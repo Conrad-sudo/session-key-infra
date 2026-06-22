@@ -29,11 +29,11 @@ pragma solidity ^0.8.24;
 
 import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
-import {Test, console2} from "forge-std/Test.sol";
+import {Test,console, console2} from "forge-std/Test.sol";
 import {IUniswapV2Router02} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 import {IUniswapV2Router01} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol";
 
-import {UNISWAP_V2_FACTORY} from "../../script/Constants.s.sol";
+import {UNISWAP_V2_FACTORY, MNT_MKR} from "../../script/Constants.s.sol";
 import {IWETH} from "../../src/interfaces/IWETH.sol";
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
@@ -47,7 +47,8 @@ import {SHFactory} from "../../src/SHFactory.sol";
 import {SHTreasury} from "../../src/SHTreasury.sol";
 import {IUniswapV2Factory} from "lib/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 import {IUniswapV2Pair} from "lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
+import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 
 contract SHUniswapV2Test is Test {
     SHOracle oracle;
@@ -61,7 +62,6 @@ contract SHUniswapV2Test is Test {
 
     IERC20 private dai;
     IWETH private weth;
-    IERC20 private mkr;
 
     address user;
     uint256 privateKey;
@@ -202,7 +202,6 @@ contract SHUniswapV2Test is Test {
 
         dai = IERC20(config.dai);
         weth = IWETH(config.weth);
-        mkr = IERC20(config.mkr);
         router = IUniswapV2Router02(config.uniswapRouter);
 
         vm.deal(address(sessionHandler), 10 ether);
@@ -229,10 +228,10 @@ contract SHUniswapV2Test is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Mocks every configured Chainlink feed to return updatedAt = block.timestamp after a vm.warp.
-     *      Required because real mainnet feeds cannot have updateAnswer called on them — their updatedAt
-     *      stays at the fork-block value while block.timestamp advances, eventually exceeding the per-feed
-     *      heartbeat and triggering SHOracle_StalePrice.
+     * @dev Mocks every configured Pyth feed to return publishTime = block.timestamp after a vm.warp.
+     *      Required because the real mainnet Pyth contract cannot have its prices updated on a fork —
+     *      publishTime stays at the fork-block value while block.timestamp advances, eventually exceeding
+     *      the per-feed max age and triggering SHOracle_StalePrice.
      */
     function _refreshForkFeeds() internal {
         _mockFeedFresh(config.ethUsdPriceFeed);
@@ -249,7 +248,6 @@ contract SHUniswapV2Test is Test {
         _mockFeedFresh(config.compUsdPriceFeed);
         _mockFeedFresh(config.crvUsdPriceFeed);
         _mockFeedFresh(config.ensUsdPriceFeed);
-        _mockFeedFresh(config.mkrUsdPriceFeed);
         _mockFeedFresh(config.sandUsdPriceFeed);
         _mockFeedFresh(config.sushiUsdPriceFeed);
         _mockFeedFresh(config.wtaoUsdPriceFeed);
@@ -257,15 +255,10 @@ contract SHUniswapV2Test is Test {
         _mockFeedFresh(config.yfiUsdPriceFeed);
     }
 
-    function _mockFeedFresh(address feed) private {
-        if (feed == address(0)) return;
-        (uint80 roundId, int256 answer, uint256 startedAt,, uint80 answeredInRound) =
-            AggregatorV3Interface(feed).latestRoundData();
-        vm.mockCall(
-            feed,
-            abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
-            abi.encode(roundId, answer, startedAt, block.timestamp, answeredInRound)
-        );
+    function _mockFeedFresh(bytes32 feedId) private {
+        PythStructs.Price memory p = IPyth(config.pyth).getPriceUnsafe(feedId);
+        p.publishTime = block.timestamp;
+        vm.mockCall(config.pyth, abi.encodeWithSelector(IPyth.getPriceUnsafe.selector, feedId), abi.encode(p));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -280,7 +273,7 @@ contract SHUniswapV2Test is Test {
         address[] memory path = new address[](3);
         path[0] = config.weth;
         path[1] = config.dai;
-        path[2] = config.mkr;
+        path[2] = MNT_MKR;
 
         uint256 amountIn = 1e18;
         uint256[] memory amounts = router.getAmountsOut(amountIn, path);
@@ -298,7 +291,7 @@ contract SHUniswapV2Test is Test {
         address[] memory path = new address[](3);
         path[0] = config.weth;
         path[1] = config.dai;
-        path[2] = config.mkr;
+        path[2] = MNT_MKR;
 
         uint256 amountOut = 1e15; // 0.001 MKR — must be less than pool's MKR reserve (~0.044 MKR)
         uint256[] memory amounts = router.getAmountsIn(amountOut, path);
@@ -1164,4 +1157,17 @@ contract SHUniswapV2Test is Test {
         assertEq(IERC20(pair).balanceOf(address(sessionHandler)), 0);
         assertEq(balanceAfterToken - balanceBeforeToken, amountToken);
     }
+
+
+    function testGetPrice() public view {
+        
+        (uint256 price , uint8 decimals) = sessionHandler.getPrice(config.weth);
+
+        console.log("PRICE*******: ");
+        console2.log(price);
+        console.log("DECIMALS*****");
+        console2.log(decimals);
+
+    }
+
 }

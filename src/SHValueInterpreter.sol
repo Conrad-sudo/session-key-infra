@@ -72,7 +72,7 @@ contract SHValueInterpreter {
             revert SHValueInterpreter_ZeroAddressOnRouter();
         }
 
-        SHOracle oracle = SHOracle(REGISTRY.priceOracle());
+        SHOracle oracle = SHOracle(payable(REGISTRY.priceOracle()));
         
         address token;
         uint256 extractedValue;

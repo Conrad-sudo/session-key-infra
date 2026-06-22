@@ -551,10 +551,10 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Returns the current USD price of a token by querying the registered SHOracle.
     /// @param token The token address to price. Use address(0) for native ETH.
-    /// @return price The current price with 8 decimals (Chainlink standard).
-    /// @return decimals The decimal count of the returned price (always 8 for Chainlink USD feeds).
+    /// @return price The current price, scaled by 10**decimals.
+    /// @return decimals The decimal count of the returned price (derived from Pyth's exponent).
     function getPrice(address token) public view returns (uint256 price, uint8 decimals) {
-        return SHOracle(REGISTRY.priceOracle()).getPrice(token);
+        return SHOracle(payable(REGISTRY.priceOracle())).getPrice(token);
     }
 
     function getAgentId() public view returns (uint256){
@@ -608,7 +608,7 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
     function isSpendingWithinBudget(address sessionKey, address token, uint256 amount) public view returns (bool) {
         Session memory session = sessions[sessionKey];
         if (!isSessionActive(sessionKey)) return false;
-        uint256 valueInUsd = SHOracle(REGISTRY.priceOracle()).getUsdValue(token, amount);
+        uint256 valueInUsd = SHOracle(payable(REGISTRY.priceOracle())).getUsdValue(token, amount);
         return session.spentAmount + valueInUsd <= session.spendingLimit;
     }
 

@@ -1,20 +1,30 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
+import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 /**
  * @title SHOracle
  * @author Conrad Japhet
- * @notice Converts token amounts to USD equivalents using Chainlink price feeds
+ * @notice Converts token amounts to USD equivalents using Pyth price feeds
  * @dev Accounts for depeg scenarios (e.g., USDC at $0.87 during SVB crisis) by querying
- *      real-time prices from Chainlink oracles instead of assuming fixed rates.
+ *      real-time prices from Pyth oracles instead of assuming fixed rates.
  *      All USD calculations use 18 decimals for precision before converting to token decimals.
  *
  *      Supports native ETH (sentinel address(0)) and any registered ERC-20 token.
  *      Token decimals are read on-chain via IERC20Metadata; ETH is hardcoded to 18.
  *      Tokens with no registered feed revert with SHOracle_UnsupportedToken.
+ *
+ *      getPrice/getUsdValue read through Pyth's getPriceUnsafe (a free, view-only read of
+ *      the last price pushed on-chain by any party), so they stay `view` and never pay a
+ *      Pyth update fee themselves. Staleness is enforced ourselves against sMaxAge so a feed
+ *      nobody has pushed to recently still reverts.
+ *
+ *      updatePrices pushes a fresh price on-chain via Pyth's updatePriceFeeds, paying the fee
+ *      from this contract's own ETH balance (fund it via receive()) so callers — including
+ *      the ERC-4337 bundler — never need to attach value themselves.
  */
 contract SHOracle {
     /*//////////////////////////////////////////////////////////////
@@ -24,11 +34,14 @@ contract SHOracle {
     /// @dev Reverts when an unsupported token address is provided
     error SHOracle_UnsupportedToken();
 
-    /// @dev Reverts when a Chainlink price feed has not been updated within its configured heartbeat
+    /// @dev Reverts when a Pyth price has not been updated within its configured max age
     error SHOracle_StalePrice();
 
-    /// @dev Reverts when the tokens and priceFeeds constructor arrays have different lengths
+    /// @dev Reverts when the tokens, priceFeedIds and maxAges constructor arrays have different lengths
     error SHOracle_ArrayLengthMismatch();
+
+    /// @dev Reverts when this contract's ETH balance can't cover Pyth's update fee
+    error SHOracle_InsufficientFeeBalance();
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -37,45 +50,46 @@ contract SHOracle {
     /// @notice Sentinel value for native ETH (used instead of an actual token address)
     address private constant ETH_TOKEN_ADDRESS = address(0);
 
-    /// @notice Maps each registered token address to its Chainlink USD price feed address
-    /// @dev Populated once in the constructor. Unregistered tokens map to address(0).
-    mapping(address => address) private sPriceFeed;
+    /// @notice The Pyth contract this oracle reads price feeds from
+    IPyth private immutable PYTH;
 
-    /// @notice Maps each registered price feed address to its expected heartbeat interval in seconds
-    /// @dev Chainlink heartbeats vary per feed: volatile assets update hourly, stablecoins every 23–24 hours.
-    ///      Using a uniform timeout would either flag stablecoin feeds as stale or mask genuinely stale volatile feeds.
-    mapping(address => uint256) private sHeartbeat;
+    /// @notice Maps each registered token address to its Pyth USD price feed ID
+    /// @dev Populated once in the constructor. Unregistered tokens map to bytes32(0).
+    mapping(address => bytes32) private sPriceFeedId;
 
-    /// @notice Multiplier to convert Chainlink's 8-decimal prices to 18-decimal precision
-    /// @dev Chainlink returns prices with 8 decimals. Multiply by 1e10 to get 18 decimals.
-    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+    /// @notice Maps each registered token address to the maximum allowed age (in seconds) of its price
+    /// @dev Pyth update frequency varies per feed: volatile assets are pushed roughly hourly,
+    ///      stablecoins less often. Using a uniform timeout would either flag stablecoin feeds as
+    ///      stale or mask genuinely stale volatile feeds.
+    mapping(address => uint256) private sMaxAge;
 
     /*//////////////////////////////////////////////////////////////
                              CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Registers token–feed pairs and initialises the oracle
-     * @dev Pairs whose priceFeed is address(0) are silently skipped, allowing callers to
+     * @notice Registers token-feed pairs and initialises the oracle
+     * @dev Pairs whose priceFeedId is bytes32(0) are silently skipped, allowing callers to
      *      pass the full NetworkConfig arrays even when some feeds are unavailable on the
      *      current network (e.g., Sepolia). Use address(0) as the token address to register
      *      native ETH.
      *
-     * @param tokens      Ordered list of token addresses to support. Use address(0) for ETH.
-     * @param priceFeeds  Ordered list of Chainlink USD price feed addresses, one per token.
-     *                    Pass address(0) for tokens that have no feed on this network.
-     * @param heartbeats  Ordered list of heartbeat intervals in seconds, one per feed.
-     *                    Matches the Chainlink-published heartbeat for each feed (e.g. 3600 for ETH/USD, 82800 for USDC/USD).
-     *                    The value at index i is ignored when priceFeeds[i] is address(0).
+     * @param pyth         Address of the Pyth contract on the current chain.
+     * @param tokens       Ordered list of token addresses to support. Use address(0) for ETH.
+     * @param priceFeedIds Ordered list of Pyth USD price feed IDs, one per token.
+     *                     Pass bytes32(0) for tokens that have no feed.
+     * @param maxAges      Ordered list of maximum price ages in seconds, one per token.
+     *                     The value at index i is ignored when priceFeedIds[i] is bytes32(0).
      */
-    constructor(address[] memory tokens, address[] memory priceFeeds, uint256[] memory heartbeats) {
-        if (tokens.length != priceFeeds.length || priceFeeds.length != heartbeats.length) {
+    constructor(address pyth, address[] memory tokens, bytes32[] memory priceFeedIds, uint256[] memory maxAges) {
+        if (tokens.length != priceFeedIds.length || priceFeedIds.length != maxAges.length) {
             revert SHOracle_ArrayLengthMismatch();
         }
+        PYTH = IPyth(pyth);
         for (uint256 i = 0; i < tokens.length; i++) {
-            if (priceFeeds[i] != address(0)) {
-                sPriceFeed[tokens[i]] = priceFeeds[i];
-                sHeartbeat[priceFeeds[i]] = heartbeats[i];
+            if (priceFeedIds[i] != bytes32(0)) {
+                sPriceFeedId[tokens[i]] = priceFeedIds[i];
+                sMaxAge[tokens[i]] = maxAges[i];
             }
         }
     }
@@ -85,18 +99,17 @@ contract SHOracle {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Returns the current USD price of a token from its registered Chainlink feed
+     * @notice Returns the current USD price of a token from its registered Pyth feed
      * @dev Reverts if the token has no registered feed or the price is stale.
      *
      * @param token     Token address. Use address(0) for native ETH.
-     * @return price    The current price with 8 decimals (Chainlink standard).
-     * @return decimals The decimal count of the returned price (always 8 for Chainlink USD feeds).
+     * @return price    The current price, scaled by 10**decimals.
+     * @return decimals The decimal count of the returned price (derived from Pyth's exponent).
      */
     function getPrice(address token) external view returns (uint256 price, uint8 decimals) {
-        address feed = sPriceFeed[token];
-        if (feed == address(0)) revert SHOracle_UnsupportedToken();
-        price = _stalePriceCheck(feed);
-        decimals = AggregatorV3Interface(feed).decimals();
+        bytes32 feedId = sPriceFeedId[token];
+        if (feedId == bytes32(0)) revert SHOracle_UnsupportedToken();
+        (price, decimals) = _stalePriceCheck(feedId, sMaxAge[token]);
     }
 
     /**
@@ -105,9 +118,9 @@ contract SHOracle {
      *      oracle works correctly with tokens of any decimal count (e.g., USDC at 6, WBTC at 8).
      *      ETH (address(0)) is hardcoded to 18 decimals since it has no on-chain contract.
      *
-     *      Formula: (amount × chainlinkPrice × 1e10) / (10 ** tokenDecimals)
-     *      Example — 1000 USDC (6 dec) at $0.99:
-     *        chainlinkPrice = 99_000_000  (8 dec)
+     *      Formula: (amount × pythPrice × 10**(18 - priceDecimals)) / (10 ** tokenDecimals)
+     *      Example — 1000 USDC (6 dec) at $0.99 (Pyth expo -8, so priceDecimals = 8):
+     *        pythPrice = 99_000_000  (8 dec)
      *        (1000e6 × 99_000_000 × 1e10) / 1e6 = 990e18  → $990 with 18 decimals
      *
      * @param token  Token address. Use address(0) for native ETH.
@@ -115,34 +128,59 @@ contract SHOracle {
      * @return       USD value with 18 decimals of precision.
      */
     function getUsdValue(address token, uint256 amount) external view returns (uint256) {
-        address feed = sPriceFeed[token];
-        if (feed == address(0)) revert SHOracle_UnsupportedToken();
+        bytes32 feedId = sPriceFeedId[token];
+        if (feedId == bytes32(0)) revert SHOracle_UnsupportedToken();
 
-        uint256 price = _stalePriceCheck(feed);
-        uint8 decimals = token == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(token).decimals();
+        (uint256 price, uint8 priceDecimals) = _stalePriceCheck(feedId, sMaxAge[token]);
+        uint8 tokenDecimals = token == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(token).decimals();
 
-        return (amount * price * ADDITIONAL_FEED_PRECISION) / (10 ** decimals);
+        return (amount * price * (10 ** (18 - priceDecimals))) / (10 ** tokenDecimals);
     }
 
     /**
-     * @dev Validates Chainlink price feed freshness and returns the current price
-     * @param priceFeed Address of the Chainlink price feed to query
-     * @return price    The current price with 8 decimals (Chainlink standard)
+     * @dev Validates Pyth price freshness and returns the current price and its decimals
+     * @param feedId  Pyth price feed ID to query
+     * @param maxAge  Maximum allowed age (in seconds) for the price to be considered fresh
+     * @return price    The current price, scaled by 10**decimals
+     * @return decimals The decimal count of the returned price, derived from Pyth's exponent
      *
-     * @notice Reverts with SHOracle_StalePrice if the feed has not updated within TIMEOUT.
+     * @notice Reverts with SHOracle_StalePrice if the price has not updated within maxAge.
      *
      * Why this matters: stale price data can lead to incorrect USD conversions. For instance,
      * if ETH crashes from $2500 to $1500 but the feed has not updated in 5 hours, using the
      * stale price would incorrectly value ETH and may allow overspending beyond session limits.
+     *
+     * Uses getPriceUnsafe (not getPriceNoOlderThan) so this stays a free, view-only read —
+     * staleness is enforced against our own sMaxAge instead of relying on Pyth's internal check.
      */
-    function _stalePriceCheck(address priceFeed) internal view returns (uint256) {
-        (, int256 price,, uint256 updatedAt,) = AggregatorV3Interface(priceFeed).latestRoundData();
+    function _stalePriceCheck(bytes32 feedId, uint256 maxAge) internal view returns (uint256 price, uint8 decimals) {
+        PythStructs.Price memory p = PYTH.getPriceNoOlderThan(feedId,maxAge);
 
-        if (block.timestamp - updatedAt > sHeartbeat[priceFeed]) {
+        if (block.timestamp - p.publishTime > maxAge) {
             revert SHOracle_StalePrice();
         }
 
         // forge-lint: disable-next-line(unsafe-typecast)
-        return uint256(price);
+        price = uint256(int256(p.price));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        decimals = uint8(uint32(-p.expo));
     }
+
+    /**
+     * @notice Pushes a fresh Pyth price update on-chain, paying the fee from this contract's
+     *         own ETH balance so the caller never has to attach value.
+     * @dev Callable by anyone — updateData must be a validly signed Pyth payload (fetched
+     *      off-chain from Hermes), so there's no way to push a false price through this path.
+     *      Reverts with SHOracle_InsufficientFeeBalance if this contract's balance can't
+     *      cover Pyth's fee; fund the contract via its receive() function in that case.
+     * @param updateData Encoded Pyth price update payload(s), as returned by Hermes.
+     */
+    function updatePrices(bytes[] calldata updateData) external {
+        uint256 fee = PYTH.getUpdateFee(updateData);
+        if (address(this).balance < fee) revert SHOracle_InsufficientFeeBalance();
+        PYTH.updatePriceFeeds{value: fee}(updateData);
+    }
+
+    /// @notice Accepts ETH so updatePrices can pay Pyth's fee without the caller forwarding any value.
+    receive() external payable {}
 }

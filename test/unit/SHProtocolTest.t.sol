@@ -20,7 +20,30 @@ import {SHRegistry} from "../../src/SHRegistry.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
 import {SHTreasury} from "../../src/SHTreasury.sol";
 import {SessionHandlerHarness} from "./SessionHandlerHarness.sol";
-import {MockV3Aggregator} from "../../src/mocks/MockV3Aggregator.sol";
+import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
+import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
+import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
+import {
+    ETH_USD_PRICE_FEED,
+    USDC_USD_PRICE_FEED,
+    DAI_USD_PRICE_FEED,
+    USDT_USD_PRICE_FEED,
+    AAVE_USD_PRICE_FEED,
+    LINK_USD_PRICE_FEED,
+    ONEINCH_USD_PRICE_FEED,
+    APE_USD_PRICE_FEED,
+    ARB_USD_PRICE_FEED,
+    BNB_USD_PRICE_FEED,
+    BTC_USD_PRICE_FEED,
+    COMP_USD_PRICE_FEED,
+    CRV_USD_PRICE_FEED,
+    ENS_USD_PRICE_FEED,
+    SAND_USD_PRICE_FEED,
+    SUSHI_USD_PRICE_FEED,
+    WTAO_USD_PRICE_FEED,
+    UNI_USD_PRICE_FEED,
+    YFI_USD_PRICE_FEED
+} from "../../script/Constants.s.sol";
 
 /**
  * @title SHProtocolTest
@@ -177,39 +200,42 @@ contract SHProtocolTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Refreshes every mock price feed's updatedAt to block.timestamp after a vm.warp.
+     * @dev Refreshes every mock price feed's publishTime to block.timestamp after a vm.warp.
      *      Required whenever warping more than the per-feed heartbeat (1 hour on Anvil) in
      *      tests where the session is still active and the oracle will be queried.
      *      Not needed when the session has already expired — _checkAndUpdateSessionStatus
      *      deletes the session before the oracle is ever reached.
      */
     function _refreshMockFeeds() internal {
-        _refreshMockFeed(config.ethUsdPriceFeed);
-        _refreshMockFeed(config.usdcUsdPriceFeed);
-        _refreshMockFeed(config.daiUsdPriceFeed);
-        _refreshMockFeed(config.usdtUsdPriceFeed);
-        _refreshMockFeed(config.aaveUsdPriceFeed);
-        _refreshMockFeed(config.linkUsdPriceFeed);
-        _refreshMockFeed(config.oneinchUsdPriceFeed);
-        _refreshMockFeed(config.apeUsdPriceFeed);
-        _refreshMockFeed(config.arbUsdPriceFeed);
-        _refreshMockFeed(config.bnbUsdPriceFeed);
-        _refreshMockFeed(config.btcUsdPriceFeed);
-        _refreshMockFeed(config.compUsdPriceFeed);
-        _refreshMockFeed(config.crvUsdPriceFeed);
-        _refreshMockFeed(config.ensUsdPriceFeed);
-        _refreshMockFeed(config.mkrUsdPriceFeed);
-        _refreshMockFeed(config.sandUsdPriceFeed);
-        _refreshMockFeed(config.sushiUsdPriceFeed);
-        _refreshMockFeed(config.wtaoUsdPriceFeed);
-        _refreshMockFeed(config.uniUsdPriceFeed);
-        _refreshMockFeed(config.yfiUsdPriceFeed);
+        _refreshMockFeed(ETH_USD_PRICE_FEED);
+        _refreshMockFeed(USDC_USD_PRICE_FEED);
+        _refreshMockFeed(DAI_USD_PRICE_FEED);
+        _refreshMockFeed(USDT_USD_PRICE_FEED);
+        _refreshMockFeed(AAVE_USD_PRICE_FEED);
+        _refreshMockFeed(LINK_USD_PRICE_FEED);
+        _refreshMockFeed(ONEINCH_USD_PRICE_FEED);
+        _refreshMockFeed(APE_USD_PRICE_FEED);
+        _refreshMockFeed(ARB_USD_PRICE_FEED);
+        _refreshMockFeed(BNB_USD_PRICE_FEED);
+        _refreshMockFeed(BTC_USD_PRICE_FEED);
+        _refreshMockFeed(COMP_USD_PRICE_FEED);
+        _refreshMockFeed(CRV_USD_PRICE_FEED);
+        _refreshMockFeed(ENS_USD_PRICE_FEED);
+        _refreshMockFeed(SAND_USD_PRICE_FEED);
+        _refreshMockFeed(SUSHI_USD_PRICE_FEED);
+        _refreshMockFeed(WTAO_USD_PRICE_FEED);
+        _refreshMockFeed(UNI_USD_PRICE_FEED);
+        _refreshMockFeed(YFI_USD_PRICE_FEED);
     }
 
-    function _refreshMockFeed(address feed) private {
-        if (feed == address(0)) return;
-        MockV3Aggregator mock = MockV3Aggregator(feed);
-        mock.updateAnswer(mock.latestAnswer());
+    function _refreshMockFeed(bytes32 feedId) private {
+        MockPyth pyth = MockPyth(config.pyth);
+        PythStructs.Price memory p = IPyth(config.pyth).getPriceUnsafe(feedId);
+        bytes memory updateData =
+            pyth.createPriceFeedUpdateData(feedId, p.price, p.conf, p.expo, p.price, p.conf, uint64(block.timestamp), 0);
+        bytes[] memory updates = new bytes[](1);
+        updates[0] = updateData;
+        pyth.updatePriceFeeds(updates);
     }
 
     /*//////////////////////////////////////////////////////////////

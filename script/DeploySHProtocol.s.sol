@@ -53,10 +53,10 @@ contract DeploySHProtocol is Script {
 
         // Build parallel token/feed arrays for SHOracle.
         // address(0) registers native ETH. Pairs with a zero feed are skipped inside the constructor,
-        // so it is safe to pass address(0) feed entries for tokens unavailable on the current network.
-        address[] memory tokens = new address[](21);
-        address[] memory priceFeeds = new address[](21);
-        uint256[] memory heartbeats = new uint256[](21);
+        // so it is safe to pass a zero feed entry for tokens unavailable on the current network.
+        address[] memory tokens = new address[](20);
+        bytes32[] memory priceFeeds = new bytes32[](20);
+        uint256[] memory heartbeats = new uint256[](20);
         tokens[0] = address(0);      priceFeeds[0] = config.ethUsdPriceFeed;      heartbeats[0] = config.ethHeartbeat;
         tokens[1] = config.usdc;     priceFeeds[1] = config.usdcUsdPriceFeed;     heartbeats[1] = config.usdcHeartbeat;
         tokens[2] = config.dai;      priceFeeds[2] = config.daiUsdPriceFeed;      heartbeats[2] = config.daiHeartbeat;
@@ -70,17 +70,16 @@ contract DeploySHProtocol is Script {
         tokens[10] = config.comp;    priceFeeds[10] = config.compUsdPriceFeed;    heartbeats[10] = config.compHeartbeat;
         tokens[11] = config.crv;     priceFeeds[11] = config.crvUsdPriceFeed;     heartbeats[11] = config.crvHeartbeat;
         tokens[12] = config.ens;     priceFeeds[12] = config.ensUsdPriceFeed;     heartbeats[12] = config.ensHeartbeat;
-        tokens[13] = config.mkr;     priceFeeds[13] = config.mkrUsdPriceFeed;     heartbeats[13] = config.mkrHeartbeat;
-        tokens[14] = config.sand;    priceFeeds[14] = config.sandUsdPriceFeed;    heartbeats[14] = config.sandHeartbeat;
-        tokens[15] = config.sushi;   priceFeeds[15] = config.sushiUsdPriceFeed;   heartbeats[15] = config.sushiHeartbeat;
-        tokens[16] = config.wtao;    priceFeeds[16] = config.wtaoUsdPriceFeed;    heartbeats[16] = config.wtaoHeartbeat;
-        tokens[17] = config.uni;     priceFeeds[17] = config.uniUsdPriceFeed;     heartbeats[17] = config.uniHeartbeat;
-        tokens[18] = config.yfi;     priceFeeds[18] = config.yfiUsdPriceFeed;     heartbeats[18] = config.yfiHeartbeat;
-        tokens[19] = config.weth;    priceFeeds[19] = config.ethUsdPriceFeed;     heartbeats[19] = config.ethHeartbeat;
-        tokens[20] = config.usdt;    priceFeeds[20] = config.usdtUsdPriceFeed;    heartbeats[20] = config.usdtHeartbeat;
+        tokens[13] = config.sand;    priceFeeds[13] = config.sandUsdPriceFeed;    heartbeats[13] = config.sandHeartbeat;
+        tokens[14] = config.sushi;   priceFeeds[14] = config.sushiUsdPriceFeed;   heartbeats[14] = config.sushiHeartbeat;
+        tokens[15] = config.wtao;    priceFeeds[15] = config.wtaoUsdPriceFeed;    heartbeats[15] = config.wtaoHeartbeat;
+        tokens[16] = config.uni;     priceFeeds[16] = config.uniUsdPriceFeed;     heartbeats[16] = config.uniHeartbeat;
+        tokens[17] = config.yfi;     priceFeeds[17] = config.yfiUsdPriceFeed;     heartbeats[17] = config.yfiHeartbeat;
+        tokens[18] = config.weth;    priceFeeds[18] = config.ethUsdPriceFeed;     heartbeats[18] = config.ethHeartbeat;
+        tokens[19] = config.usdt;    priceFeeds[19] = config.usdtUsdPriceFeed;    heartbeats[19] = config.usdtHeartbeat;
 
         //deploy price oracle
-        oracle = new SHOracle(tokens, priceFeeds, heartbeats);
+        oracle = new SHOracle(config.pyth, tokens, priceFeeds, heartbeats);
         //register the agent
         uint256 agentId = IIdentityRegistry(config.identityRegistry).register(AGENT_URI);
        

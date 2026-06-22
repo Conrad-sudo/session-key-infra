@@ -9,6 +9,45 @@ address constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f
 // Canonical EntryPoint v0.7 — deployed at the same address on mainnet, Sepolia, and most EVM chains.
 address constant ENTRYPOINT_V07 = 0x0000000071727De22E5E9d8BAf0edAc6f37da032;
 
+
+
+// ─── Pyth Price Feed IDs ──────────────────────────────────────────────────────
+// Pyth price feed IDs are network-agnostic (same id on every chain Pyth supports),
+// so a single set covers both Sepolia and mainnet. Use these with IPyth.getPriceNoOlderThan.
+// No MKR/USD feed exists on Pyth (MakerDAO's SKY token is a separate, differently
+// priced asset) — MKR support is dropped until Pyth lists it.
+bytes32 constant ETH_USD_PRICE_FEED = 0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace;
+bytes32 constant USDC_USD_PRICE_FEED = 0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a;
+bytes32 constant DAI_USD_PRICE_FEED = 0xb0948a5e5313200c632b51bb5ca32f6de0d36e9950a942d19751e833f70dabfd;
+bytes32 constant USDT_USD_PRICE_FEED = 0x2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b;
+bytes32 constant AAVE_USD_PRICE_FEED = 0x2b9ab1e972a281585084148ba1389800799bd4be63b957507db1349314e47445;
+bytes32 constant LINK_USD_PRICE_FEED = 0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221;
+bytes32 constant BTC_USD_PRICE_FEED = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43; // used for WBTC
+bytes32 constant UNI_USD_PRICE_FEED = 0x78d185a741d07edb3412b09008b7c5cfb9bbbd7d568bf00ba737b456ba171501;
+bytes32 constant ONEINCH_USD_PRICE_FEED = 0x63f341689d98a12ef60a5cff1d7f85c70a9e17bf1575f0e7c0b2512d48b1c8b3;
+bytes32 constant APE_USD_PRICE_FEED = 0x15add95022ae13563a11992e727c91bdb6b55bc183d9d747436c80a483d8c864;
+bytes32 constant ARB_USD_PRICE_FEED = 0x3fa4252848f9f0a1480be62745a4629d9eb1322aebab8a791e344b3b9c1adcf5;
+bytes32 constant BNB_USD_PRICE_FEED = 0x2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f;
+bytes32 constant COMP_USD_PRICE_FEED = 0x4a8e42861cabc5ecb50996f92e7cfa2bce3fd0a2423b0c44c9b423fb2bd25478;
+bytes32 constant CRV_USD_PRICE_FEED = 0xa19d04ac696c7a6616d291c7e5d1377cc8be437c327b75adb5dc1bad745fcae8;
+bytes32 constant ENS_USD_PRICE_FEED = 0xb98ab6023650bd2edc026b983fb7c2f8fa1020286f1ba6ecf3f4322cd83b72a6;
+bytes32 constant SAND_USD_PRICE_FEED = 0xcb7a1d45139117f8d3da0a4b67264579aa905e3b124efede272634f094e1e9d1;
+bytes32 constant SUSHI_USD_PRICE_FEED = 0x26e4f737fde0263a9eea10ae63ac36dcedab2aaf629261a994e1eeb6ee0afe53;
+bytes32 constant WTAO_USD_PRICE_FEED = 0x410f41de235f2db824e562ea7ab2d3d3d4ff048316c61d629c0b93f58584e1af;
+bytes32 constant YFI_USD_PRICE_FEED = 0x425f4b198ab2504936886c1e93511bb6720fbcf2045a4f3c0723bb213846022f;
+bytes32 constant WAVAX_USD_PRICE_FEED = 0x93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7;
+bytes32 constant BAT_USD_PRICE_FEED = 0x8e860fb74e60e5736b455d82f60b3728049c348e94961add5f961b02fdee2535;
+bytes32 constant IMX_USD_PRICE_FEED = 0x941320a8989414874de5aa2fc340a75d5ed91fdff1613dd55f83844d52ea63a2;
+bytes32 constant KNC_USD_PRICE_FEED = 0xb9ccc817bfeded3926af791f09f76c5ffbc9b789cac6e9699ec333a79cacbe2a;
+bytes32 constant RDNT_USD_PRICE_FEED = 0xc8cf45412be4268bef8f76a8b0d60971c6e57ab57919083b8e9f12ba72adeeb6;
+
+
+
+
+// ─── Sepolia Contracts ───────────────────────────────────────────────────────────
+address constant SEPOLIA_ORACLE_CONTRACT=0xDd24F84d36BF92C65F92307595335bdFab5Bbd21;
+
+
 // ─── Sepolia Tokens ───────────────────────────────────────────────────────────
 address constant SEPOLIA_USDC = 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
 address constant SEPOLIA_WETH = 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
@@ -19,17 +58,16 @@ address constant SEPOLIA_LINK = 0x779877A7B0D9E8603169DdbD7836e478b4624789; // C
 address constant SEPOLIA_WBTC = 0x29f2D40B0605204364af54EC677bD022dA425d03; // Aave V3 testnet token
 address constant SEPOLIA_UNI = 0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984; // Official Uniswap deployment
 
-// ─── Sepolia Price Feeds ──────────────────────────────────────────────────────
-address constant SEPOLIA_ETH_USD_PRICE_FEED = 0x694AA1769357215DE4FAC081bf1f309aDC325306;
-address constant SEPOLIA_USDC_USD_PRICE_FEED = 0xA2F78ab2355fe2f984D808B5CeE7FD0A93D5270E;
-address constant SEPOLIA_DAI_USD_PRICE_FEED = 0x14866185B1962B63C3Ea9E03Bc1da838bab34C19;
-address constant SEPOLIA_LINK_USD_PRICE_FEED = 0xc59E3633BAAC79493d908e63626716e204A45EdF;
-address constant SEPOLIA_BTC_USD_PRICE_FEED = 0x1b44F3514812d835EB1BDB0acB33d3fA3351Ee43;
 
 // ─── Sepolia Agent Registries ──────────────────────────────────────────────────────
 
 address constant SEPOLIA_REPUTATION_REGISTRY = 0x8004B663056A597Dffe9eCcC1965A193B7388713;
 address constant SEPOLIA_IDENTITY_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A494BD9e;
+
+
+
+// ─── Mainnet Contract ───────────────────────────────────────────────────────────
+address constant MNT_ORACLE_CONTRACT=0x4305FB66699C3B2702D4d05CF36551390A4c69C6;
 
 // ─── Mainnet Tokens ───────────────────────────────────────────────────────────
 address constant MNT_USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
@@ -57,33 +95,6 @@ address constant MNT_BAT = 0x0D8775F648430679A709E98d2b0Cb6250d2887EF;
 address constant MNT_IMX = 0xF57e7e7C23978C3cAEC3C3548E3D615c346e79fF;
 address constant MNT_KNC = 0xdeFA4e8a7bcBA345F687a2f1456F5Edd9CE97202;
 address constant MNT_RDNT = 0x137dDB47Ee24EaA998a535Ab00378d6BFa84F893;
-
-// ─── Mainnet Price Feeds ──────────────────────────────────────────────────────
-address constant MNT_ETH_USD_PRICE_FEED = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
-address constant MNT_USDC_USD_PRICE_FEED = 0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6;
-address constant MNT_DAI_USD_PRICE_FEED = 0xAed0c38402a5d19df6E4c03F4E2DceD6e29c1ee9;
-address constant MNT_USDT_USD_PRICE_FEED = 0x3E7d1eAB13ad0104d2750B8863b489D65364e32D;
-address constant MNT_AAVE_USD_PRICE_FEED = 0x547a514d5e3769680Ce22B2361c10Ea13619e8a9;
-address constant MNT_LINK_USD_PRICE_FEED = 0x2c1d072e956AFFC0D435Cb7AC38EF18d24d9127c;
-address constant MNT_ONEINCH_USD_PRICE_FEED = 0xc929ad75B72593967DE83E7F7Cda0493458261D9;
-address constant MNT_APE_USD_PRICE_FEED = 0xD10aBbC76679a20055E167BB80A24ac851b37056;
-address constant MNT_ARB_USD_PRICE_FEED = 0x31697852a68433DbCc2Ff612c516d69E3D9bd08F;
-address constant MNT_BNB_USD_PRICE_FEED = 0x14e613AC84a31f709eadbdF89C6CC390fDc9540A;
-address constant MNT_BTC_USD_PRICE_FEED = 0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c;
-address constant MNT_COMP_USD_PRICE_FEED = 0xdbd020CAeF83eFd542f4De03e3cF0C28A4428bd5;
-address constant MNT_CRV_USD_PRICE_FEED = 0xCd627aA160A6fA45Eb793D19Ef54f5062F20f33f;
-address constant MNT_ENS_USD_PRICE_FEED = 0x5C00128d4d1c2F4f652C267d7bcdD7aC99C16E16;
-address constant MNT_MKR_USD_PRICE_FEED = 0xec1D1B3b0443256cc3860e24a46F108e699484Aa;
-address constant MNT_SAND_USD_PRICE_FEED = 0x35E3f7E558C04cE7eEE1629258EcbbA03B36Ec56;
-address constant MNT_SUSHI_USD_PRICE_FEED = 0xCc70F09A6CC17553b2E31954cD36E4A2d89501f7;
-address constant MNT_WTAO_USD_PRICE_FEED = 0x1c88503c9A52aE6aaE1f9bb99b3b7e9b8Ab35459;
-address constant MNT_UNI_USD_PRICE_FEED = 0x553303d460EE0afB37EdFf9bE42922D8FF63220e;
-address constant MNT_YFI_USD_PRICE_FEED = 0xA027702dbb89fbd58938e4324ac03B58d812b0E1;
-address constant MNT_WAVAX_USD_PRICE_FEED = 0xFF3EEb22B5E3dE6e705b44749C2559d704923FD7;
-address constant MNT_BAT_USD_PRICE_FEED = 0x0d16d4528239e9ee52fa531af613AcdB23D88c94;
-address constant MNT_IMX_USD_PRICE_FEED = 0xBAEbEFc1D023c0feCcc047Bff42E75F15Ff213E6;
-address constant MNT_KNC_USD_PRICE_FEED = 0xf8fF43E991A81e6eC886a3D281A2C6cC19aE70Fc;
-address constant MNT_RDNT_USD_PRICE_FEED = 0x393CC05baD439c9B36489384F11487d9C8410471;
 
 // ─── Mainnet Agent Registries ──────────────────────────────────────────────────────
 address constant MNT_REPUTATION_REGISTRY = 0x8004BAa17C55a88189AE136b182e5fdA19dE9b63;
