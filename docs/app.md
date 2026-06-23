@@ -6,13 +6,15 @@ The `app/` directory bridges the AI agent to the on-chain contracts. It is built
 
 ```
 app/
-├── constants.py           ← Chain IDs, addresses, Chainlink heartbeats, ERC-8004 registry addresses
+├── constants.py           ← Chain IDs, ETH sentinel, heartbeat constants
 ├── db.py                  ← SQLite data layer (all reads/writes to wallet.db)
 ├── network_config.py      ← Web3 connection factory
 ├── contracts.py           ← Contract loading with per-chat_id caching
 ├── anvil.py               ← Session key management and UserOp execution (local/fork)
 ├── live_network.py        ← UserOp execution via Alchemy bundler (live networks)
 ├── vault_signer.py        ← HashiCorp Vault Transit encrypt/decrypt wrapper
+├── pyth.py                ← Fetches Pyth price update payloads from Hermes
+├── price_update.py        ← Fork-test fixture: writes script/PriceUpdate.json from real Hermes data
 ├── deploy_wallet.py       ← Deployment and session registration scripts
 ├── tools.py               ← LangChain tool wrappers for the AI agent
 ├── smart_wallet_agent.py  ← LangChain agent and system prompt
@@ -26,8 +28,7 @@ app/
 │   ├── IUniswapV2Router02.json    ← ABI for Uniswap V2 Router
 │   ├── IUniswapV2Factory.json     ← ABI for Uniswap V2 Factory
 │   ├── IUniswapV2Pair.json        ← ABI for Uniswap V2 Pair
-│   ├── ERC20Mock.json             ← ABI for ERC20Mock (Anvil)
-│   └── MockV3Aggregator.json      ← ABI for MockV3Aggregator (Anvil)
+│   └── ERC20Mock.json             ← ABI for ERC20Mock (Anvil)
 └── migrate/
     ├── Chains.json                ← Chain name → chain ID mapping
     ├── RPC.json                   ← Chain name → RPC URL mapping
@@ -36,10 +37,11 @@ app/
     ├── ReputationRegistry_Selectors.json ← ERC-8004 function name → selector
     ├── SHFactory.json             ← SHFactory ABI (for deployWallet())
     ├── Mainnet_Tokens.json        ← Token ticker → mainnet address
-    ├── Mainnet_Pricefeeds.json    ← Token → Chainlink feed address (mainnet)
     ├── Sepolia_Tokens.json        ← Token ticker → Sepolia address
-    └── Sepolia_Pricefeeds.json    ← Token → Chainlink feed address (Sepolia)
+    └── Pricefeeds.json            ← Token ticker → Pyth price feed ID (network-agnostic)
 ```
+
+> `artifacts/MockV3Aggregator.json` was removed — Anvil's mock oracle is now Pyth's own `MockPyth`, seeded directly by `HelperConfig.s.sol`. No Python code loads a Chainlink-style aggregator ABI anymore.
 
 ## Module Dependency Flow
 
@@ -51,6 +53,7 @@ telebot.py ──────────► smart_wallet_agent.py ──► too
                                                   tools.py ──► live_network.py ► vault_signer.py
                                                                                 ► network_config.py
                                                                                 ► contracts.py
+                                                  tools.py ──► pyth.py ──────► db.py (get_pricefeed_id)
                                                   tools.py ──► db.py
 deploy_wallet.py ───────────────────────────────────────────────────────────────────────────────────► db.py
 ```
@@ -61,7 +64,7 @@ The dependency graph is strictly one-directional — no circular imports.
 
 ## `constants.py`
 
-Centralizes all shared constants imported by `db.py`, `anvil.py`, `live_network.py`, `tools.py`, and `deploy.py`:
+Centralizes the small set of constants shared across the app layer:
 
 ```python
 CHAIN_ID_ANVIL     = 31337
@@ -69,18 +72,13 @@ CHAIN_ID_MAINNET   = 1
 CHAIN_ID_SEPOLIA   = 11155111
 WEI_PER_ETH        = 10**18
 ETH_SENTINEL       = "0x0000000000000000000000000000000000000000"
-UNISWAP_V2_ROUTER  = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
 UNISWAP_V2_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
-ENTRYPOINT_V07     = "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
 HEARTBEAT_1H       = 3_600
 HEARTBEAT_23H      = 82_800
 HEARTBEAT_24H      = 86_400
-
-IDENTITY_REGISTRY_MAINNET   = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
-IDENTITY_REGISTRY_SEPOLIA   = "0x8004A818BFB912233c491871b3d84c89A494BD9e"
-REPUTATION_REGISTRY_MAINNET = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
-REPUTATION_REGISTRY_SEPOLIA = "0x8004B663056A597Dffe9eCcC1965A193B7388713"
 ```
+
+Everything else that varies per network or per deployment — the EntryPoint, Uniswap router, ERC-8004 registry addresses, token addresses, Pyth feed IDs — is resolved from the database (`db.py`) rather than hardcoded here, since those addresses change per chain and per redeploy. `HEARTBEAT_24H` is reused directly by `deploy_wallet.py` to compute a session's `validUntil` from a day count.
 
 ---
 
@@ -121,7 +119,7 @@ CREATE TABLE session_keys (
 
 CREATE TABLE contacts (chat_id INTEGER NOT NULL, name TEXT NOT NULL, address TEXT NOT NULL, PRIMARY KEY (chat_id, name));
 CREATE TABLE session_handlers (chat_id INTEGER PRIMARY KEY, address TEXT NOT NULL);
-CREATE TABLE entry_point (chain_id INTEGER PRIMARY KEY, address TEXT NOT NULL);
+CREATE TABLE factory (chain_id INTEGER PRIMARY KEY, address TEXT NOT NULL);  -- SHFactory address, read from the Forge broadcast file by `make db`
 CREATE TABLE chains (name TEXT NOT NULL, chain_id INTEGER NOT NULL, PRIMARY KEY (name, chain_id));
 CREATE TABLE rpcs (name TEXT PRIMARY KEY, rpc_url TEXT NOT NULL);
 CREATE TABLE user_network (chat_id INTEGER PRIMARY KEY, chain_name TEXT NOT NULL);
@@ -129,15 +127,14 @@ CREATE TABLE user_network (chat_id INTEGER PRIMARY KEY, chain_name TEXT NOT NULL
 CREATE TABLE anvil_tokens   (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE mainnet_tokens (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE sepolia_tokens (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
-CREATE TABLE mainnet_pricefeeds (token TEXT PRIMARY KEY, address TEXT NOT NULL);
-CREATE TABLE sepolia_pricefeeds (token TEXT PRIMARY KEY, address TEXT NOT NULL);
+
+-- Pyth feed IDs are network-agnostic (bytes32, same value on every chain Pyth supports),
+-- so there's a single table here instead of one per network.
+CREATE TABLE pricefeeds (token TEXT PRIMARY KEY, id TEXT NOT NULL);
 
 CREATE TABLE erc20_selectors             (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
 CREATE TABLE uniswapv2_selectors         (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
 CREATE TABLE reputation_registry_selectors (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
-
-CREATE TABLE agent_registries (chain_id INTEGER PRIMARY KEY, identity_registry TEXT NOT NULL, reputation_registry TEXT NOT NULL);
-CREATE TABLE agent_ids        (chain_id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL);
 
 CREATE TABLE recurring_transfers (
     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
@@ -145,7 +142,20 @@ CREATE TABLE recurring_transfers (
 );
 ```
 
-**Initialisation:** Run `make db` once to create all tables and seed from the `migrate/` JSON files. Re-running is safe — it uses `INSERT OR REPLACE`.
+**Initialisation:** Run `make db` once to create all tables and seed from the `migrate/` JSON files, plus the `factory` table from the Forge broadcast file written by `make deploy`. Re-running is safe — it uses `INSERT OR REPLACE`.
+
+**Pyth feed lookups:**
+
+```python
+def get_pricefeed_id(token: str) -> str
+    # Returns the Pyth feed ID (0x-prefixed bytes32 hex string) for a ticker.
+    # Raises ValueError if the token has no registered feed.
+
+def get_all_pricefeed_tokens() -> list[str]
+    # Returns every ticker with a registered Pyth feed — used by tools.py to
+    # refresh the oracle's full price set in one Hermes call rather than
+    # tracking which specific tokens a given on-chain call touches.
+```
 
 ---
 
@@ -186,7 +196,7 @@ Contract loading with module-level caching. Every loader checks a per-`chat_id` 
 ```python
 def load_session_handler(chat_id: int) -> Contract
 def load_entry_point(chat_id: int) -> Contract
-def load_ierc20(chat_id: int, token: str) -> Contract       # uses IWETH ABI for "weth"
+def load_ierc20(chat_id: int, token: str, uniswap_pair: bool = False) -> Contract  # uses IWETH ABI for "weth"
 def load_iuniswap_router(chat_id: int) -> Contract
 def load_iuniswap_factory(chat_id: int) -> Contract
 def load_iuniswap_pair(chat_id: int, token_a: str, token_b: str) -> Contract
@@ -197,6 +207,26 @@ def invalidate_cache(chat_id: int) -> None                   # call after a rede
 ```
 
 > The cache is process-scoped. Restart the bot process to invalidate after a contract redeploy.
+
+---
+
+## `pyth.py`
+
+Fetches a fresh Pyth price update payload from [Hermes](https://hermes.pyth.network/) for a list of ticker symbols.
+
+```python
+def fetch_price_update_data(tokens: list[str]) -> list[str]:
+    # Looks up each ticker's Pyth feed ID via get_pricefeed_id(), then makes a single
+    # batched request to Hermes' /v2/updates/price/latest endpoint for all of them.
+    # Returns a list of 0x-prefixed hex blobs — passed straight through as
+    # SessionHandler.execute()'s priceUpdateData argument. Empty input returns [].
+```
+
+Hermes batches every requested feed ID into a single combined update blob — requesting 19 feeds still returns one ~15KB payload, not 19 separate ones. Raises `ValueError` if a ticker has no registered feed (propagated from `get_pricefeed_id`), or `RuntimeError` on a Hermes HTTP error or unexpected response shape.
+
+## `price_update.py`
+
+A standalone fixture generator for fork tests, not used by the bot at runtime. Fetches real Hermes data for a fixed token list (`FORK_TEST_TOKENS`, matching what `test/fork/SHUniswapV2Test.t.sol` and `test/fork/SHSepoliaTest.t.sol` exercise) and writes it to `script/PriceUpdate.json` (gitignored), which `script/PriceUpdate.s.sol` then reads on-chain via `vm.parseJsonBytesArray`. Run via `make price-update` before running fork tests — see [docs/contracts.md](contracts.md#priceupdates-sol).
 
 ---
 
@@ -224,7 +254,7 @@ def get_or_create_session_key(chat_id: int, target_address: str) -> tuple[str, s
 
 `send_user_op_as_session()` orchestrates the complete UserOp lifecycle:
 
-1. ABI-encode `SessionHandler.execute(target, value, data)` as the UserOp `callData`.
+1. ABI-encode `SessionHandler.execute(target, value, data, price_update_data)` as the UserOp `callData`. `price_update_data` is supplied by the caller (`tools.py`'s dispatcher) — see below.
 2. Fetch nonce from `EntryPoint.getNonce()`.
 3. Build a signed dummy op, estimate gas via `eth_estimateGas`, then construct the real op with a 20% buffer and live gas price.
 4. Decrypt session key from Vault transiently, sign with EIP-191, wipe.
@@ -250,7 +280,7 @@ The blockchain execution layer for **live networks** (Sepolia, mainnet). Submits
 
 `send_live_user_op_as_session()`:
 
-1. ABI-encode `SessionHandler.execute(target, value, data)`.
+1. ABI-encode `SessionHandler.execute(target, value, data, price_update_data)`.
 2. Fetch nonce from `EntryPoint.getNonce()`.
 3. Submit a signed dummy op to `eth_estimateUserOperationGas` to get per-component gas limits.
 4. Construct the final op with a 20% buffer and live gas price.
@@ -271,37 +301,42 @@ USER_OP_POLL_INTERVAL_SECS   = 2
 
 > The Alchemy bundler signs and pays for the outer transaction. `SEPOLIA_BUNDLER` in `.env` is not used by `live_network.py`.
 
-### Network Routing in `tools.py`
+### Network Routing and Price Freshness in `tools.py`
+
+`send_user_op_as_session()` is the single dispatcher every write `@tool` calls through. Before routing to a backend, it checks `SessionHandler.oracleIsUpToDate()` — a cheap `eth_call` mirroring the same heartbeat condition `execute()` itself uses — and only hits Hermes for a fresh price update when the oracle's cached price has actually gone stale:
 
 ```python
 def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
     _, _, chain_name = load_network_config(chat_id)
+    session_handler = load_session_handler(chat_id)
+
+    price_update_data = []
+    if not session_handler.functions.oracleIsUpToDate().call():
+        price_update_data = fetch_price_update_data(get_all_pricefeed_tokens())
+
     if "fork" in chain_name.lower() or "anvil" in chain_name.lower():
-        return _send_user_op_as_session(...)   # anvil.py — direct handleOps()
+        return _send_user_op_as_session(chat_id, key_ciphertext, target, value, data, price_update_data)  # anvil.py
     else:
-        return _send_live_user_op_as_session(...)  # live_network.py — bundler RPC
+        return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data, price_update_data)  # live_network.py
 ```
+
+This avoids paying both Pyth's update fee and Hermes' round-trip / calldata cost on every single call — most calls land within the heartbeat window and skip the refresh entirely. `RuntimeError`/`ValueError` from either backend or from the Hermes fetch is converted to `ToolException` so LangChain's tool error handler can surface it to the agent cleanly.
 
 ---
 
 ## `deploy_wallet.py`
 
-Deployment and session registration scripts. Run once per fresh environment or network.
+Per-user wallet deployment and session registration. This module does **not** deploy the shared protocol infrastructure — `EntryPoint`, `SHOracle`, `SHTreasury`/`SHRegistry`, `SHValueInterpreter`, and `SHFactory` are deployed once per chain by the Forge script (`forge script script/DeploySHProtocol.s.sol`, run via `make deploy`) and synced into the DB by `make db`. Everything here assumes that infrastructure already exists and operates strictly on top of it.
 
-**`deploy_session_handler_anvil(chat_id)`** deploys the full stack on Anvil:
+**`deploy_wallet(chat_id, chain_name)`** calls `SHFactory.deployWallet()` to create a new `SessionHandler` owned by the deployer key, funds it (and the bundler, on fork networks) with 10 ETH via `prefund()`, and persists the resulting address to `wallet.db`. Fork networks sign with `ANVIL_PRIVATE_KEY`; `"sepolia"` uses `SEPOLIA_PRIVATE_KEY`.
 
-1. EntryPoint
-2. 18 ERC20Mock tokens + 19 MockV3Aggregator price feeds
-3. SHOracle
-4. MockIdentityRegistry + MockReputationRegistry
-5. SHTreasury (deploys SHRegistry) → SHValueInterpreter → SHFactory
-6. `SHFactory.deployWallet()` → user's SessionHandler
-7. Mint tokens + send 10 ETH to SessionHandler
-8. Persist all addresses to `wallet.db`
+**`deploy(chat_id, network)`** is the top-level dispatcher — validates `network` is one of `"anvil"`, `"mainnet-fork"`, `"sepolia-fork"`, `"sepolia"`, then calls `deploy_wallet()`. This is what `make deploy-wallet` invokes via the `__main__` block.
 
-**`deploy_session_handler(chat_id, network)`** deploys on a live or fork network (`"mainnet-fork"`, `"sepolia-fork"`, `"sepolia"`). Fork networks use `ANVIL_PRIVATE_KEY`; `"sepolia"` uses `SEPOLIA_PRIVATE_KEY`. Calls `prefund()` after deployment and `_verify()` for non-fork Sepolia (if `ETHERSCAN_API_KEY` is set).
+**`add_session(chat_id, targets, functions, session_ends, limits)`** registers one session key per target by calling `addSessionKey()` as the owner — used internally by `add_default_session()`, but also callable directly for custom session sets.
 
-**`add_default_session(chat_id)`** registers default session keys. Sessions vary by network:
+**`approve(chat_id, token)`** approves the Uniswap V2 router for `type(uint256).max` of a token from the SessionHandler, calling `execute()` as the owner. `add_session()` calls this automatically for every non-ETH, non-router target when deploying on a mainnet network, since the router uses `transferFrom` to pull tokens.
+
+**`add_default_session(chat_id)`** registers a default set of session keys via `add_session()`. Sessions vary by network:
 
 **mainnet-fork** (5 sessions):
 

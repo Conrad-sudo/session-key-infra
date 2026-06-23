@@ -231,8 +231,9 @@ contract SHProtocolTest is Test {
     function _refreshMockFeed(bytes32 feedId) private {
         MockPyth pyth = MockPyth(config.pyth);
         PythStructs.Price memory p = IPyth(config.pyth).getPriceUnsafe(feedId);
-        bytes memory updateData =
-            pyth.createPriceFeedUpdateData(feedId, p.price, p.conf, p.expo, p.price, p.conf, uint64(block.timestamp), 0);
+        bytes memory updateData = pyth.createPriceFeedUpdateData(
+            feedId, p.price, p.conf, p.expo, p.price, p.conf, uint64(block.timestamp), 0
+        );
         bytes[] memory updates = new bytes[](1);
         updates[0] = updateData;
         pyth.updatePriceFeeds(updates);
@@ -244,7 +245,8 @@ contract SHProtocolTest is Test {
 
     /// @notice validateUserOp must revert when called by any address other than the EntryPoint
     function testValidateUserOpRevertsForNonEntryPoint() public {
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, "");
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, "", new bytes[](0));
         (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
             address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
         );
@@ -262,7 +264,7 @@ contract SHProtocolTest is Test {
 
         vm.expectRevert(SessionHandler.SessionHandler_NotEntryPointOrOwner.selector);
         vm.prank(user);
-        sessionHandler.execute(dest, value, data);
+        sessionHandler.execute(dest, value, data, new bytes[](0));
     }
 
     /// @notice Owner must be able to execute arbitrary calls on behalf of the account
@@ -272,7 +274,7 @@ contract SHProtocolTest is Test {
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
 
         vm.prank(sessionHandler.owner());
-        sessionHandler.execute(dest, value, data);
+        sessionHandler.execute(dest, value, data, new bytes[](0));
         assertEq(usdc.balanceOf(user), AMOUNT_TO_MINT);
     }
 
@@ -285,7 +287,7 @@ contract SHProtocolTest is Test {
         vm.startPrank(sessionHandler.owner());
         sessionHandler.pause();
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        sessionHandler.execute(dest, value, data);
+        sessionHandler.execute(dest, value, data, new bytes[](0));
         vm.stopPrank();
     }
 
@@ -298,7 +300,7 @@ contract SHProtocolTest is Test {
         vm.startPrank(sessionHandler.owner());
         sessionHandler.pause();
         sessionHandler.unpause();
-        sessionHandler.execute(dest, value, data);
+        sessionHandler.execute(dest, value, data, new bytes[](0));
         vm.stopPrank();
 
         assertEq(usdc.balanceOf(user), AMOUNT_TO_MINT);
@@ -371,7 +373,7 @@ contract SHProtocolTest is Test {
 
         vm.expectRevert(SessionHandler.SessionHandler_NotEntryPointOrOwner.selector);
         vm.prank(user);
-        sessionHandler.execute(dest, value, data);
+        sessionHandler.execute(dest, value, data, new bytes[](0));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -381,7 +383,8 @@ contract SHProtocolTest is Test {
     /// @notice validateUserOp must return SIG_VALIDATION_FAILED when the signer is neither the owner nor a registered session key
     function testValidateUserOpFailsWithUnknownSigner() public {
         (address random, uint256 randomKey) = makeAddrAndKey("random");
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, "");
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, "", new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, random, randomKey);
@@ -400,7 +403,7 @@ contract SHProtocolTest is Test {
 
         vm.prank(sessionHandler.owner());
         vm.expectRevert(SessionHandler.SessionHandler_ExecutionFailed.selector);
-        sessionHandler.execute(address(usdc), 0, badCallData);
+        sessionHandler.execute(address(usdc), 0, badCallData, new bytes[](0));
     }
 
     /**
@@ -415,7 +418,8 @@ contract SHProtocolTest is Test {
         uint256 value = 0;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
             address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
@@ -442,7 +446,8 @@ contract SHProtocolTest is Test {
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -469,7 +474,8 @@ contract SHProtocolTest is Test {
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, wrongDest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, wrongDest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -494,7 +500,8 @@ contract SHProtocolTest is Test {
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -519,7 +526,8 @@ contract SHProtocolTest is Test {
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -549,7 +557,8 @@ contract SHProtocolTest is Test {
         address expectedSigner = sessionHandler.owner();
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
 
-        bytes memory callData = abi.encodeWithSelector(sessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(sessionHandler.execute.selector, dest, value, data, new bytes[](0));
         (PackedUserOperation memory userOp,, bytes32 digest) = sendPackedUserOp.generateSignedUserOp(
             address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
         );
@@ -569,7 +578,8 @@ contract SHProtocolTest is Test {
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
 
-        bytes memory callData = abi.encodeWithSelector(sessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(sessionHandler.execute.selector, dest, value, data, new bytes[](0));
         (PackedUserOperation memory userOp,, bytes32 digest) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         address actualSigner = ECDSA.recover(digest, userOp.signature);
@@ -591,7 +601,8 @@ contract SHProtocolTest is Test {
         uint256 value = 0;
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
             address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
@@ -618,7 +629,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -669,7 +681,8 @@ contract SHProtocolTest is Test {
         uint256 valueInUsd = oracle.getUsdValue(address(0), value);
 
         bytes memory data = ""; // No data needed for native ETH transfer
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -711,7 +724,8 @@ contract SHProtocolTest is Test {
 
         // `approve` should no longer be allowed — if it is, the old mapping was never cleared
         bytes memory data = abi.encodeWithSelector(ERC20Mock.approve.selector, makeAddr("s"), 1e6);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data, new bytes[](0));
         (PackedUserOperation memory userOp, bytes32 hash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
 
@@ -791,7 +805,8 @@ contract SHProtocolTest is Test {
         for (uint256 i = 0; i < 3; i++) {
             PackedUserOperation[] memory ops = new PackedUserOperation[](1);
             bytes memory data = abi.encodeWithSelector(MockWeth.transfer.selector, reciever, singleSpend);
-            bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+            bytes memory callData =
+                abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
             (PackedUserOperation memory userOp,,) =
                 sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
             ops[0] = userOp;
@@ -819,7 +834,8 @@ contract SHProtocolTest is Test {
 
         // approve selector should pass
         bytes memory data = abi.encodeWithSelector(ERC20Mock.approve.selector, makeAddr("spender"), 1e6);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data, new bytes[](0));
         (PackedUserOperation memory userOp, bytes32 hash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
 
@@ -830,7 +846,7 @@ contract SHProtocolTest is Test {
 
         // mint (unlisted) should still fail
         data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, 1e6);
-        callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data);
+        callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data, new bytes[](0));
         (userOp, hash,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
 
@@ -887,7 +903,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.transfer.selector, receiver, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -957,7 +974,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.transfer.selector, receiver, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -984,7 +1002,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.deposit.selector);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -1011,7 +1030,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.approve.selector, kani, type(uint256).max);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -1044,7 +1064,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.transferFrom.selector, kani, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -1188,8 +1209,14 @@ contract SHProtocolTest is Test {
      *      the production contract.
      */
     function testPackValidationDataRoundTrip(bool sigFailed, uint48 validAfter, uint48 validUntil) public {
-        SessionHandlerHarness sessionHandlerHarness =
-            new SessionHandlerHarness(config.account, config.entryPoint, config.reputationRegistry, config.identityRegistry, address(feeRegistry), 0);
+        SessionHandlerHarness sessionHandlerHarness = new SessionHandlerHarness(
+            config.account,
+            config.entryPoint,
+            config.reputationRegistry,
+            config.identityRegistry,
+            address(feeRegistry),
+            0
+        );
         uint256 packed = sessionHandlerHarness.packValidationData(sigFailed, validAfter, validUntil);
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(uint160(packed), sigFailed ? 1 : 0);
@@ -1215,7 +1242,8 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);

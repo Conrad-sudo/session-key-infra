@@ -9,7 +9,7 @@ src/
 ├── SHFactory.sol              ← User-facing factory — deploys one SessionHandler per user
 ├── SHTreasury.sol             ← Protocol fee collector — owns and administers SHRegistry
 ├── SHRegistry.sol             ← Central config store (fee, treasury, oracle, agentId, router, interpreter)
-├── SHOracle.sol               ← Chainlink-based USD value converter
+├── SHOracle.sol               ← Pyth Network-based USD value converter
 ├── SHValueInterpreter.sol     ← Decodes session-key calldata → USD debit/credit values
 ├── SessionHandler.sol         ← ERC-4337 smart account with session key logic
 ├── interfaces/
@@ -21,14 +21,15 @@ src/
     ├── MockIdentityRegistry.sol  ← Full ERC-8004 Identity Registry mock (local testing)
     ├── MockReputationRegistry.sol← ERC-8004 Reputation Registry mock (local testing)
     ├── ERC20Mock.sol             ← Mintable ERC20 for local testing
-    ├── MockV3Aggregator.sol      ← Chainlink price feed mock for Anvil
+    ├── MockV3Aggregator.sol      ← Unused leftover from the pre-Pyth Chainlink oracle (Anvil now uses Pyth's own MockPyth)
     └── MockWeth.sol              ← WETH mock with deposit/withdraw for Anvil
 
 script/
 ├── DeploySHProtocol.s.sol    ← Deployment entry point (SHOracle → SHTreasury → SHValueInterpreter → SHFactory)
-├── Constants.s.sol            ← Shared mainnet/Sepolia contract addresses
+├── Constants.s.sol            ← Shared Pyth price feed IDs and network-specific contract addresses
 ├── HelperConfig.s.sol         ← Chain-specific configuration resolver
-└── SendPackedUserOp.s.sol     ← UserOp construction and signing helper
+├── SendPackedUserOp.s.sol     ← UserOp construction and signing helper
+└── PriceUpdate.s.sol          ← Reads a pre-fetched Hermes update from PriceUpdate.json and pushes it via SHOracle.updatePrices() — used by fork tests and as a standalone CLI script
 
 test/
 ├── unit/
@@ -146,48 +147,52 @@ Extracting this logic into a standalone contract allows the oracle and Uniswap r
 
 | Operation | USD treatment |
 |---|---|
-| Native ETH send | `value` priced via ETH/USD feed |
-| ERC-20 `transfer` / `transferFrom` | token `amount` priced via token/USD feed |
+| Native ETH send (`value > 0`, not a WETH `deposit`) | `value` priced via the ETH/USD Pyth feed |
+| ERC-20 `transfer` / `transferFrom` | token `amount` priced via the token's Pyth feed |
 | Uniswap V2 swaps | exact input or exact output amount priced at the input token |
 | `addLiquidity` / `addLiquidityETH` | both deposit amounts priced and summed |
-| `removeLiquidity` / `removeLiquidityETH` | returns a `creditValueInUSD` (budget credit, not debit) |
+| `removeLiquidity` / `removeLiquidityETH` | returns a `creditValueInUsd` (budget credit, not debit) |
 | WETH `deposit` | ETH component excluded (deposit just wraps — no net spend) |
+
+The `value > 0` guard on the native-ETH branch matters because `computeUsdValue` is also reachable with `value == 0` for plain token calls — without it, every such call would needlessly price `address(0)` for zero ETH.
 
 ```solidity
 constructor(address registry);  // SHRegistry address
 
-// Returns (debitValueInUSD, creditValueInUSD) — creditValueInUSD non-zero only for removeLiquidity variants.
-function computeUSDValue(
+// Returns (debitValueInUsd, creditValueInUsd) — creditValueInUsd non-zero only for removeLiquidity variants.
+function computeUsdValue(
     address dest,
     uint256 value,
     bytes memory data,
     bytes4 selector
-) external view returns (uint256 debitValueInUSD, uint256 creditValueInUSD);
+) external view returns (uint256 debitValueInUsd, uint256 creditValueInUsd);
 ```
 
 ---
 
 ## `SHOracle.sol`
 
-The `SHOracle` converts ETH and ERC20 token amounts into real-time USD values using Chainlink price feeds. It is called by `SHValueInterpreter` to enforce USD-denominated spending limits rather than raw token amounts.
+The `SHOracle` converts ETH and ERC20 token amounts into real-time USD values using [Pyth Network](https://pyth.network/) price feeds. It is called by `SHValueInterpreter` to enforce USD-denominated spending limits rather than raw token amounts.
 
 This design accounts for stablecoin depeg events (e.g., USDC at $0.87 during the March 2023 SVB crisis) by querying actual market prices rather than assuming a 1:1 peg.
 
-**Supported tokens (21 registered by Forge deploy script; 26 in mainnet `HelperConfig`):** ETH (via `address(0)`), USDC, DAI, WETH, USDT, AAVE, LINK, 1INCH, APE, ARB, BNB, WBTC, COMP, CRV, ENS, MKR, SAND, SUSHI, wTAO, UNI, YFI. The mainnet `HelperConfig` additionally provides WAVAX, BAT, IMX, KNC, and RDNT. The Python `deploy.py` path registers all 26 on mainnet.
+**Supported tokens:** registered per-token via `(address token, bytes32 priceFeedId)` pairs passed to the constructor — ETH uses `address(0)`. Pyth feed IDs are `bytes32` and identical across every EVM chain Pyth supports (unlike Chainlink, where feed availability and addresses vary per network), so the same feed ID constants in `script/Constants.s.sol` are reused for both mainnet and Sepolia configs in `HelperConfig.s.sol`. The exact registered token set per network lives there — there's no fixed list to keep in sync here. One notable exclusion: no MKR/USD feed exists on Pyth, so MKR has been dropped entirely.
 
-Token-to-feed mappings are stored in `mapping(address => address) private s_priceFeed`, and per-feed staleness thresholds in `mapping(address => uint256) private s_heartbeat`. Entries with `address(0)` feeds are silently skipped, allowing safe deployment on chains with partial feed availability.
+Token-to-feed mappings are stored in a single `mapping(address => bytes32) private sPriceFeedId`. Pairs whose `priceFeedId` is `bytes32(0)` are silently skipped at construction, so the same `NetworkConfig` array shape can be reused across networks even when a token has no feed on a given chain.
 
-**Per-feed staleness protection:** Reverts with `SHOracle_StalePrice` if a feed has not updated within its registered heartbeat. Heartbeats: 1 hour for ETH, BTC, AAVE, LINK, DAI, COMP, MKR, UNI, WETH; 23 hours for USDC; 24 hours for all others.
+**Staleness protection:** a single `heartbeat` (immutable, set at construction) applies to every registered token — 24 hours on mainnet/Sepolia, 1 hour on Anvil. `getPrice`/`getUsdValue` revert with `SHOracle_StalePrice` if `block.timestamp - publishTime > heartbeat` for the requested feed, where `publishTime` comes from Pyth's own `getPriceUnsafe()` (a free, view-only read — no Pyth fee is paid just to read a price).
+
+**Refreshing prices:** `updatePrices(bytes[] updateData)` pushes a fresh, Hermes-signed update on-chain via Pyth's `updatePriceFeeds`, paying Pyth's fee from this contract's own ETH balance (top up via `receive()`) so callers never attach value. It's callable by anyone — the payload itself is Pyth-signed, so there's no way to push a false price through this path. `lastUpdated` records when this last succeeded, so `heartbeat`/`lastUpdated` together let `SessionHandler.execute()` (and the off-chain bot, via `oracleIsUpToDate()`) decide cheaply whether a refresh is actually due before paying for one.
 
 ```solidity
-constructor(
-    address[] memory tokens,
-    address[] memory priceFeeds,
-    uint256[] memory heartbeats
-);
+constructor(address pyth, address[] memory tokens, bytes32[] memory priceFeedIds, uint256 heartbeat_);
 
-function getUSDValue(address token, uint256 amount) external view returns (uint256);
 function getPrice(address token) external view returns (uint256 price, uint8 decimals);
+function getUsdValue(address token, uint256 amount) external view returns (uint256);
+function updatePrices(bytes[] calldata updateData) external;
+
+uint256 public immutable heartbeat;
+uint256 public lastUpdated;
 ```
 
 ---
@@ -210,8 +215,9 @@ Each `SessionHandler` reads all protocol parameters from `SHRegistry` at executi
 | Native ETH sends | `address(0)` session target sentinel — allows ETH transfers to arbitrary recipients |
 | Protocol fee | Charges a flat ETH fee (`REGISTRY.protocolFee()`) to `REGISTRY.treasury()` on every session-key execution |
 | Owner revocation | `revokeSessionKey` cleans up mappings and resets storage |
-| Owner withdrawal | `withdraw(token, amount)` allows the owner to pull ERC20 tokens or ETH from the wallet |
+| Owner withdrawal | `withdraw(token, amount, to)` allows the owner to pull ERC20 tokens or ETH from the wallet to a chosen recipient |
 | Agent identity | `getAgentIdentity()` and `getAgentReputation()` proxy to the ERC-8004 registries |
+| Just-in-time price refresh | `execute()`'s 4th parameter, `priceUpdateData`, is forwarded to `SHOracle.updatePrices()` whenever the oracle's cached price is past its heartbeat — see below |
 
 **Session struct:**
 
@@ -236,7 +242,7 @@ address transient tPendingSessionKey;
 bytes4  transient tPendingSelector;
 ```
 
-USD computation is deferred entirely to `execute()` via `SHValueInterpreter.computeUSDValue()`, because oracle reads (external storage) are forbidden during validation. The transient slots are zeroed automatically at transaction end.
+USD computation is deferred entirely to `execute()` via `SHValueInterpreter.computeUsdValue()`, because oracle reads (external storage) are forbidden during validation. The transient slots are zeroed automatically at transaction end.
 
 **Signature validation flow (`validateUserOp`):**
 
@@ -248,27 +254,32 @@ USD computation is deferred entirely to `execute()` via `SHValueInterpreter.comp
    - Otherwise: assert `dest` matches session target, extract selector, assert `_isSessionUsable` and `isSelectorAllowed`, write transient storage, return packed time bounds.
 4. Otherwise — return `SIG_VALIDATION_FAILED`.
 
+**Just-in-time price refresh:**
+
+`execute()` takes a 4th parameter, `bytes[] calldata priceUpdateData` — a Pyth update payload fetched off-chain from Hermes, or an empty array to skip the refresh attempt. If `priceUpdateData.length > 0 && !oracleIsUpToDate()`, it's forwarded to `SHOracle.updatePrices()` *before* any USD value is computed, so the spend check below reads a freshly-pushed price. This rides on the session key's existing signature and the bundler's existing gas payment — no separate transaction or signer is needed, and the Pyth fee itself is paid from `SHOracle`'s own ETH balance. Because the gate is `!oracleIsUpToDate()`, whoever's transaction happens to land after the heartbeat elapses is the one who pays to refresh it — everyone else's calls skip the refresh (and its fee) entirely.
+
 **USD computation and fee collection (`execute`):**
 
-When called by the EntryPoint with `tPendingSessionKey != address(0)`, calls `SHValueInterpreter.computeUSDValue()` to get `(debitValueInUSD, creditValueInUSD)`, enforces the spending limit, then dispatches the inner call. After success, collects the flat protocol fee to the treasury.
+When called by the EntryPoint with `tPendingSessionKey != address(0)` and `dest != REPUTATION_REGISTRY`, calls `SHValueInterpreter.computeUsdValue()` to get `(debitValueInUsd, creditValueInUsd)`, enforces the spending limit, then dispatches the inner call. After success, collects the flat protocol fee to the treasury. Calls to `REPUTATION_REGISTRY` skip the entire budget block — Reputation Registry sessions carry no spending limit (`spendingLimit` is exempted from the zero-check in `addSessionKey` for this target) and move no value, so there's nothing to price or auto-revoke on.
 
 **`removeLiquidity` budget accounting:**
 
-For `removeLiquidity` variants, `computeUSDValue` returns a non-zero `creditValueInUSD` and zero `debitValueInUSD`. `execute` credits back up to the current `spentAmount` rather than charging — LP removal recovers value, it does not spend it.
+For `removeLiquidity` variants, `computeUsdValue` returns a non-zero `creditValueInUsd` and zero `debitValueInUsd`. `execute` credits back up to the current `spentAmount` rather than charging — LP removal recovers value, it does not spend it.
 
 **Key functions:**
 
 ```solidity
 function addSessionKey(address sessionKey, address target, bytes4[] calldata selectors, uint48 validFrom, uint48 validUntil, uint256 spendingLimit) external onlyOwner;
 function revokeSessionKey(address sessionKey) public onlyOwner;
-function execute(address dest, uint256 value, bytes calldata data) external onlyEntryPointOrOwner whenNotPaused;
-function withdraw(address token, uint256 amount) external onlyOwner;
+function execute(address dest, uint256 value, bytes calldata data, bytes[] calldata priceUpdateData) external onlyEntryPointOrOwner whenNotPaused;
+function withdraw(address token, uint256 amount, address to) external onlyOwner;
 
 function getSession(address sessionKey) public view returns (Session memory);
 function isSessionActive(address sessionKey) public view returns (bool);
 function getRemainingBudget(address sessionKey) public view returns (uint256);
 function isSpendingWithinBudget(address sessionKey, address token, uint256 amount) public view returns (bool);
 function getPrice(address token) public view returns (uint256 price, uint8 decimals);
+function oracleIsUpToDate() public view returns (bool);
 function getAgentId() public view returns (uint256);
 function getAgentIdentity() public view returns (bool registered, uint256 agentId, string memory agentUri);
 function getAgentReputation() public view returns (uint256 agentId, uint64 feedbackCount, int128 summaryValue, uint8 summaryValueDecimals);
@@ -310,9 +321,9 @@ The project integrates the **ERC-8004** standard for on-chain agent identity and
 | Ethereum Sepolia | 11155111 | `ENTRYPOINT_V07` (canonical) |
 | Anvil (local) | 31337 | Freshly deployed, cached per session |
 
-For Anvil, `HelperConfig` deploys a fresh `EntryPoint`, 25 token mocks, 25 `MockV3Aggregator` price feeds, `MockIdentityRegistry`, and `MockReputationRegistry`, then caches the result. Mock prices approximate real-world values (ETH at $1000, USDC at $0.998). All mock feeds use a 1-hour heartbeat.
+For Anvil, `HelperConfig` deploys a fresh `EntryPoint`, token mocks, a `MockPyth` contract seeded with mock prices for every registered feed, `MockIdentityRegistry`, and `MockReputationRegistry`, then caches the result. Mock prices approximate real-world values (ETH at $1000, USDC at $0.998). The Anvil `heartbeat` is `HEARTBEAT_1H` — short enough that fork/unit tests exercising `vm.warp` can still trigger a deliberate `SHOracle_StalePrice` revert without waiting a full day.
 
-For Sepolia, live testnet token and Chainlink feed addresses are returned. USDT, AAVE, and UNI have Sepolia token addresses but no Chainlink feeds on Sepolia — they are registered as tokens but skipped during oracle construction. Uniswap V2 is not deployed on Sepolia, so `uniswapRouter` is `address(0)`.
+For Sepolia and mainnet, `heartbeat` is `HEARTBEAT_24H`. Because Pyth feed IDs are network-agnostic `bytes32` values (unlike Chainlink, where feed *addresses* vary per chain), the same feed ID constants from `script/Constants.s.sol` are reused for both networks — there's no Sepolia-specific "feed doesn't exist on this chain" caveat the way there was under Chainlink. Token *addresses* still differ per network and are resolved separately. Uniswap V2 is not deployed on Sepolia, so `uniswapRouter` is `address(0)`.
 
 `getMainnetConfig()` is primarily used for mainnet-fork testing and sets `account` to Anvil's default account 0. **Before deploying to live mainnet, replace this with a real funded EOA.**
 
@@ -325,7 +336,7 @@ Orchestrates deployment of all shared protocol infrastructure. Individual `Sessi
 **Deployment sequence:**
 
 1. Instantiate `HelperConfig` to resolve chain-specific addresses.
-2. Build parallel token/feed/heartbeat arrays and deploy `SHOracle`.
+2. Build parallel token/feed arrays from `config` and deploy `SHOracle(config.pyth, tokens, priceFeeds, config.heartbeat)` — a single `heartbeat` now applies to every token, rather than a per-token array.
 3. Call `IIdentityRegistry.register(AGENT_URI)` to mint the agent's identity NFT and obtain `agentId`.
 4. Deploy `SHTreasury(initialFee, oracle, agentId, uniswapRouter)` — the treasury's constructor deploys its own `SHRegistry`.
 5. Deploy `SHValueInterpreter(treasury.REGISTRY())` and wire it in via `treasury.setCallValueInterpreter(interpreter)`.
@@ -355,6 +366,24 @@ A reusable script helper for constructing signed `PackedUserOperation`s, used by
 
 ---
 
+## `PriceUpdate.s.sol`
+
+A script helper that pushes a real, Hermes-signed Pyth price update onto a fork's actual `SHOracle`, replacing the `vm.mockCall`-based feed mocking used before the Pyth migration. Genuinely fetched Pyth data has a fixed `publishTime` baked into the signed payload — unlike a mocked `latestRoundData` return value, it cannot be made to look fresh after `vm.warp` jumps the block timestamp forward, so tests need a real mechanism to refresh it.
+
+**Flow:**
+1. Off-chain, `app/price_update.py` calls `fetch_price_update_data()` (in `app/pyth.py`) to pull a fresh combined update blob from Hermes for a fixed token list (`FORK_TEST_TOKENS`), and writes it to `script/PriceUpdate.json` (gitignored — regenerated per run, not committed).
+2. `PriceUpdate.s.sol` reads that JSON via `vm.parseJsonBytesArray` (requires `fs_permissions = [{ access = "read", path = "./script" }]` in `foundry.toml`) and calls `oracle.updatePrices(updateData)` directly.
+
+```solidity
+function getPriceUpdateData() public view returns (bytes[] memory);
+function updateOracle(address oracle) public;
+function run(address oracle) external; // CLI entry point
+```
+
+Both fork test suites (`SHUniswapV2Test.t.sol` and `SHSepoliaTest.t.sol`) instantiate `PriceUpdate` in `setUp()` and call `priceUpdate.updateOracle(address(oracle))` instead of mocking, so `lastUpdated` reflects a real on-chain price push before any `vm.warp`.
+
+---
+
 ## Test Suite
 
 **`test/unit/SHProtocolTest.t.sol`** — comprehensive coverage of the full `SessionHandler` lifecycle.
@@ -369,9 +398,9 @@ A reusable script helper for constructing signed `PackedUserOperation`s, used by
 | View Functions | `isSessionActive`, `getRemainingBudget`, `getSession`, `isSpendingWithinBudget` |
 | Events | `SessionAdded` and `SessionRevoked` emissions |
 
-Tests that use `vm.warp` call `_refreshMockFeeds()` afterward to reset the `updatedAt` timestamp on all `MockV3Aggregator` instances, preventing false `SHOracle_StalePrice` reverts.
+Tests that use `vm.warp` call `_refreshMockFeeds()` afterward to reset `lastUpdated` on the Anvil `MockPyth` instance, preventing false `SHOracle_StalePrice` reverts.
 
-**`test/fork/SHUniswapV2Test.t.sol`** — integration tests for all six Uniswap V2 swap functions against a live mainnet fork. Uses `vm.mockCall` on `latestRoundData` to keep feeds fresh after `vm.warp`.
+**`test/fork/SHUniswapV2Test.t.sol`** — integration tests for all six Uniswap V2 swap functions against a live mainnet fork. `setUp()` instantiates `PriceUpdate` and calls `priceUpdate.updateOracle(address(oracle))` to push a real Hermes-fetched price update before any `vm.warp` — see [`PriceUpdate.s.sol`](#priceupdates-sol) above. This requires `script/PriceUpdate.json` to exist and be reasonably fresh; run `make price-update` first if tests fail with `SHOracle_StalePrice`.
 
 | Test | Swap Function |
 |---|---|
@@ -382,7 +411,7 @@ Tests that use `vm.warp` call `_refreshMockFeeds()` afterward to reset the `upda
 | `testSwapTokensForExactETHWithSession` | `swapTokensForExactETH` |
 | `testSwapExactETHForTokensWithSession` | `swapExactETHForTokens` |
 
-**`test/fork/SHSepoliaTest.t.sol`** — integration tests against a live Sepolia fork.
+**`test/fork/SHSepoliaTest.t.sol`** — integration tests against a live Sepolia fork. Also uses `PriceUpdate` in `setUp()` to refresh the oracle with real data before testing.
 
 | Test | Description |
 |---|---|
@@ -415,6 +444,9 @@ forge test --match-path test/unit/SHProtocolTest.t.sol
 
 # Invariant tests
 forge test --match-path test/invariant/InvariantSH.t.sol
+
+# Fetch a fresh Pyth price update for fork tests (writes script/PriceUpdate.json)
+make price-update
 
 # Fork test — Uniswap V2 (mainnet fork)
 forge test --match-path test/fork/SHUniswapV2Test.t.sol --fork-url $MAINNET_RPC_URL

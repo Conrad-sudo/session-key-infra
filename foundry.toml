@@ -16,6 +16,8 @@ remappings= ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
 
 
 
+fs_permissions = [{ access = "read", path = "./script" }]
+
 [fuzz]
 runs=1000
 depth=200

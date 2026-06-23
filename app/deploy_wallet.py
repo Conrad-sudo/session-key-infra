@@ -313,7 +313,7 @@ def approve(chat_id: int, token: str):
     )
 
     _call(
-        session_handler.functions.execute(erc20.address, 0, approve_data),
+        session_handler.functions.execute(erc20.address, 0, approve_data, []),
         w3,
         deployer,
         chain_id,

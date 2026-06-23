@@ -30,7 +30,6 @@ import {IWETH} from "./interfaces/IWETH.sol";
  *      removeLiquidity variants, where the session budget is credited rather than charged.
  */
 contract SHValueInterpreter {
-
     /// @dev Anvil's default chainId. The zero-router guard is skipped on this chain since
     ///      Uniswap V2 has no local deployment there.
     uint256 private constant ANVIL_CHAIN_ID = 31337;
@@ -64,22 +63,20 @@ contract SHValueInterpreter {
         external
         view
         returns (uint256 debitValueInUsd, uint256 creditValueInUsd)
-    {   
-
-
+    {
         address uniswapRouter = REGISTRY.uniswapRouter();
         if (uniswapRouter == address(0) && block.chainid != ANVIL_CHAIN_ID && block.chainid != SEPOLIA_CHAIN_ID) {
             revert SHValueInterpreter_ZeroAddressOnRouter();
         }
 
         SHOracle oracle = SHOracle(payable(REGISTRY.priceOracle()));
-        
+
         address token;
         uint256 extractedValue;
 
         // swapExactETHForTokens and swapETHForExactTokens forward ETH as `value` with no token input
         // parameter, so their USD cost is fully captured here. No additional interpreter branch needed.
-        if (selector != IWETH.deposit.selector) {
+        if (selector != IWETH.deposit.selector && value > 0) {
             debitValueInUsd += oracle.getUsdValue(address(0), value);
         }
 
@@ -119,10 +116,10 @@ contract SHValueInterpreter {
                     tokenIn := mload(add(pathPtr, 32))
                     tokenOut := mload(add(pathPtr, add(32, mul(sub(pathLen, 1), 32))))
                 }
-                token = (
-                    selector == IUniswapV2Router01.swapExactTokensForTokens.selector
-                        || selector == IUniswapV2Router01.swapExactTokensForETH.selector
-                ) ? tokenIn : tokenOut;
+                token = (selector == IUniswapV2Router01.swapExactTokensForTokens.selector
+                        || selector == IUniswapV2Router01.swapExactTokensForETH.selector)
+                    ? tokenIn
+                    : tokenOut;
                 debitValueInUsd += oracle.getUsdValue(token, extractedValue);
             } else if (selector == IUniswapV2Router01.addLiquidity.selector && data.length >= 132) {
                 address tokenA;

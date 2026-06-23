@@ -82,7 +82,9 @@ contract MockReputationRegistry is IReputationRegistry {
 
         // SECURITY: Prevent self-feedback from owner and operators.
         // Also reverts with ERC721NonexistentToken if the agent doesn't exist.
-        require(!IIdentityRegistry(_IDENTITY_REGISTRY).isAuthorizedOrOwner(msg.sender, agentId), "Self-feedback not allowed");
+        require(
+            !IIdentityRegistry(_IDENTITY_REGISTRY).isAuthorizedOrOwner(msg.sender, agentId), "Self-feedback not allowed"
+        );
 
         // Increment and get current index (1-indexed)
         uint64 currentIndex = ++_lastIndex[agentId][msg.sender];
@@ -97,7 +99,17 @@ contract MockReputationRegistry is IReputationRegistry {
         }
 
         emit NewFeedback(
-            agentId, msg.sender, currentIndex, value, valueDecimals, tag1, tag1, tag2, endpoint, feedbackURI, feedbackHash
+            agentId,
+            msg.sender,
+            currentIndex,
+            value,
+            valueDecimals,
+            tag1,
+            tag1,
+            tag2,
+            endpoint,
+            feedbackURI,
+            feedbackHash
         );
     }
 
@@ -288,11 +300,12 @@ contract MockReputationRegistry is IReputationRegistry {
         }
     }
 
-    function getResponseCount(uint256 agentId, address clientAddress, uint64 feedbackIndex, address[] calldata responders)
-        external
-        view
-        returns (uint64 count)
-    {
+    function getResponseCount(
+        uint256 agentId,
+        address clientAddress,
+        uint64 feedbackIndex,
+        address[] calldata responders
+    ) external view returns (uint64 count) {
         if (clientAddress == address(0)) {
             // Count all responses for all clients
             address[] memory clientsList = _clients[agentId];
@@ -314,11 +327,12 @@ contract MockReputationRegistry is IReputationRegistry {
         }
     }
 
-    function _countResponses(uint256 agentId, address clientAddress, uint64 feedbackIndex, address[] calldata responders)
-        internal
-        view
-        returns (uint64 count)
-    {
+    function _countResponses(
+        uint256 agentId,
+        address clientAddress,
+        uint64 feedbackIndex,
+        address[] calldata responders
+    ) internal view returns (uint64 count) {
         if (responders.length == 0) {
             // Count from all responders
             address[] memory allResponders = _responders[agentId][clientAddress][feedbackIndex];

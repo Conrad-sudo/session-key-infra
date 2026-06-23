@@ -204,13 +204,33 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
      *      from EIP-1153 transient storage and applies the budget debit (or credit for removeLiquidity)
      *      before dispatching the call. Session auto-cleanup fires if the session expired or exhausted
      *      its budget after the transaction settles.
+     *
+     *      If priceUpdateData is non-empty AND the oracle's cached price is older than its
+     *      heartbeat, it's forwarded to SHOracle.updatePrices before any USD value is computed,
+     *      so the spend check below reads a freshly-pushed Pyth price. This rides on the session
+     *      key's existing signature and the bundler's existing gas payment — no separate
+     *      transaction or signer is needed. The Pyth fee itself is paid from SHOracle's own ETH
+     *      balance. Whoever happens to execute after the heartbeat elapses pays to refresh it for
+     *      everyone, so individual callers never need to refresh per-transaction. Pass an empty
+     *      array to skip the refresh attempt entirely (e.g. when no priceUpdateData is on hand).
      * @param dest  Target address to call.
      * @param value ETH value in wei to forward with the call.
      * @param data  Encoded calldata to pass.
+     * @param priceUpdateData Pyth price update payload(s) fetched off-chain from Hermes, or empty to skip.
      */
-    function execute(address dest, uint256 value, bytes calldata data) external onlyEntryPointOrOwner whenNotPaused {
+    function execute(address dest, uint256 value, bytes calldata data, bytes[] calldata priceUpdateData)
+        external
+        onlyEntryPointOrOwner
+        whenNotPaused
+    {
+        if (priceUpdateData.length > 0 && !oracleIsUpToDate()) {
+            SHOracle oracle = SHOracle(payable(REGISTRY.priceOracle()));
+            oracle.updatePrices(priceUpdateData);
+            
+        }
+
         bool isSessionKeyExecution = msg.sender == ENTRY_POINT && tPendingSessionKey != address(0);
-        if (isSessionKeyExecution) {
+        if (isSessionKeyExecution && dest != REPUTATION_REGISTRY) {
             address sessionKey = tPendingSessionKey;
             Session storage selectedSession = sessions[sessionKey];
             bytes4 selector = tPendingSelector;
@@ -448,7 +468,8 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
     {
         Session storage selectedSession = sessions[signer];
 
-        (address dest, uint256 value, bytes memory data) = abi.decode(userOp.callData[4:], (address, uint256, bytes));
+        (address dest, uint256 value, bytes memory data,) =
+            abi.decode(userOp.callData[4:], (address, uint256, bytes, bytes[]));
         bytes4 selector;
 
         // Native ETH send: address(0) target is the sentinel for ETH sends to any recipient.
@@ -524,8 +545,6 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
         return sessions[sessionKey];
     }
 
-   
-
     /// @notice Returns whether a session key is currently active.
     /// @param sessionKey The session key address to check.
     /// @return True if the session is active and within its valid time window with budget remaining.
@@ -557,10 +576,21 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
         return SHOracle(payable(REGISTRY.priceOracle())).getPrice(token);
     }
 
-    function getAgentId() public view returns (uint256){
-        return REGISTRY.agentId();
+    /**
+     * @notice Returns whether the oracle's cached price is still within its heartbeat, so
+     *         callers (e.g. the off-chain bot building a UserOp) can decide whether a price
+     *         refresh is needed without resolving the oracle's address or ABI themselves.
+     * @dev Mirrors the same condition execute() uses to decide whether to call updatePrices().
+     * @return True if the oracle does NOT need a refresh right now; false if it does.
+     */
+    function oracleIsUpToDate() public view returns (bool) {
+        SHOracle oracle = SHOracle(payable(REGISTRY.priceOracle()));
+        return block.timestamp - oracle.lastUpdated() < oracle.heartbeat();
     }
 
+    function getAgentId() public view returns (uint256) {
+        return REGISTRY.agentId();
+    }
 
     /// @notice Returns the agent's ERC-8004 on-chain identity.
     /// @return registered True if the agent token exists in the Identity Registry.
@@ -597,8 +627,6 @@ contract SessionHandler is IAccount, Ownable, ReentrancyGuard, Pausable {
     function getUniswapRouter() public view returns (address) {
         return REGISTRY.uniswapRouter();
     }
-
-    
 
     /// @notice Checks whether a proposed spend is within the session's remaining budget.
     /// @param sessionKey The session key to check.

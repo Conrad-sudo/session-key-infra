@@ -104,3 +104,6 @@ bot:
 agent:
 	.venv/bin/python3 app/smart_wallet_agent.py
 
+price-update:
+	.venv/bin/python3 app/price_update.py
+

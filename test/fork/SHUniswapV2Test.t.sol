@@ -29,7 +29,7 @@ pragma solidity ^0.8.24;
 
 import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
-import {Test,console, console2} from "forge-std/Test.sol";
+import {Test, console, console2} from "forge-std/Test.sol";
 import {IUniswapV2Router02} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 import {IUniswapV2Router01} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol";
 
@@ -40,6 +40,7 @@ import {SessionHandler} from "../../src/SessionHandler.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {SendPackedUserOp} from "../../script/SendPackedUserOp.s.sol";
 import {DeploySHProtocol} from "../../script/DeploySHProtocol.s.sol";
+import {PriceUpdate} from "../../script/PriceUpdate.s.sol";
 import {ERC20Mock} from "../../src/mocks/ERC20Mock.sol";
 import {SHOracle} from "../../src/SHOracle.sol";
 import {SHRegistry} from "../../src/SHRegistry.sol";
@@ -47,8 +48,6 @@ import {SHFactory} from "../../src/SHFactory.sol";
 import {SHTreasury} from "../../src/SHTreasury.sol";
 import {IUniswapV2Factory} from "lib/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 import {IUniswapV2Pair} from "lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
-import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
-import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 
 contract SHUniswapV2Test is Test {
     SHOracle oracle;
@@ -56,6 +55,7 @@ contract SHUniswapV2Test is Test {
     HelperConfig.NetworkConfig config;
     SessionHandler sessionHandler;
     SendPackedUserOp sendPackedUserOp;
+    PriceUpdate priceUpdate;
 
     /// @dev Starting token balance given to both `user` and `sessionHandler` in setUp.
     uint256 private constant INITIAL_BALANCE = 100000e18;
@@ -199,6 +199,8 @@ contract SHUniswapV2Test is Test {
         vm.prank(config.account);
         sessionHandler = SessionHandler(payable(factory.deployWallet()));
         sendPackedUserOp = new SendPackedUserOp();
+        priceUpdate = new PriceUpdate();
+        priceUpdate.updateOracle(address(oracle));
 
         dai = IERC20(config.dai);
         weth = IWETH(config.weth);
@@ -221,44 +223,6 @@ contract SHUniswapV2Test is Test {
         weth.approve(config.uniswapRouter, type(uint256).max);
         dai.approve(config.uniswapRouter, type(uint256).max);
         vm.stopPrank();
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                       ORACLE REFRESH HELPERS
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @dev Mocks every configured Pyth feed to return publishTime = block.timestamp after a vm.warp.
-     *      Required because the real mainnet Pyth contract cannot have its prices updated on a fork —
-     *      publishTime stays at the fork-block value while block.timestamp advances, eventually exceeding
-     *      the per-feed max age and triggering SHOracle_StalePrice.
-     */
-    function _refreshForkFeeds() internal {
-        _mockFeedFresh(config.ethUsdPriceFeed);
-        _mockFeedFresh(config.usdcUsdPriceFeed);
-        _mockFeedFresh(config.daiUsdPriceFeed);
-        _mockFeedFresh(config.usdtUsdPriceFeed);
-        _mockFeedFresh(config.aaveUsdPriceFeed);
-        _mockFeedFresh(config.linkUsdPriceFeed);
-        _mockFeedFresh(config.oneinchUsdPriceFeed);
-        _mockFeedFresh(config.apeUsdPriceFeed);
-        _mockFeedFresh(config.arbUsdPriceFeed);
-        _mockFeedFresh(config.bnbUsdPriceFeed);
-        _mockFeedFresh(config.btcUsdPriceFeed);
-        _mockFeedFresh(config.compUsdPriceFeed);
-        _mockFeedFresh(config.crvUsdPriceFeed);
-        _mockFeedFresh(config.ensUsdPriceFeed);
-        _mockFeedFresh(config.sandUsdPriceFeed);
-        _mockFeedFresh(config.sushiUsdPriceFeed);
-        _mockFeedFresh(config.wtaoUsdPriceFeed);
-        _mockFeedFresh(config.uniUsdPriceFeed);
-        _mockFeedFresh(config.yfiUsdPriceFeed);
-    }
-
-    function _mockFeedFresh(bytes32 feedId) private {
-        PythStructs.Price memory p = IPyth(config.pyth).getPriceUnsafe(feedId);
-        p.publishTime = block.timestamp;
-        vm.mockCall(config.pyth, abi.encodeWithSelector(IPyth.getPriceUnsafe.selector, feedId), abi.encode(p));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -377,7 +341,7 @@ contract SHUniswapV2Test is Test {
         uint256 wethBefore = weth.balanceOf(address(sessionHandler));
 
         vm.startPrank(sessionHandler.owner());
-        sessionHandler.execute(dest, value, data);
+        sessionHandler.execute(dest, value, data, new bytes[](0));
         vm.stopPrank();
 
         assertEq(weth.balanceOf(address(sessionHandler)) - wethBefore, value);
@@ -572,14 +536,15 @@ contract SHUniswapV2Test is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(IWETH.deposit.selector);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -608,7 +573,8 @@ contract SHUniswapV2Test is Test {
         bytes memory data = abi.encodeWithSelector(
             IUniswapV2Router01.swapTokensForExactTokens.selector, amountOut, amountInMax, path, to, deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
@@ -616,7 +582,7 @@ contract SHUniswapV2Test is Test {
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -647,7 +613,8 @@ contract SHUniswapV2Test is Test {
         bytes memory data = abi.encodeWithSelector(
             IUniswapV2Router01.swapExactTokensForTokens.selector, amountIn, amountOutMin, path, to, deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
@@ -655,7 +622,7 @@ contract SHUniswapV2Test is Test {
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -683,7 +650,8 @@ contract SHUniswapV2Test is Test {
 
         bytes memory data =
             abi.encodeWithSelector(IUniswapV2Router01.swapExactETHForTokens.selector, amountOutMin, path, to, deadline);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
@@ -691,7 +659,7 @@ contract SHUniswapV2Test is Test {
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -724,7 +692,8 @@ contract SHUniswapV2Test is Test {
 
         bytes memory data =
             abi.encodeWithSelector(IUniswapV2Router01.swapETHForExactTokens.selector, amountOut, path, to, deadline);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
@@ -735,7 +704,7 @@ contract SHUniswapV2Test is Test {
         weth.approve(address(router), type(uint256).max);
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -769,10 +738,14 @@ contract SHUniswapV2Test is Test {
                 buyPath,
                 address(sessionHandler),
                 block.timestamp + 2 hours
-            )
+            ),
+            new bytes[](0)
         );
         sessionHandler.execute(
-            config.dai, 0, abi.encodeWithSelector(IERC20.approve.selector, config.uniswapRouter, type(uint256).max)
+            config.dai,
+            0,
+            abi.encodeWithSelector(IERC20.approve.selector, config.uniswapRouter, type(uint256).max),
+            new bytes[](0)
         );
         vm.stopPrank();
 
@@ -791,7 +764,8 @@ contract SHUniswapV2Test is Test {
         bytes memory data = abi.encodeWithSelector(
             IUniswapV2Router01.swapTokensForExactETH.selector, amountOut, amountInMax, path, to, deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
@@ -801,7 +775,7 @@ contract SHUniswapV2Test is Test {
         uint256 ethBefore = address(sessionHandler).balance;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -834,10 +808,14 @@ contract SHUniswapV2Test is Test {
                 buyPath,
                 address(sessionHandler),
                 block.timestamp
-            )
+            ),
+            new bytes[](0)
         );
         sessionHandler.execute(
-            config.dai, 0, abi.encodeWithSelector(IERC20.approve.selector, config.uniswapRouter, type(uint256).max)
+            config.dai,
+            0,
+            abi.encodeWithSelector(IERC20.approve.selector, config.uniswapRouter, type(uint256).max),
+            new bytes[](0)
         );
         vm.stopPrank();
 
@@ -855,7 +833,8 @@ contract SHUniswapV2Test is Test {
         bytes memory data = abi.encodeWithSelector(
             IUniswapV2Router01.swapExactTokensForETH.selector, amountIn, amountOutMin, path, to, deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
@@ -865,7 +844,7 @@ contract SHUniswapV2Test is Test {
         uint256 ethBefore = address(sessionHandler).balance;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -915,13 +894,13 @@ contract SHUniswapV2Test is Test {
             to,
             deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data);
+        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data, new bytes[](0));
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -973,13 +952,13 @@ contract SHUniswapV2Test is Test {
             to,
             deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data);
+        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data, new bytes[](0));
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -1028,13 +1007,14 @@ contract SHUniswapV2Test is Test {
             to,
             deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, amountEthDesired, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, amountEthDesired, data, new bytes[](0));
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -1083,13 +1063,13 @@ contract SHUniswapV2Test is Test {
         bytes memory data = abi.encodeWithSelector(
             IUniswapV2Router01.removeLiquidity.selector, tokenA, tokenB, liquidity, expectedA, expectedB, to, deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data);
+        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data, new bytes[](0));
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -1138,14 +1118,14 @@ contract SHUniswapV2Test is Test {
         bytes memory data = abi.encodeWithSelector(
             IUniswapV2Router01.removeLiquidityETH.selector, token, liquidity, amountToken, amountEth, to, deadline
         );
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data);
+        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, 0, data, new bytes[](0));
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
         uint256 balanceBeforeToken = IERC20(token).balanceOf(to);
         vm.warp(block.timestamp + 1.1 hours);
-        _refreshForkFeeds();
+        priceUpdate.updateOracle(address(oracle));
         vm.startPrank(bundler, bundler);
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
@@ -1158,16 +1138,12 @@ contract SHUniswapV2Test is Test {
         assertEq(balanceAfterToken - balanceBeforeToken, amountToken);
     }
 
-
     function testGetPrice() public view {
-        
-        (uint256 price , uint8 decimals) = sessionHandler.getPrice(config.weth);
+        (uint256 price, uint8 decimals) = sessionHandler.getPrice(config.weth);
 
         console.log("PRICE*******: ");
         console2.log(price);
         console.log("DECIMALS*****");
         console2.log(decimals);
-
     }
-
 }

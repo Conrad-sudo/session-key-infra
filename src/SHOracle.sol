@@ -19,12 +19,14 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
  *
  *      getPrice/getUsdValue read through Pyth's getPriceUnsafe (a free, view-only read of
  *      the last price pushed on-chain by any party), so they stay `view` and never pay a
- *      Pyth update fee themselves. Staleness is enforced ourselves against sMaxAge so a feed
- *      nobody has pushed to recently still reverts.
+ *      Pyth update fee themselves. Staleness is enforced ourselves against a single shared
+ *      heartbeat so a feed nobody has pushed to recently still reverts.
  *
  *      updatePrices pushes a fresh price on-chain via Pyth's updatePriceFeeds, paying the fee
  *      from this contract's own ETH balance (fund it via receive()) so callers — including
- *      the ERC-4337 bundler — never need to attach value themselves.
+ *      the ERC-4337 bundler — never need to attach value themselves. lastUpdated tracks when
+ *      that last happened, so callers (e.g. SessionHandler) can skip paying the fee again
+ *      until heartbeat has actually elapsed.
  */
 contract SHOracle {
     /*//////////////////////////////////////////////////////////////
@@ -37,7 +39,7 @@ contract SHOracle {
     /// @dev Reverts when a Pyth price has not been updated within its configured max age
     error SHOracle_StalePrice();
 
-    /// @dev Reverts when the tokens, priceFeedIds and maxAges constructor arrays have different lengths
+    /// @dev Reverts when the tokens and priceFeedIds constructor arrays have different lengths
     error SHOracle_ArrayLengthMismatch();
 
     /// @dev Reverts when this contract's ETH balance can't cover Pyth's update fee
@@ -57,11 +59,11 @@ contract SHOracle {
     /// @dev Populated once in the constructor. Unregistered tokens map to bytes32(0).
     mapping(address => bytes32) private sPriceFeedId;
 
-    /// @notice Maps each registered token address to the maximum allowed age (in seconds) of its price
-    /// @dev Pyth update frequency varies per feed: volatile assets are pushed roughly hourly,
-    ///      stablecoins less often. Using a uniform timeout would either flag stablecoin feeds as
-    ///      stale or mask genuinely stale volatile feeds.
-    mapping(address => uint256) private sMaxAge;
+    /// @notice Maximum allowed age (in seconds) for any price reading, shared across all tokens.
+    uint256 public immutable heartbeat;
+
+    /// @notice Timestamp of the last successful updatePrices() call.
+    uint256 public lastUpdated;
 
     /*//////////////////////////////////////////////////////////////
                              CONSTRUCTOR
@@ -78,18 +80,17 @@ contract SHOracle {
      * @param tokens       Ordered list of token addresses to support. Use address(0) for ETH.
      * @param priceFeedIds Ordered list of Pyth USD price feed IDs, one per token.
      *                     Pass bytes32(0) for tokens that have no feed.
-     * @param maxAges      Ordered list of maximum price ages in seconds, one per token.
-     *                     The value at index i is ignored when priceFeedIds[i] is bytes32(0).
+     * @param heartbeat_   Maximum price age in seconds, shared across every registered token.
      */
-    constructor(address pyth, address[] memory tokens, bytes32[] memory priceFeedIds, uint256[] memory maxAges) {
-        if (tokens.length != priceFeedIds.length || priceFeedIds.length != maxAges.length) {
+    constructor(address pyth, address[] memory tokens, bytes32[] memory priceFeedIds, uint256 heartbeat_) {
+        if (tokens.length != priceFeedIds.length) {
             revert SHOracle_ArrayLengthMismatch();
         }
         PYTH = IPyth(pyth);
+        heartbeat = heartbeat_;
         for (uint256 i = 0; i < tokens.length; i++) {
             if (priceFeedIds[i] != bytes32(0)) {
                 sPriceFeedId[tokens[i]] = priceFeedIds[i];
-                sMaxAge[tokens[i]] = maxAges[i];
             }
         }
     }
@@ -109,7 +110,7 @@ contract SHOracle {
     function getPrice(address token) external view returns (uint256 price, uint8 decimals) {
         bytes32 feedId = sPriceFeedId[token];
         if (feedId == bytes32(0)) revert SHOracle_UnsupportedToken();
-        (price, decimals) = _stalePriceCheck(feedId, sMaxAge[token]);
+        (price, decimals) = _stalePriceCheck(feedId);
     }
 
     /**
@@ -131,7 +132,7 @@ contract SHOracle {
         bytes32 feedId = sPriceFeedId[token];
         if (feedId == bytes32(0)) revert SHOracle_UnsupportedToken();
 
-        (uint256 price, uint8 priceDecimals) = _stalePriceCheck(feedId, sMaxAge[token]);
+        (uint256 price, uint8 priceDecimals) = _stalePriceCheck(feedId);
         uint8 tokenDecimals = token == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(token).decimals();
 
         return (amount * price * (10 ** (18 - priceDecimals))) / (10 ** tokenDecimals);
@@ -140,23 +141,22 @@ contract SHOracle {
     /**
      * @dev Validates Pyth price freshness and returns the current price and its decimals
      * @param feedId  Pyth price feed ID to query
-     * @param maxAge  Maximum allowed age (in seconds) for the price to be considered fresh
      * @return price    The current price, scaled by 10**decimals
      * @return decimals The decimal count of the returned price, derived from Pyth's exponent
      *
-     * @notice Reverts with SHOracle_StalePrice if the price has not updated within maxAge.
+     * @notice Reverts with SHOracle_StalePrice if the price has not updated within heartbeat.
      *
      * Why this matters: stale price data can lead to incorrect USD conversions. For instance,
      * if ETH crashes from $2500 to $1500 but the feed has not updated in 5 hours, using the
      * stale price would incorrectly value ETH and may allow overspending beyond session limits.
      *
      * Uses getPriceUnsafe (not getPriceNoOlderThan) so this stays a free, view-only read —
-     * staleness is enforced against our own sMaxAge instead of relying on Pyth's internal check.
+     * staleness is enforced against our own heartbeat instead of relying on Pyth's internal check.
      */
-    function _stalePriceCheck(bytes32 feedId, uint256 maxAge) internal view returns (uint256 price, uint8 decimals) {
-        PythStructs.Price memory p = PYTH.getPriceNoOlderThan(feedId,maxAge);
+    function _stalePriceCheck(bytes32 feedId) internal view returns (uint256 price, uint8 decimals) {
+        PythStructs.Price memory p = PYTH.getPriceUnsafe(feedId);
 
-        if (block.timestamp - p.publishTime > maxAge) {
+        if (block.timestamp - p.publishTime > heartbeat) {
             revert SHOracle_StalePrice();
         }
 
@@ -179,6 +179,7 @@ contract SHOracle {
         uint256 fee = PYTH.getUpdateFee(updateData);
         if (address(this).balance < fee) revert SHOracle_InsufficientFeeBalance();
         PYTH.updatePriceFeeds{value: fee}(updateData);
+        lastUpdated = block.timestamp;
     }
 
     /// @notice Accepts ETH so updatePrices can pay Pyth's fee without the caller forwarding any value.

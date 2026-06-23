@@ -101,7 +101,8 @@ contract MockIdentityRegistry is ERC721URIStorage, EIP712, IIdentityRegistry {
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
         if (err != ECDSA.RecoverError.NoError || recovered != newWallet) {
             // ECDSA failed, try ERC1271 (smart contract wallets)
-            (bool ok, bytes memory res) = newWallet.staticcall(abi.encodeCall(IERC1271.isValidSignature, (digest, signature)));
+            (bool ok, bytes memory res) =
+                newWallet.staticcall(abi.encodeCall(IERC1271.isValidSignature, (digest, signature)));
             require(ok && res.length >= 32 && abi.decode(res, (bytes4)) == ERC1271_MAGICVALUE, "invalid wallet sig");
         }
 
@@ -140,7 +141,12 @@ contract MockIdentityRegistry is ERC721URIStorage, EIP712, IIdentityRegistry {
         return "1.0.0-mock";
     }
 
-    function tokenURI(uint256 tokenId) public view override(ERC721URIStorage, IIdentityRegistry) returns (string memory) {
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override(ERC721URIStorage, IIdentityRegistry)
+        returns (string memory)
+    {
         return super.tokenURI(tokenId);
     }
 

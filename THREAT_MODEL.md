@@ -46,9 +46,9 @@
 ---
 
 ### 3.3 Price Oracle — Staleness
-**Threat:** A stale Chainlink feed (e.g. during network congestion) could cause USD value calculations to be incorrect — either allowing overspending or incorrectly rejecting valid operations.  
-**Mitigation in place:** `SHOracle._stalePriceCheck()` reverts with `SHOracle_StalePrice` if a feed has not updated within its registered per-feed heartbeat. Heartbeats mirror real Chainlink update schedules: 1 hour for ETH, WBTC, AAVE, LINK, DAI, COMP, MKR, UNI, WETH; 23 hours for USDC; 24 hours for all other feeds. Using a uniform timeout would either flag slow stablecoin feeds as stale or mask genuinely stale volatile-asset feeds.  
-**Residual risk:** Low. During extreme volatility a 1-hour window on ETH/BTC feeds may still admit a meaningfully stale price.
+**Threat:** A stale Pyth feed (e.g. nobody has pushed an update recently) could cause USD value calculations to be incorrect — either allowing overspending or incorrectly rejecting valid operations.  
+**Mitigation in place:** `SHOracle._stalePriceCheck()` reverts with `SHOracle_StalePrice` if a feed's `getPriceUnsafe()` reading is older than `heartbeat` — a single value shared across every registered token (24 hours on mainnet/Sepolia, 1 hour on Anvil), set once at construction. `SHOracle.updatePrices(bytes[] updateData)` pushes a fresh, Hermes-signed update on-chain and is callable by anyone; the fee is paid from the oracle's own ETH balance, so callers never need to attach value. `SessionHandler.execute()` forwards any `priceUpdateData` it's given to `updatePrices()` automatically, but only when `block.timestamp - SHOracle.lastUpdated() >= heartbeat` — whoever's transaction happens to land after the heartbeat elapses pays to refresh the price for everyone, so most calls skip the refresh (and its fee) entirely. `SessionHandler.oracleIsUpToDate()` exposes that same check so the off-chain bot can decide whether to fetch fresh data from Hermes before submitting a UserOp at all.  
+**Residual risk:** Low. A 24-hour window means a fast-moving token could meaningfully diverge from its on-chain price within the window before someone's transaction triggers a refresh. `updatePrices()` being permissionless means anyone can pay to refresh early if this matters for a specific operation.
 
 ---
 
@@ -82,6 +82,13 @@
 **Threat:** The contract charges the full `value` (ETH forwarded as `msg.value`) against the session budget, not the actual ETH consumed by the swap. The Uniswap router refunds unused ETH, but the budget is still decremented by the full forwarded amount.  
 **Impact:** Session budgets are depleted faster than the actual USD value transacted. Not exploitable for theft, but degrades session utility.  
 **Residual risk:** Low severity — funds are not at risk, only session budget accounting is imprecise.
+
+---
+
+### 3.9 Reputation Registry Calls Skip Budget Tracking and Auto-Cleanup
+**Threat:** `execute()` skips its entire budget-debit/credit block — including the auto-revocation check that fires when a session has expired or exhausted its budget — whenever `dest == REPUTATION_REGISTRY`. This avoids a pre-existing issue where pricing a non-token destination (any call with ≥68 bytes of calldata to a contract with no registered Pyth feed) would revert with `SHOracle_UnsupportedToken`.  
+**Impact:** A session scoped only to the Reputation Registry never self-revokes via the `execute()` path on expiry — it just sits inactive (still rejected by `isSessionActive`/`_isSessionUsable` at validation time) until something else touches it. Reputation Registry sessions are already required to use a `spendingLimit` of `0` (see `addSessionKey`'s exemption), so there's no budget to track in the first place.  
+**Residual risk:** Low — no funds or spending authority are affected, since `giveFeedback` and related calls move no value and have no USD cost.
 
 ---
 
@@ -130,7 +137,7 @@
 
 ## 5. Out of Scope
 
-- Chainlink node-level collusion
+- Pyth Network / Wormhole guardian-level collusion
 - EntryPoint contract vulnerabilities (audited by OpenZeppelin)
 - Uniswap V2 contract vulnerabilities
 - Host OS / server compromise

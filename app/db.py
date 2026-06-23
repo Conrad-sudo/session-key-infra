@@ -119,14 +119,11 @@ def init_db():
             interval_hrs INTEGER NOT NULL
         );
                      
-          CREATE TABLE IF NOT EXISTS mainnet_pricefeeds (
+          CREATE TABLE IF NOT EXISTS pricefeeds (
             token TEXT PRIMARY KEY,
-            address TEXT  NOT NULL
+            id TEXT  NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS sepolia_pricefeeds (
-            token TEXT PRIMARY KEY,
-            address TEXT  NOT NULL
-        );
+        
 
         CREATE TABLE IF NOT EXISTS session_keys (
             chat_id         INTEGER NOT NULL,
@@ -209,22 +206,15 @@ def migrate_json_to_db():
                 (name, Web3.to_checksum_address(address)),
             )
 
-    if os.path.exists("./app/migrate/Mainnet_Pricefeeds.json"):
-        for name, address in get_json(
-            "./app/migrate/Mainnet_Pricefeeds.json"
+    if os.path.exists("./app/migrate/Pricefeeds.json"):
+        for name, feed_id in get_json(
+            "./app/migrate/Pricefeeds.json"
         ).items():
             db.execute(
-                "INSERT OR REPLACE INTO mainnet_pricefeeds (token, address) VALUES (?, ?)",
-                (name, Web3.to_checksum_address(address)),
+                "INSERT OR REPLACE INTO pricefeeds (token, id) VALUES (?, ?)",
+                (name, feed_id),
             )
-    if os.path.exists("./app/migrate/Sepolia_Pricefeeds.json"):
-        for name, address in get_json(
-            "./app/migrate/Sepolia_Pricefeeds.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO sepolia_pricefeeds (token, address) VALUES (?, ?)",
-                (name, Web3.to_checksum_address(address)),
-            )
+    
 
     if os.path.exists("./app/migrate/RPC.json"):
         for name, rpc_url in get_json("./app/migrate/RPC.json").items():
@@ -617,24 +607,37 @@ def get_supported_tokens(chat_id: int) -> list[str]:
 
 
 
-def get_pricefeed_address(chat_id: int, token: str) -> str:
+def get_pricefeed_id(token: str) -> str:
     """
-    Retrieves the price feed address for a specific token on the user's network.
+    Retrieves the Pyth price feed ID for a given token ticker.
 
-    @return  A single Chainlink feed address (e.g. "0xD10a...").
-    @raises ValueError  If the network is unsupported or the token has no feed.
+    Pyth feed IDs are network-agnostic — the same ID is valid on every chain Pyth
+    supports — so unlike token addresses, this lookup doesn't need a chain/network.
+
+    @param token  The token ticker symbol (e.g. "usdc", "weth").
+    @return       The Pyth price feed ID as a 0x-prefixed 32-byte hex string.
+    @raises ValueError  If the token has no registered feed.
     """
-    network = get_user_network(chat_id)
-    prefix = _NETWORK_DB_PREFIX.get(network)
-    if prefix is None:
-        raise ValueError(f"Unsupported network: '{network}'")
-    table = f"{prefix}_pricefeeds"
     row = get_db().execute(
-        f"SELECT address FROM {table} WHERE token = ?", (token,)
+        "SELECT id FROM pricefeeds WHERE token = ?", (token.lower(),)
     ).fetchone()
     if row is None:
-        raise ValueError(f"No price feed for token '{token}' on network '{network}'")
-    return row["address"]
+        raise ValueError(f"No price feed for token '{token}'")
+    return row["id"]
+
+
+def get_all_pricefeed_tokens() -> list[str]:
+    """
+    Returns every token ticker that has a registered Pyth feed.
+
+    Used to refresh the oracle's full price set in one shot rather than tracking which
+    specific tokens a given call touches — SHOracle's heartbeat gate means most calls skip
+    the actual on-chain update anyway, so there's no per-call cost to requesting all of them.
+
+    @return  A list of ticker strings (e.g. ["aave", "ape", ...]).
+    """
+    rows = get_db().execute("SELECT token FROM pricefeeds ORDER BY token ASC").fetchall()
+    return [row["token"] for row in rows]
 
 
 # ── Contacts ──────────────────────────────────────────────────────────────────

@@ -72,15 +72,10 @@ contract SHTreasury is Ownable, ReentrancyGuard {
      * @param initialAgentId Id of the SessionHandler ERC-4337 AI agent on the ERC-8004 Identity Registry.
      * @param uniswapRouter  Uniswap V2 Router address. May be address(0) on chains without Uniswap V2.
      */
-    constructor(
-        uint256 initialFee,
-        address priceOracle,
-        uint256 initialAgentId,
-        address uniswapRouter
-    ) Ownable(msg.sender) {
-        SHRegistry registry = new SHRegistry(
-            initialFee, address(this), priceOracle, initialAgentId, uniswapRouter
-        );
+    constructor(uint256 initialFee, address priceOracle, uint256 initialAgentId, address uniswapRouter)
+        Ownable(msg.sender)
+    {
+        SHRegistry registry = new SHRegistry(initialFee, address(this), priceOracle, initialAgentId, uniswapRouter);
         REGISTRY = address(registry);
     }
 
@@ -153,7 +148,6 @@ contract SHTreasury is Ownable, ReentrancyGuard {
     function setTreasury(address newTreasury) external onlyOwner {
         SHRegistry(REGISTRY).setTreasury(newTreasury);
     }
-
 
     /**
      * @notice Updates the registered agentId for the SessionHandler Protocol. Only callable by the owner.

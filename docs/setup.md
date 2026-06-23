@@ -264,7 +264,7 @@ make agent
 
 | Contract | Address |
 |---|---|
-| `SessionHandler` | `0x202DCf56889F9b11F68f636e7567Ac14B9B1D249` |
-| `SHOracle` | `0x6C1A1Da2518C456a097A082fc9f48d76f23F0aaC` |
 | `IdentityRegistry` (canonical ERC-8004) | `0x8004A818BFB912233c491871b3d84c89A494BD9e` |
 | `ReputationRegistry` (canonical ERC-8004) | `0x8004B663056A597Dffe9eCcC1965A193B7388713` |
+
+> `SessionHandler` and `SHOracle` addresses are deployment-specific and intentionally omitted here — the previous addresses in this table predated the Pyth migration (different constructor/`execute()` signatures) and would be misleading. After running `make deploy ARGS="sepolia"`, the fresh addresses are in the Forge broadcast file (`broadcast/DeploySHProtocol.s.sol/11155111/run-latest.json`) and get synced into `wallet.db` by `make db`.

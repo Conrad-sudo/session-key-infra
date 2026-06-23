@@ -37,7 +37,7 @@ The protocol is composed of five layers: Solidity smart contracts, a Python bloc
    SessionHandler  (per-user smart account)
          ├─ reads config at runtime ──▶  SHRegistry
          │                               (fee, treasury, oracle, agentId, router, interpreter)
-         ├─ USD computation ──────────▶  SHValueInterpreter → SHOracle (Chainlink)
+         ├─ USD computation ──────────▶  SHValueInterpreter → SHOracle (Pyth Network)
          ├─ protocol fee ─────────────▶  SHTreasury (owns SHRegistry)
          └─ identity / reputation ────▶  ERC-8004 Registries
 
@@ -49,7 +49,7 @@ The protocol is composed of five layers: Solidity smart contracts, a Python bloc
 ```
 SHTreasury  (protocol operator — owns SHRegistry)
     └── SHRegistry  (fee, treasury, oracle, agentId, router, interpreter)
-              ├── SHOracle           (Chainlink USD price feeds)
+              ├── SHOracle           (Pyth Network USD price feeds)
               └── SHValueInterpreter (calldata → USD debit/credit)
 
 SHFactory   (user-facing factory)
@@ -77,6 +77,9 @@ cd sh-protocol
 
 # Foundry dependencies
 forge install
+
+# Node dependencies (Pyth Solidity SDK, used by SHOracle)
+npm install
 
 # Python dependencies
 python3 -m venv .venv

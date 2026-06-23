@@ -119,7 +119,7 @@ contract SHRegistry is Ownable {
         if (initialFee > MAX_PROTOCOL_FEE) revert SHRegistry_FeeTooHigh();
         if (initialTreasury == address(0)) revert SHRegistry_InvalidTreasury();
         if (initialOracle == address(0)) revert SHRegistry_InvalidPriceOracle();
-       
+
         protocolFee = initialFee;
         treasury = initialTreasury;
         priceOracle = initialOracle;
@@ -198,5 +198,4 @@ contract SHRegistry is Ownable {
         callValueInterpreter = newInterpreter;
         emit CallValueInterpreterUpdated(old, newInterpreter);
     }
-
 }

@@ -105,34 +105,9 @@ contract HelperConfig is Script {
      * @param kncUsdPriceFeed     Pyth KNC/USD price feed ID
      * @param rdntUsdPriceFeed    Pyth RDNT/USD price feed ID
      *
-     * Heartbeats below are passed to SHOracle as the maximum allowed age (in seconds) of a
-     * Pyth price before it's considered stale. 1 hour for volatile assets, 24 hours for the
-     * lower-volatility stablecoins (USDC, DAI, USDT).
-     *
-     * @param ethHeartbeat        ETH/USD max price age in seconds
-     * @param usdcHeartbeat       USDC/USD max price age in seconds
-     * @param daiHeartbeat        DAI/USD max price age in seconds
-     * @param usdtHeartbeat       USDT/USD max price age in seconds
-     * @param aaveHeartbeat       AAVE/USD max price age in seconds
-     * @param linkHeartbeat       LINK/USD max price age in seconds
-     * @param oneinchHeartbeat    1INCH/USD max price age in seconds
-     * @param apeHeartbeat        APE/USD max price age in seconds
-     * @param arbHeartbeat        ARB/USD max price age in seconds
-     * @param bnbHeartbeat        BNB/USD max price age in seconds
-     * @param btcHeartbeat        BTC/USD max price age in seconds
-     * @param compHeartbeat       COMP/USD max price age in seconds
-     * @param crvHeartbeat        CRV/USD max price age in seconds
-     * @param ensHeartbeat        ENS/USD max price age in seconds
-     * @param sandHeartbeat       SAND/USD max price age in seconds
-     * @param sushiHeartbeat      SUSHI/USD max price age in seconds
-     * @param wtaoHeartbeat       TAO/USD max price age in seconds
-     * @param uniHeartbeat        UNI/USD max price age in seconds
-     * @param yfiHeartbeat        YFI/USD max price age in seconds
-     * @param wavaxHeartbeat      AVAX/USD max price age in seconds
-     * @param batHeartbeat        BAT/USD max price age in seconds
-     * @param imxHeartbeat        IMX/USD max price age in seconds
-     * @param kncHeartbeat        KNC/USD max price age in seconds
-     * @param rdntHeartbeat       RDNT/USD max price age in seconds
+     * @param heartbeat   Passed to SHOracle as the maximum allowed age (in seconds) of any
+     *                    registered Pyth price before it's considered stale. Shared across
+     *                    every token — SHOracle no longer tracks a per-token max age.
      */
     struct NetworkConfig {
         address entryPoint;
@@ -192,46 +167,15 @@ contract HelperConfig is Script {
         bytes32 imxUsdPriceFeed;
         bytes32 kncUsdPriceFeed;
         bytes32 rdntUsdPriceFeed;
-        // Max price age in seconds (maximum allowed staleness of a Pyth price)
-        uint256 ethHeartbeat;
-        uint256 usdcHeartbeat;
-        uint256 daiHeartbeat;
-        uint256 usdtHeartbeat;
-        uint256 aaveHeartbeat;
-        uint256 linkHeartbeat;
-        uint256 oneinchHeartbeat;
-        uint256 apeHeartbeat;
-        uint256 arbHeartbeat;
-        uint256 bnbHeartbeat;
-        uint256 btcHeartbeat;
-        uint256 compHeartbeat;
-        uint256 crvHeartbeat;
-        uint256 ensHeartbeat;
-        uint256 sandHeartbeat;
-        uint256 sushiHeartbeat;
-        uint256 wtaoHeartbeat;
-        uint256 uniHeartbeat;
-        uint256 yfiHeartbeat;
-        uint256 wavaxHeartbeat;
-        uint256 batHeartbeat;
-        uint256 imxHeartbeat;
-        uint256 kncHeartbeat;
-        uint256 rdntHeartbeat;
+        // Max price age in seconds (maximum allowed staleness of a Pyth price), shared by every token
+        uint256 heartbeat;
     }
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Chain ID for the Ethereum Sepolia testnet
-    uint256 public constant ETH_SEPOLIA_CHAIN_ID = 11155111;
-
-    /// @notice Chain ID for the zkSync Sepolia testnet
-    uint256 public constant ZKSYNC_SEPOLIA_CHAIN_ID = 300;
-
-    /// @notice Chain ID used by a local Anvil node
-    uint256 public constant LOCAL_CHAIN_ID = 31337;
-
+    
     /// @notice Deployer account used on live networks — must be funded before broadcasting
     address public sepoliaAccount = vm.envOr("SEPOLIA_ACCOUNT", address(0));
 
@@ -246,90 +190,7 @@ contract HelperConfig is Script {
     ///      broadcasting an actual mainnet deployment.
     uint256 private constant MAINNET_DEPLOYER_PK = uint256(keccak256("session-handler-mainnet-deployer"));
 
-    /// @notice The number of decimals (magnitude of Pyth's price exponent) mock prices are seeded with
-    uint8 public constant DECIMALS = 8;
-
-    /// @notice The latest mock price of ETH in USD, seeded into MockPyth
-    int256 public constant ETH_USD_PRICE = 1000e8;
-
-    /// @notice The latest mock price of USDC in USD, seeded into MockPyth
-    int256 public constant USDC_USD_PRICE = 0.998e8;
-
-    /// @notice The latest mock price of DAI in USD, seeded into MockPyth
-    int256 public constant DAI_USD_PRICE = 1.2e8;
-
-    /// @notice Mock price of Aave (AAVE) in USD from the MockV3Aggregator
-    int256 public constant AAVE_USD_PRICE = 119e8;
-
-    /// @notice Mock price of Chainlink (LINK) in USD from the MockV3Aggregator — sourced 2026-03-16
-    int256 public constant LINK_USD_PRICE = 9.21e8;
-
-    /// @notice Mock price of 1inch Network (1INCH) in USD from the MockV3Aggregator
-    int256 public constant ONEINCH_USD_PRICE = 0.1e8;
-
-    /// @notice Mock price of ApeCoin (APE) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant APE_USD_PRICE = 0.1e8;
-
-    /// @notice Mock price of Arbitrum (ARB) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant ARB_USD_PRICE = 0.1e8;
-
-    /// @notice Mock price of BNB in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant BNB_USD_PRICE = 674.03e8;
-
-    /// @notice Mock price of Bitcoin (BTC) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant BTC_USD_PRICE = 71498.24e8;
-
-    /// @notice Mock price of Compound (COMP) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant COMP_USD_PRICE = 18.6e8;
-
-    /// @notice Mock price of Curve DAO Token (CRV) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant CRV_USD_PRICE = 0.23e8;
-
-    /// @notice Mock price of Ethereum Name Service (ENS) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant ENS_USD_PRICE = 6.11e8;
-
-    /// @notice Mock price of The Sandbox (SAND) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant SAND_USD_PRICE = 0.08e8;
-
-    /// @notice Mock price of Solana (SOL) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant SOL_USD_PRICE = 88.63e8;
-
-    /// @notice Mock price of SushiSwap (SUSHI) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant SUSHI_USD_PRICE = 0.22e8;
-
-    /// @notice Mock price of Bittensor (TAO) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant TAO_USD_PRICE = 271.61e8;
-
-    /// @notice Mock price of Uniswap (UNI) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant UNI_USD_PRICE = 3.77e8;
-
-    /// @notice Mock price of yearn.finance (YFI) in USD — sourced 2026-03-16, 8 decimals
-    int256 public constant YFI_USD_PRICE = 2561.07e8;
-
-    /// @notice Mock price of Wrapped AVAX (WAVAX) in USD — sourced 2026-04-30, 8 decimals
-    int256 public constant WAVAX_USD_PRICE = 20e8;
-
-    /// @notice Mock price of Basic Attention Token (BAT) in USD — sourced 2026-04-30, 8 decimals
-    int256 public constant BAT_USD_PRICE = 0.17e8;
-
-    /// @notice Mock price of Immutable X (IMX) in USD — sourced 2026-04-30, 8 decimals
-    int256 public constant IMX_USD_PRICE = 0.75e8;
-
-    /// @notice Mock price of Kyber Network Crystal (KNC) in USD — sourced 2026-04-30, 8 decimals
-    int256 public constant KNC_USD_PRICE = 0.55e8;
-
-    /// @notice Mock price of Radiant Capital (RDNT) in USD — sourced 2026-04-30, 8 decimals
-    int256 public constant RDNT_USD_PRICE = 0.04e8;
-
-    /// @notice Mock price of Tether (USDT) in USD from the MockV3Aggregator
-    int256 public constant USDT_USD_PRICE = 1e8;
-
-    /// @notice Heartbeat for volatile-asset Chainlink feeds that update every hour
-    uint256 public constant HEARTBEAT_1H = 1 hours;
-
-    /// @notice Heartbeat for low-volatility feeds that publish updates approximately every 24 hours
-    uint256 public constant HEARTBEAT_24H = 24 hours;
-
+   
     /**
      * @dev Cached Anvil network config. Populated on first call to getOrCreateAnvilConfig.
      *      Both fields must be non-zero for the cache to be considered valid.
@@ -437,31 +298,8 @@ contract HelperConfig is Script {
             imxUsdPriceFeed: IMX_USD_PRICE_FEED,
             kncUsdPriceFeed: KNC_USD_PRICE_FEED,
             rdntUsdPriceFeed: RDNT_USD_PRICE_FEED,
-            // Heartbeats (max price age) — 24 hours for every feed
-            ethHeartbeat: HEARTBEAT_24H,
-            usdcHeartbeat: HEARTBEAT_24H,
-            daiHeartbeat: HEARTBEAT_24H,
-            usdtHeartbeat: HEARTBEAT_24H,
-            aaveHeartbeat: HEARTBEAT_24H,
-            linkHeartbeat: HEARTBEAT_24H,
-            oneinchHeartbeat: HEARTBEAT_24H,
-            apeHeartbeat: HEARTBEAT_24H,
-            arbHeartbeat: HEARTBEAT_24H,
-            bnbHeartbeat: HEARTBEAT_24H,
-            btcHeartbeat: HEARTBEAT_24H,
-            compHeartbeat: HEARTBEAT_24H,
-            crvHeartbeat: HEARTBEAT_24H,
-            ensHeartbeat: HEARTBEAT_24H,
-            sandHeartbeat: HEARTBEAT_24H,
-            sushiHeartbeat: HEARTBEAT_24H,
-            wtaoHeartbeat: HEARTBEAT_24H,
-            uniHeartbeat: HEARTBEAT_24H,
-            yfiHeartbeat: HEARTBEAT_24H,
-            wavaxHeartbeat: HEARTBEAT_24H,
-            batHeartbeat: HEARTBEAT_24H,
-            imxHeartbeat: HEARTBEAT_24H,
-            kncHeartbeat: HEARTBEAT_24H,
-            rdntHeartbeat: HEARTBEAT_24H
+            // Heartbeat (max price age) — 24 hours, shared across every feed
+            heartbeat: HEARTBEAT_1H
         });
     }
 
@@ -532,31 +370,8 @@ contract HelperConfig is Script {
             imxUsdPriceFeed: IMX_USD_PRICE_FEED,
             kncUsdPriceFeed: KNC_USD_PRICE_FEED,
             rdntUsdPriceFeed: RDNT_USD_PRICE_FEED,
-            // Heartbeats (max price age) — 24 hours for every feed
-            ethHeartbeat: HEARTBEAT_24H,
-            usdcHeartbeat: HEARTBEAT_24H,
-            daiHeartbeat: HEARTBEAT_24H,
-            usdtHeartbeat: HEARTBEAT_24H,
-            aaveHeartbeat: HEARTBEAT_24H,
-            linkHeartbeat: HEARTBEAT_24H,
-            oneinchHeartbeat: HEARTBEAT_24H,
-            apeHeartbeat: HEARTBEAT_24H,
-            arbHeartbeat: HEARTBEAT_24H,
-            bnbHeartbeat: HEARTBEAT_24H,
-            btcHeartbeat: HEARTBEAT_24H,
-            compHeartbeat: HEARTBEAT_24H,
-            crvHeartbeat: HEARTBEAT_24H,
-            ensHeartbeat: HEARTBEAT_24H,
-            sandHeartbeat: HEARTBEAT_24H,
-            sushiHeartbeat: HEARTBEAT_24H,
-            wtaoHeartbeat: HEARTBEAT_24H,
-            uniHeartbeat: HEARTBEAT_24H,
-            yfiHeartbeat: HEARTBEAT_24H,
-            wavaxHeartbeat: HEARTBEAT_24H,
-            batHeartbeat: HEARTBEAT_24H,
-            imxHeartbeat: HEARTBEAT_24H,
-            kncHeartbeat: HEARTBEAT_24H,
-            rdntHeartbeat: HEARTBEAT_24H
+            // Heartbeat (max price age) — 24 hours, shared across every feed
+            heartbeat: HEARTBEAT_24H
         });
     }
 
@@ -699,31 +514,8 @@ contract HelperConfig is Script {
                 imxUsdPriceFeed: IMX_USD_PRICE_FEED,
                 kncUsdPriceFeed: KNC_USD_PRICE_FEED,
                 rdntUsdPriceFeed: RDNT_USD_PRICE_FEED,
-                // Heartbeats (max price age) — 1 hour for everything except the 24-hour stablecoins
-                ethHeartbeat: HEARTBEAT_1H,
-                usdcHeartbeat: HEARTBEAT_24H,
-                daiHeartbeat: HEARTBEAT_24H,
-                usdtHeartbeat: HEARTBEAT_24H,
-                aaveHeartbeat: HEARTBEAT_1H,
-                linkHeartbeat: HEARTBEAT_1H,
-                oneinchHeartbeat: HEARTBEAT_1H,
-                apeHeartbeat: HEARTBEAT_1H,
-                arbHeartbeat: HEARTBEAT_1H,
-                bnbHeartbeat: HEARTBEAT_1H,
-                btcHeartbeat: HEARTBEAT_1H,
-                compHeartbeat: HEARTBEAT_1H,
-                crvHeartbeat: HEARTBEAT_1H,
-                ensHeartbeat: HEARTBEAT_1H,
-                sandHeartbeat: HEARTBEAT_1H,
-                sushiHeartbeat: HEARTBEAT_1H,
-                wtaoHeartbeat: HEARTBEAT_1H,
-                uniHeartbeat: HEARTBEAT_1H,
-                yfiHeartbeat: HEARTBEAT_1H,
-                wavaxHeartbeat: HEARTBEAT_1H,
-                batHeartbeat: HEARTBEAT_1H,
-                imxHeartbeat: HEARTBEAT_1H,
-                kncHeartbeat: HEARTBEAT_1H,
-                rdntHeartbeat: HEARTBEAT_1H
+                // Heartbeat (max price age) — 1 hour, shared across every feed
+                heartbeat: HEARTBEAT_1H
             });
             return sLocalNetworkConfig;
         }

@@ -259,7 +259,7 @@ def create_signed_user_op(
 
 
 def send_live_user_op_as_session(
-    chat_id: int, key_ciphertext: str, target: str, value: int, data: bytes
+    chat_id: int, key_ciphertext: str, target: str, value: int, data: bytes, price_update_data: list[str] = []
 ):
     """
     Orchestrates the full ERC-4337 UserOperation flow for a session key holder.
@@ -275,6 +275,9 @@ def send_live_user_op_as_session(
     @param target         The contract address SessionHandler will call (e.g. USDC).
     @param value          The ETH value in wei to forward with the inner call.
     @param data           ABI-encoded inner calldata to execute on the target.
+    @param price_update_data Pyth update payload(s) from fetch_price_update_data(), or
+                          [] to skip the refresh (SessionHandler forwards this to
+                          SHOracle.updatePrices before computing USD values).
     @return               A tuple of (user_op_hash_bytes, receipt) where receipt["status"]
                           is 1 on success, matching the return shape of anvil.py for
                           compatibility with tools.py callers.
@@ -284,7 +287,7 @@ def send_live_user_op_as_session(
 
     session_handler = load_session_handler(chat_id=chat_id)
     calldata = session_handler.encode_abi(
-        abi_element_identifier="execute", args=[target, value, data]
+        abi_element_identifier="execute", args=[target, value, data, price_update_data]
     )
 
     entry_point = load_entry_point(chat_id=chat_id)

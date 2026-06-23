@@ -36,7 +36,9 @@ contract SHFactory is Ownable, Pausable {
      * @param _reputationRegistry The Reputation Registry address.
      * @param _identityRegistry   The ERC-8004 Identity Registry address.
      */
-    constructor(address _entryPoint, address _feeRegistry, address _reputationRegistry, address _identityRegistry) Ownable(msg.sender) {
+    constructor(address _entryPoint, address _feeRegistry, address _reputationRegistry, address _identityRegistry)
+        Ownable(msg.sender)
+    {
         ENTRY_POINT = _entryPoint;
         REGISTRY = _feeRegistry;
         REPUTATION_REGISTRY = _reputationRegistry;

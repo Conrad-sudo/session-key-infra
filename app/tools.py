@@ -24,6 +24,9 @@ from anvil import (
 
 from live_network import send_live_user_op_as_session as _send_live_user_op_as_session
 
+from pyth import fetch_price_update_data
+from db import get_all_pricefeed_tokens
+
 from constants import ETH_SENTINEL, WEI_PER_ETH
 
 
@@ -37,11 +40,16 @@ def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
     either the local Anvil backend (for fork/test networks) or the live Alchemy bundler
     (for all other networks), based on the chain name stored in the user's network config.
 
-    Every @tool function that submits an on-chain transaction calls this function.
-    Callers pass a plain (target, value, data) triple; this function handles the full
-    ERC-4337 flow — gas estimation, signing, submission, and receipt polling — via the
-    appropriate backend. RuntimeError from either backend is converted to ToolException
-    so LangChain's tool error handler can surface it to the agent cleanly.
+    Every @tool function that submits an on-chain transaction calls this function. Before
+    dispatching, it checks SessionHandler.oracleIsUpToDate() — a cheap eth_call mirroring the
+    same heartbeat condition execute() itself uses — and only hits Hermes for a fresh price update
+    when the oracle's cache has actually gone stale. Whoever's transaction happens to land
+    after the heartbeat elapses pays to refresh it for everyone, so this avoids paying Hermes'
+    round-trip and the calldata cost of attaching update data on every single call. The full
+    ERC-4337 flow — gas estimation, signing, submission, and receipt polling — is handled by
+    the appropriate backend. RuntimeError from either backend or from the Hermes fetch is
+    converted to ToolException so LangChain's tool error handler can surface it to the agent
+    cleanly.
 
     @param chat_id        The Telegram chat ID of the user making the request.
     @param key_ciphertext Vault Transit ciphertext for the session key ('vault:v1:...').
@@ -50,18 +58,27 @@ def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
     @param data           ABI-encoded calldata for the inner call on target.
     @return               A tuple of (tx_hash_bytes, receipt_dict) where receipt_dict
                           contains at least {"status": 1} on success.
-    @raises ToolException If the UserOperation fails or the bundler rejects the submission.
+    @raises ToolException If the UserOperation fails, the bundler rejects the submission,
+                          or the Hermes price fetch fails.
     """
     _,_,chain_name = load_network_config(chat_id)
 
+    session_handler = load_session_handler(chat_id)
+    price_update_data = []
+    if not session_handler.functions.oracleIsUpToDate().call():
+        try:
+            price_update_data = fetch_price_update_data(get_all_pricefeed_tokens())
+        except (RuntimeError, ValueError) as e:
+            raise ToolException(f"Failed to fetch fresh price data: {e}")
+
     if "fork" in chain_name.lower() or "anvil" in chain_name.lower():
         try:
-            return _send_user_op_as_session(chat_id, key_ciphertext, target, value, data)
+            return _send_user_op_as_session(chat_id, key_ciphertext, target, value, data, price_update_data)
         except RuntimeError as e:
             raise ToolException(str(e))
     else:
         try:
-            return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data)
+            return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data, price_update_data)
         except RuntimeError as e:
             raise ToolException(str(e))
         

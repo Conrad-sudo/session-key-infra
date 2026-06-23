@@ -8,6 +8,7 @@ import {SessionHandler} from "../../src/SessionHandler.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {SendPackedUserOp} from "../../script/SendPackedUserOp.s.sol";
 import {DeploySHProtocol} from "../../script/DeploySHProtocol.s.sol";
+import {PriceUpdate} from "../../script/PriceUpdate.s.sol";
 import {SHOracle} from "../../src/SHOracle.sol";
 import {SHRegistry} from "../../src/SHRegistry.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
@@ -22,6 +23,7 @@ contract SHSepoliaTest is Test {
     HelperConfig.NetworkConfig config;
     SessionHandler sessionHandler;
     SendPackedUserOp sendPackedUserOp;
+    PriceUpdate priceUpdate;
     address user;
     uint256 privateKey;
     address kani = makeAddr("kani");
@@ -90,6 +92,8 @@ contract SHSepoliaTest is Test {
         sessionHandler = SessionHandler(payable(factory.deployWallet()));
         (user, privateKey) = makeAddrAndKey("user");
         sendPackedUserOp = new SendPackedUserOp();
+        priceUpdate = new PriceUpdate();
+        priceUpdate.updateOracle(address(oracle));
         vm.deal(address(sessionHandler), 10 ether);
         deal(config.link, address(sessionHandler), 10000e18);
 
@@ -111,7 +115,8 @@ contract SHSepoliaTest is Test {
         uint256 valueInUsd = oracle.getUsdValue(address(0), value);
 
         bytes memory data = ""; // No data needed for native ETH transfer
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -141,7 +146,8 @@ contract SHSepoliaTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(IERC20.transfer.selector, user, amountToTransfer);
-        bytes memory callData = abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data);
+        bytes memory callData =
+            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
@@ -175,8 +181,9 @@ contract SHSepoliaTest is Test {
             // forge-lint: disable-next-line(unsafe-typecast)
             bytes32("feedbackHash")
         );
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, config.reputationRegistry, value, data);
+        bytes memory callData = abi.encodeWithSelector(
+            SessionHandler.execute.selector, config.reputationRegistry, value, data, new bytes[](0)
+        );
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
