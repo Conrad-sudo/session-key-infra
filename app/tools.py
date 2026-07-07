@@ -24,7 +24,7 @@ from anvil import (
 
 from live_network import send_live_user_op_as_session as _send_live_user_op_as_session
 
-from constants import ETH_SENTINEL, WEI_PER_ETH, get_native_wrapped_ticker
+from constants import ETH_SENTINEL, WEI_PER_ETH, get_native_wrapped_ticker, get_native_asset_ticker
 
 
 def _to_base_units(amount: float, decimals: int) -> int:
@@ -110,6 +110,30 @@ def get_supported_tokens(chat_id: int) -> list:
     """
     print("Running get_supported_tokens")
     return _get_supported_tokens(chat_id)
+
+
+@tool
+def get_native_asset(chat_id: int) -> str:
+    """
+    Retrieves the display name of the wallet's native gas asset for its current network.
+
+    Use this before referring to the wallet's native balance in a response, and whenever the
+    user mentions a native-asset ticker (ETH, BNB, CELO, etc.) that doesn't match what you'd
+    expect on Ethereum. "eth" as a ticker/session argument (e.g. get_eth_balance,
+    send_eth, get_session_keys("eth")) always means "the chain's native asset" internally —
+    it is NOT Ethereum-specific and works identically on every supported network. Never refuse
+    a native-balance or native-send request just because the network isn't Ethereum; call this
+    tool to find out what to call the asset instead.
+
+    Args:
+        chat_id: The Telegram chat ID of the user. Required to resolve the correct network.
+
+    Returns:
+        The native asset's display ticker for the current network (e.g. "ETH", "BNB", "CELO").
+    """
+    print("Running get_native_asset")
+    _, chain_id, _ = load_network_config(chat_id)
+    return get_native_asset_ticker(chain_id)
 
 
 @tool
@@ -240,21 +264,13 @@ def get_recurring_transfers(chat_id: int) -> list[dict]:
 """
 
 
-@tool
-def get_eth_balance(chat_id: int) -> float:
+def _get_native_balance(chat_id: int) -> float:
     """
-    Retrieves the ETH balance of the smart wallet contract.
-
-    Use this tool when the user asks how much ETH the wallet holds or wants
-    to check whether there is enough ETH before wrapping or sending.
-
-    Args:
-        chat_id: The Telegram chat ID of the user making the request.
-
-    Returns:
-        The wallet's ETH balance in whole units (e.g. 1.5 for 1.5 ETH).
+    Raw native-asset balance fetch, in whole units. Not LLM-facing — internal helper shared by
+    get_eth_balance and the balance-sufficiency tools (is_derived_input_sufficient,
+    is_exact_input_sufficient, is_liquidity_sufficient), which need a plain float to do
+    arithmetic against, not the self-describing dict get_eth_balance returns to the agent.
     """
-    print("Running get_eth_balance")
     w3, _, _ = load_network_config(chat_id)
     address = load_session_handler(chat_id).address
     balance_wei = w3.eth.get_balance(address)
@@ -262,23 +278,58 @@ def get_eth_balance(chat_id: int) -> float:
 
 
 @tool
+def get_eth_balance(chat_id: int) -> dict:
+    """
+    Retrieves the smart wallet's native gas asset balance, together with what that asset is
+    actually called on the current network. "eth" in the tool name is a generic internal
+    label, not a claim that the network is Ethereum — this works identically on every
+    supported network. Always report the `asset` value from the result, never assume "ETH".
+
+    Use this tool when the user asks how much of their native asset (ETH, BNB, etc.) the
+    wallet holds, or wants to check whether there is enough before wrapping or sending. If the
+    ticker the user asked about (e.g. "ETH") does not match the returned `asset` (e.g. "BNB"),
+    do not report the balance under the ticker they asked about and do not invent a balance for
+    it either — tell them their wallet is on a network whose native asset is `asset`, and there
+    is no separate balance for the ticker they named on this network.
+
+    Args:
+        chat_id: The Telegram chat ID of the user making the request.
+
+    Returns:
+        A dict with `balance` (float, whole units, e.g. 1.5) and `asset` (str, e.g. "ETH",
+        "BNB", "CELO" — the actual name of the native asset on the wallet's current network).
+    """
+    print("Running get_eth_balance")
+    _, chain_id, _ = load_network_config(chat_id)
+    return {
+        "balance": _get_native_balance(chat_id),
+        "asset": get_native_asset_ticker(chain_id),
+    }
+
+
+@tool
 def send_eth(
     chat_id: int, session_key_ciphertext: str, recipient: str, amount_eth: float
 ):
     """
-    Sends native ETH to a named contact using the ETH session key.
+    Sends the chain's native gas asset (ETH on Ethereum/Sepolia/Anvil, BNB on BSC, CELO on
+    Celo) to a named contact using the native-asset session key. This works identically on
+    every supported network — "eth" in the tool/parameter names is a generic internal label,
+    not a claim that the network is Ethereum. Never refuse this request just because the
+    network isn't Ethereum; call get_native_asset first if you need the correct name for
+    your response.
 
-    Use this tool when the user wants to send ETH to someone. The recipient must
-    already be saved as a contact — if they are not, call save_contact first.
+    Use this tool when the user wants to send their native asset (ETH, BNB, etc.) to someone.
+    The recipient must already be saved as a contact — if they are not, call save_contact first.
     Retrieve the session key by calling get_session_keys("eth").
-    Specify the amount in whole ETH units (e.g. 1.5 for 1.5 ETH), not in wei.
+    Specify the amount in whole native-asset units (e.g. 1.5), not in wei.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        session_key_ciphertext: Vault ciphertext for the native ETH session key.
+        session_key_ciphertext: Vault ciphertext for the native-asset session key.
                                 Obtain by calling get_session_keys("eth").
-        recipient: The name of the contact to send ETH to (e.g. "Sandy"). Must be a saved contact.
-        amount_eth: The amount of ETH to send, in whole units (e.g. 1.5 for 1.5 ETH). The tool converts this to wei internally before sending the transaction.
+        recipient: The name of the contact to send to (e.g. "Sandy"). Must be a saved contact.
+        amount_eth: The amount of the native asset to send, in whole units (e.g. 1.5). The tool converts this to wei internally before sending the transaction.
 
     Returns:
         A string summarizing the transaction result, including the transaction hash and status.
@@ -1001,7 +1052,7 @@ def is_derived_input_sufficient(
     """
 
     if token_in.lower() == "eth":
-        balance = get_eth_balance.func(chat_id)
+        balance = _get_native_balance(chat_id)
     else:
         balance = get_erc20_balance.func(chat_id, token_in)
 
@@ -1041,7 +1092,7 @@ def is_exact_input_sufficient(chat_id: int, token_in: str, amount_in: float) -> 
         True if the user has sufficient funds to cover the swap without slippage, False otherwise.
     """
     if token_in.lower() == "eth":
-        balance = get_eth_balance.func(chat_id)
+        balance = _get_native_balance(chat_id)
     else:
         balance = get_erc20_balance.func(chat_id, token_in)
 
@@ -1086,7 +1137,7 @@ def is_liquidity_sufficient(
         return {"is_sufficient": False, "amount_b": amount_b}
 
     if token_b.lower() == "eth":
-        balance_b = get_eth_balance.func(chat_id)
+        balance_b = _get_native_balance(chat_id)
     else:
         balance_b = get_erc20_balance.func(chat_id, token_b)
     if amount_b > balance_b:
@@ -1257,39 +1308,42 @@ def swap_ETH_for_exact_tokens(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
-    Swaps ETH for an exact amount of an ERC20 token via the Uniswap V2 router using
-    swapETHForExactTokens. The user specifies how many tokens to receive; the router
-    charges however much ETH is needed (plus a slippage buffer) and refunds any excess.
+    Swaps the chain's native asset (ETH, BNB, etc.) for an exact amount of an ERC20 token via
+    the Uniswap/PancakeSwap V2 router using swapETHForExactTokens. The user specifies how many
+    tokens to receive; the router charges however much of the native asset is needed (plus a
+    slippage buffer) and refunds any excess. "ETH" in the tool name is a generic internal
+    label — this works identically on every supported network.
 
     Use this tool when the user wants to acquire a specific amount of an ERC20 token by
-    spending ETH. The session key must be authorized for the Uniswap router. Always
+    spending their native asset. The session key must be authorized for the router. Always
     retrieve it by calling get_session_keys("uniswapv2_router") — the session is scoped
     to the router, not to the output token.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized
-                                for the Uniswap router. Obtain via get_session_keys("uniswapv2_router").
+                                for the router. Obtain via get_session_keys("uniswapv2_router").
         token_out: The ticker symbol of the ERC20 token to acquire (e.g. "usdc").
         amount_out: The exact amount of token_out to receive, in whole units (e.g. 100 for 100 USDC).
                     The tool converts this to base units internally.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). Applied as an
-                      upward buffer on the ETH value sent so the swap succeeds even if the price
-                      moves slightly. Defaults to 50 bps. Use a higher value for volatile tokens
-                      or low-liquidity pools.
+                      upward buffer on the native-asset value sent so the swap succeeds even if the
+                      price moves slightly. Defaults to 50 bps. Use a higher value for volatile
+                      tokens or low-liquidity pools.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
-             ETH spent, and amount of token_out received.
+             native asset spent, and amount of token_out received.
     """
     print("Running swap_ETH_for_exact_tokens")
     _, chain_id, _ = load_network_config(chat_id)
     native_wrapped = get_native_wrapped_ticker(chain_id)
+    native_ticker = get_native_asset_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
     quote = get_quote_in.func(chat_id, native_wrapped, token_out, amount_out)
     derived_check = is_derived_input_sufficient.func(
         chat_id, "eth", token_out, amount_out, slippage_bps
     )
     if not derived_check["is_sufficient"]:
-        raise ToolException(f"Insufficient ETH balance for this swap.")
+        raise ToolException(f"Insufficient {native_ticker} balance for this swap.")
 
     value = int(
         quote["amount_in_base"] * (BPS_DENOMINATOR + slippage_bps) / BPS_DENOMINATOR
@@ -1323,7 +1377,7 @@ def swap_ETH_for_exact_tokens(
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"ETH spent: {quote['amount_in']:.6f} ETH, "
+        f"{native_ticker} spent: {quote['amount_in']:.6f} {native_ticker}, "
         f"{token_out.upper()} received: {amount_out}"
     )
 
@@ -1486,28 +1540,30 @@ def swap_exact_tokens_for_ETH(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
-    Swaps an exact amount of an ERC20 token for ETH via the Uniswap V2 router
-    using swapExactTokensForETH. The user specifies how much of token_in to sell;
-    they receive however much ETH the pool gives back (minus slippage).
+    Swaps an exact amount of an ERC20 token for the chain's native asset (ETH, BNB, etc.) via
+    the Uniswap/PancakeSwap V2 router using swapExactTokensForETH. The user specifies how much
+    of token_in to sell; they receive however much of the native asset the pool gives back
+    (minus slippage). "ETH" in the tool name is a generic internal label — this works
+    identically on every supported network.
 
     Use this tool when the user wants to sell a specific amount of an ERC20 token
-    and receive ETH in return. The session key must be authorized for the Uniswap
+    and receive their native asset in return. The session key must be authorized for the
     router. Always retrieve it by calling get_session_keys("uniswapv2_router")
     before calling this tool.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized
-                                for the Uniswap router. Obtain via get_session_keys("uniswapv2_router").
+                                for the router. Obtain via get_session_keys("uniswapv2_router").
         token_in: The ticker symbol of the ERC20 token to sell (e.g. "usdc", "dai").
         amount_in: The exact amount of token_in to sell, in whole units (e.g. 100 for 100 USDC).
                    The tool converts this to base units internally.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). The tool
-                      queries getAmountsOut to find the expected ETH output and sets amountOutMin
-                      accordingly. Defaults to 50 bps. Use a higher value for volatile tokens
-                      or low-liquidity pools.
+                      queries getAmountsOut to find the expected native-asset output and sets
+                      amountOutMin accordingly. Defaults to 50 bps. Use a higher value for
+                      volatile tokens or low-liquidity pools.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
-             amount of token_in spent, and ETH received.
+             amount of token_in spent, and native asset received.
     """
     print("Running swap_exact_tokens_for_ETH")
 
@@ -1516,6 +1572,7 @@ def swap_exact_tokens_for_ETH(
 
     _, chain_id, _ = load_network_config(chat_id)
     native_wrapped = get_native_wrapped_ticker(chain_id)
+    native_ticker = get_native_asset_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
     quote = get_quote_out.func(chat_id, token_in, native_wrapped, amount_in)
 
@@ -1553,7 +1610,7 @@ def swap_exact_tokens_for_ETH(
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token_in.upper()} spent: {amount_in}, "
-        f"ETH received: {quote['amount_out']:.6f}"
+        f"{native_ticker} received: {quote['amount_out']:.6f}"
     )
 
 
@@ -1566,31 +1623,35 @@ def swap_tokens_for_exact_ETH(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
-    Swaps however much of an ERC20 token is needed to receive an exact amount of ETH via
-    the Uniswap V2 router using swapTokensForExactETH. The user specifies how much ETH
-    they want to receive; the router spends as much token_in as required (up to amountInMax).
+    Swaps however much of an ERC20 token is needed to receive an exact amount of the chain's
+    native asset (ETH, BNB, etc.) via the Uniswap/PancakeSwap V2 router using
+    swapTokensForExactETH. The user specifies how much of the native asset they want to
+    receive; the router spends as much token_in as required (up to amountInMax). "ETH" in the
+    tool/parameter names is a generic internal label — this works identically on every
+    supported network.
 
-    Use this tool when the user wants to receive a specific amount of ETH by selling an
-    ERC20 token. The session key must be authorized for the Uniswap router. Always retrieve
+    Use this tool when the user wants to receive a specific amount of their native asset by
+    selling an ERC20 token. The session key must be authorized for the router. Always retrieve
     it by calling get_session_keys("uniswapv2_router") before calling this tool.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized
-                                for the Uniswap router. Obtain via get_session_keys("uniswapv2_router").
+                                for the router. Obtain via get_session_keys("uniswapv2_router").
         token_in: The ticker symbol of the ERC20 token to sell (e.g. "usdc", "dai").
-        amount_out_eth: The exact amount of ETH to receive, in whole units (e.g. 1.5 for 1.5 ETH).
+        amount_out_eth: The exact amount of the native asset to receive, in whole units (e.g. 1.5).
                         The tool converts this to wei internally.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). Applied as an
                       upward buffer on amountInMax so the swap succeeds even if the price moves
                       slightly. Defaults to 50 bps. Use a higher value for volatile tokens or
                       low-liquidity pools.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
-             amount of token_in spent, and ETH received.
+             amount of token_in spent, and native asset received.
     """
     print("Running swap_tokens_for_exact_ETH")
     _, chain_id, _ = load_network_config(chat_id)
     native_wrapped = get_native_wrapped_ticker(chain_id)
+    native_ticker = get_native_asset_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
     quote = get_quote_in.func(chat_id, token_in, native_wrapped, amount_out_eth)
     derived_check = is_derived_input_sufficient.func(
@@ -1634,7 +1695,7 @@ def swap_tokens_for_exact_ETH(
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token_in.upper()} spent: {quote['amount_in']:.6f}, "
-        f"ETH received: {amount_out_eth}"
+        f"{native_ticker} received: {amount_out_eth}"
     )
 
 
@@ -1647,36 +1708,40 @@ def swap_exact_ETH_for_tokens(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
-    Swaps an exact amount of ETH for an ERC20 token via the Uniswap V2 router using
-    swapExactETHForTokens. The user specifies how much ETH to spend; they receive
-    however many tokens the pool gives back (minus slippage).
+    Swaps an exact amount of the chain's native asset (ETH, BNB, etc.) for an ERC20 token via
+    the Uniswap/PancakeSwap V2 router using swapExactETHForTokens. The user specifies how much
+    of the native asset to spend; they receive however many tokens the pool gives back (minus
+    slippage). "ETH" in the tool/parameter names is a generic internal label — this works
+    identically on every supported network.
 
-    Use this tool when the user wants to spend a specific amount of ETH and receive as
-    many tokens as possible in return. The session key must be authorized for the Uniswap
+    Use this tool when the user wants to spend a specific amount of their native asset and
+    receive as many tokens as possible in return. The session key must be authorized for the
     router. Always retrieve it by calling get_session_keys("uniswapv2_router") — the
     session is scoped to the router, not to the output token.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized
-                                for the Uniswap router. Obtain via get_session_keys("uniswapv2_router").
+                                for the router. Obtain via get_session_keys("uniswapv2_router").
         token_out: The ticker symbol of the ERC20 token to receive (e.g. "usdc", "dai").
-        eth_amount_in: The exact amount of ETH to spend, in whole units (e.g. 1.5 for 1.5 ETH).
+        eth_amount_in: The exact amount of the native asset to spend, in whole units (e.g. 1.5).
                        The tool converts this to wei internally and forwards it as msg.value.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). The tool
                       queries getAmountsOut to find the expected token output and sets amountOutMin
                       accordingly. Defaults to 50 bps. Use a higher value for volatile tokens
                       or low-liquidity pools.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
-             ETH spent, and amount of token_out received.
+             native asset spent, and amount of token_out received.
     """
     print("Running swap_exact_ETH_for_tokens")
 
-    if not is_exact_input_sufficient.func(chat_id, "eth", eth_amount_in):
-        raise ToolException(f"Insufficient ETH balance for this swap.")
-
     _, chain_id, _ = load_network_config(chat_id)
     native_wrapped = get_native_wrapped_ticker(chain_id)
+    native_ticker = get_native_asset_ticker(chain_id)
+
+    if not is_exact_input_sufficient.func(chat_id, "eth", eth_amount_in):
+        raise ToolException(f"Insufficient {native_ticker} balance for this swap.")
+
     router = load_iuniswap_router(chat_id)
     quote = get_quote_out.func(chat_id, native_wrapped, token_out, eth_amount_in)
 
@@ -1712,7 +1777,7 @@ def swap_exact_ETH_for_tokens(
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"ETH spent: {eth_amount_in}, "
+        f"{native_ticker} spent: {eth_amount_in}, "
         f"{token_out.upper()} received: {quote['amount_out']:.6f}"
     )
 
@@ -1817,42 +1882,45 @@ def add_liquidity_eth(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
-    Adds liquidity to a Uniswap V2 token/ETH pool via addLiquidityETH. The user specifies
-    the ERC20 token and an amount; the proportional ETH amount is derived from live pool
-    reserves via router.quote() so the deposit always matches the current pool ratio. ETH
-    is forwarded directly as msg.value — no prior wrapping is required.
+    Adds liquidity to a Uniswap/PancakeSwap V2 token/native-asset pool via addLiquidityETH.
+    The user specifies the ERC20 token and an amount; the proportional amount of the chain's
+    native asset (ETH, BNB, etc.) is derived from live pool reserves via router.quote() so the
+    deposit always matches the current pool ratio. The native asset is forwarded directly as
+    msg.value — no prior wrapping is required. "ETH" in the tool name is a generic internal
+    label — this works identically on every supported network.
 
-    Use this tool when the user wants to add liquidity to a Uniswap V2 pool using raw ETH
+    Use this tool when the user wants to add liquidity to a pool using their raw native asset
     (as opposed to the chain's wrapped-native token). The session key must be authorized for
-    the Uniswap router. Retrieve
+    the router. Retrieve
     it by calling get_session_keys("uniswapv2_router") before calling this tool. The token
     must already have its ERC20 allowance set for the router so it can pull the token amount.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized for the
-                                Uniswap router. Obtain via get_session_keys("uniswapv2_router").
-        token: The ticker symbol of the ERC20 token to deposit alongside ETH (e.g. "dai").
+                                router. Obtain via get_session_keys("uniswapv2_router").
+        token: The ticker symbol of the ERC20 token to deposit alongside the native asset (e.g. "dai").
         amount_token: The desired amount of the ERC20 token to deposit, in whole units
-                      (e.g. 2500 for 2500 DAI). The proportional ETH amount is computed
+                      (e.g. 2500 for 2500 DAI). The proportional native-asset amount is computed
                       from pool reserves automatically.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). Applied
                       to both amountTokenMin and amountETHMin. Defaults to 50 bps.
 
     Returns:
         A string summarizing the transaction result, including the transaction hash, status,
-        token min deposited, and ETH min deposited.
+        token min deposited, and native asset min deposited.
     """
     print("Running add_liquidity_eth")
     _, chain_id, _ = load_network_config(chat_id)
     native_wrapped = get_native_wrapped_ticker(chain_id)
+    native_ticker = get_native_asset_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
     quote = get_pool_quote.func(chat_id, token, native_wrapped, amount_token)
 
     liquidity_check = is_liquidity_sufficient.func(chat_id, token, amount_token, "eth")
     if not liquidity_check["is_sufficient"]:
         raise ToolException(
-            f"Insufficient token balance. Ensure the wallet holds enough {token.upper()} and ETH to cover the deposit."
+            f"Insufficient token balance. Ensure the wallet holds enough {token.upper()} and {native_ticker} to cover the deposit."
         )
 
     amount_token_min = int(
@@ -1892,7 +1960,7 @@ def add_liquidity_eth(
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token.upper()} min deposited: {amount_token_min / 10**quote['decimals_a']:.6f}, "
-        f"ETH min deposited: {amount_eth_min / WEI_PER_ETH:.6f}"
+        f"{native_ticker} min deposited: {amount_eth_min / WEI_PER_ETH:.6f}"
     )
 
 
@@ -1994,17 +2062,19 @@ def remove_liquidity_eth(
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
-    Removes liquidity from a Uniswap V2 token/ETH pool via removeLiquidityETH. The user
-    specifies the ERC20 token and the LP amount to burn; expected return amounts for the
-    token and ETH are derived from live reserves using the proportional share formula
-    (liquidity * reserve / totalSupply). Slippage is applied downward to compute
-    amountTokenMin and amountETHMin. The router unwraps the wrapped-native share to raw ETH/BNB before
-    sending it back to the wallet.
+    Removes liquidity from a Uniswap/PancakeSwap V2 token/native-asset pool via
+    removeLiquidityETH. The user specifies the ERC20 token and the LP amount to burn; expected
+    return amounts for the token and the chain's native asset (ETH, BNB, etc.) are derived
+    from live reserves using the proportional share formula (liquidity * reserve /
+    totalSupply). Slippage is applied downward to compute amountTokenMin and amountETHMin.
+    The router unwraps the wrapped-native share to the raw native asset before sending it back
+    to the wallet. "ETH" in the tool/parameter names is a generic internal label — this works
+    identically on every supported network.
 
-    Use this tool when the user wants to remove liquidity from a token/ETH pool and receive
-    the ERC20 token and raw ETH back. The session key must be authorized for the Uniswap
-    router. Retrieve it by calling get_session_keys("uniswapv2_router") before calling this
-    tool. The LP token allowance for the router must already be set.
+    Use this tool when the user wants to remove liquidity from a token/native-asset pool and
+    receive the ERC20 token and the raw native asset back. The session key must be authorized
+    for the router. Retrieve it by calling get_session_keys("uniswapv2_router") before calling
+    this tool. The LP token allowance for the router must already be set.
 
     Note: removeLiquidityETH credits the session budget back rather than charging it, so no
     preflight budget check is required — only session validity needs to be confirmed.
@@ -2012,9 +2082,9 @@ def remove_liquidity_eth(
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized for the
-                                Uniswap router. Obtain via get_session_keys("uniswapv2_router").
+                                router. Obtain via get_session_keys("uniswapv2_router").
         token: The ticker symbol of the ERC20 token in the pair (e.g. "dai"). The other
-               token is always ETH.
+               side of the pair is always the chain's native asset.
         lp_amount: The amount of LP tokens to burn, in whole units (e.g. 0.5 for 0.5 LP
                    tokens). The tool converts this to base units internally.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). Applied
@@ -2026,6 +2096,7 @@ def remove_liquidity_eth(
     print("Running remove_liquidity_eth")
     _, chain_id, _ = load_network_config(chat_id)
     native_wrapped = get_native_wrapped_ticker(chain_id)
+    native_ticker = get_native_asset_ticker(chain_id)
     if not is_liquidity_removal_sufficient.func(chat_id, token, native_wrapped, lp_amount):
         raise ToolException(
             "Insufficient LP tokens. Use get_liquidity_token_balance to check your balance."
@@ -2068,7 +2139,7 @@ def remove_liquidity_eth(
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"Min {token.upper()} returned: {amount_token_min / 10**lp['decimals_a']:.6f}, "
-        f"Min ETH returned: {amount_eth_min / WEI_PER_ETH:.6f}"
+        f"Min {native_ticker} returned: {amount_eth_min / WEI_PER_ETH:.6f}"
     )
 
 

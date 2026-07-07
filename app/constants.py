@@ -37,3 +37,29 @@ def get_native_wrapped_ticker(chain_id: int) -> str:
         raise ValueError(f"No native-wrapped ticker configured for chain_id {chain_id}")
     return ticker
 
+
+# Display name of the chain's native gas asset — the thing "eth" as a session/ticker
+# argument actually refers to everywhere in this codebase (ETH_SENTINEL, get_eth_balance,
+# send_eth, the swap_*_ETH tools, etc). Purely cosmetic: lets user-facing text say "BNB"
+# instead of "ETH" when the wallet is deployed on BSC.
+NATIVE_ASSET_TICKER = {
+    CHAIN_ID_MAINNET: "ETH",
+    CHAIN_ID_SEPOLIA: "ETH",
+    CHAIN_ID_ANVIL: "ETH",
+    CHAIN_ID_BSC: "BNB",
+    CHAIN_ID_CELO: "CELO",
+}
+
+
+def get_native_asset_ticker(chain_id: int) -> str:
+    """
+    Returns the display name of chain_id's native gas asset (e.g. "ETH", "BNB", "CELO").
+
+    @param chain_id  The numeric chain ID.
+    @raises ValueError  If chain_id has no configured native-asset ticker.
+    """
+    ticker = NATIVE_ASSET_TICKER.get(chain_id)
+    if ticker is None:
+        raise ValueError(f"No native-asset ticker configured for chain_id {chain_id}")
+    return ticker
+

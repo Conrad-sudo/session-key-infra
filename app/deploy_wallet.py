@@ -17,6 +17,7 @@ from db import (
     get_token_address,
     get_erc20_selectors,
     get_uniswapv2_selectors,
+    save_contact
 )
 from anvil import get_or_create_session_key
 from contracts import (
@@ -25,6 +26,7 @@ from contracts import (
     load_session_handler,
     load_session_handler_module,
     load_ierc20,
+    load_calldata,
     pack_execution_calldata,
     ERC7579_SINGLE_CALL_MODE,
 )
@@ -375,10 +377,7 @@ def approve(chat_id: int, token: str):
 
     erc20 = load_ierc20(chat_id=chat_id, token=token)
 
-    approve_data = erc20.encode_abi(
-        abi_element_identifier="approve",
-        args=[router_address, 2**256 - 1],
-    )
+    approve_data = load_calldata(instance=erc20, fn_name="approve", args=[router_address, 2**256 - 1])
     execution_calldata = pack_execution_calldata(erc20.address, 0, approve_data)
 
     _call(
@@ -420,7 +419,7 @@ def add_default_session(chat_id: int):
     ]
     reputation_registry_functions = ["giveFeedback"]
 
-    if chain_name == "mainnet-fork":
+    if "mainnet" in chain_name:
         add_session(
             chat_id=chat_id,
             targets=["eth", native_wrapped, "usdc", "uniswapv2_router","reputation_registry"],
@@ -454,7 +453,7 @@ def add_default_session(chat_id: int):
         # against BNB-USD on chain 56 regardless of the ticker name used to request the session.
         add_session(
             chat_id=chat_id,
-            targets=["eth", native_wrapped, "usdc", "uniswapv2_router", "reputation_registry"],
+            targets=["bnb", native_wrapped, "usdc", "uniswapv2_router", "reputation_registry"],
             functions=[
                 [],  # empty selector array for native BNB sessions (address(0) target) since there are no function calls, just value transfers
                 weth_functions,
@@ -517,6 +516,8 @@ def deploy(chat_id: int, network: str):
 
 if __name__ == "__main__":
     chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
-    network = sys.argv[1] if len(sys.argv) > 1 else "sepolia-fork"
-    deploy(chat_id=chat_id, network=network)
-    add_default_session(chat_id=chat_id)
+    #save_contact(chat_id=chat_id,name="tim",address="0x9f4d8D3f66C47c75b95325f01861d1643825Bffc")
+    #network = sys.argv[1] if len(sys.argv) > 1 else "sepolia-fork"
+    #deploy(chat_id=chat_id, network=network)
+    #add_default_session(chat_id=chat_id)
+    approve(chat_id=chat_id, token="wbnb")
