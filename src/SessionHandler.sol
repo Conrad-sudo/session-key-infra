@@ -1,9 +1,4 @@
-/* SPDX-License-Identifier: BUSL-1.1
- * Licensor: Conrad Japhet
- * Licensed Work: SessionHandler.sol
- * Change Date: 2029-06-12
- * Change License: MIT
-*/
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import {IEntryPoint} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
