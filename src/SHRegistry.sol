@@ -58,7 +58,7 @@ contract SHRegistry is Ownable {
 
     /// @notice Uniswap V2 Router address used for swap and liquidity calldata parsing.
     /// @dev May be address(0) on chains where Uniswap V2 is not deployed.
-    address public uniswapRouter;
+    address public router;
 
     /// @notice SHValueInterpreter used by all SessionHandler wallets to compute USD spend values.
     address public callValueInterpreter;
@@ -107,14 +107,14 @@ contract SHRegistry is Ownable {
      * @param initialTreasury      Address that will receive protocol fees. Must not be address(0).
      * @param initialOracle        Address of the deployed SHOracle. Must not be address(0).
      * @param initialAgentId       Id of the SessionHandler agent on the ERC-8004 Identity Registry. Must not be 0.
-     * @param initialUniswapRouter Uniswap V2 Router address. May be address(0) on chains without Uniswap V2.
+     * @param initialRouter Uniswap V2 Router address. May be address(0) on chains without Uniswap V2.
      */
     constructor(
         uint256 initialFee,
         address initialTreasury,
         address initialOracle,
         uint256 initialAgentId,
-        address initialUniswapRouter
+        address initialRouter
     ) Ownable(msg.sender) {
         if (initialFee > MAX_PROTOCOL_FEE) revert SHRegistry_FeeTooHigh();
         if (initialTreasury == address(0)) revert SHRegistry_InvalidTreasury();
@@ -124,7 +124,7 @@ contract SHRegistry is Ownable {
         treasury = initialTreasury;
         priceOracle = initialOracle;
         agentId = initialAgentId;
-        uniswapRouter = initialUniswapRouter;
+        router = initialRouter;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -182,8 +182,8 @@ contract SHRegistry is Ownable {
      * @param newRouter The new Uniswap V2 Router address.
      */
     function setUniswapRouter(address newRouter) external onlyOwner {
-        address old = uniswapRouter;
-        uniswapRouter = newRouter;
+        address old = router;
+        router = newRouter;
         emit UniswapRouterUpdated(old, newRouter);
     }
 

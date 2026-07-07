@@ -8,8 +8,12 @@ import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Errors} from "@openzeppelin/contracts/utils/Errors.sol";
+import {Account as OZAccount} from "@openzeppelin/contracts/account/Account.sol";
+import {PackedUserOperation as OZPackedUserOperation} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
 //Local imports
 import {SessionHandler} from "../../src/SessionHandler.sol";
+import {SessionHandlerModule} from "../../src/SessionHandlerModule.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {SendPackedUserOp} from "../../script/SendPackedUserOp.s.sol";
 import {DeploySHProtocol} from "../../script/DeploySHProtocol.s.sol";
@@ -19,50 +23,35 @@ import {SHOracle} from "../../src/SHOracle.sol";
 import {SHRegistry} from "../../src/SHRegistry.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
 import {SHTreasury} from "../../src/SHTreasury.sol";
-import {SessionHandlerHarness} from "./SessionHandlerHarness.sol";
-import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
-import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
-import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
-import {
-    ETH_USD_PRICE_FEED,
-    USDC_USD_PRICE_FEED,
-    DAI_USD_PRICE_FEED,
-    USDT_USD_PRICE_FEED,
-    AAVE_USD_PRICE_FEED,
-    LINK_USD_PRICE_FEED,
-    ONEINCH_USD_PRICE_FEED,
-    APE_USD_PRICE_FEED,
-    ARB_USD_PRICE_FEED,
-    BNB_USD_PRICE_FEED,
-    BTC_USD_PRICE_FEED,
-    COMP_USD_PRICE_FEED,
-    CRV_USD_PRICE_FEED,
-    ENS_USD_PRICE_FEED,
-    SAND_USD_PRICE_FEED,
-    SUSHI_USD_PRICE_FEED,
-    WTAO_USD_PRICE_FEED,
-    UNI_USD_PRICE_FEED,
-    YFI_USD_PRICE_FEED
-} from "../../script/Constants.s.sol";
+import {SessionHandlerModuleHarness} from "./SessionHandlerModuleHarness.sol";
+import {MockV3Aggregator} from "../../src/mocks/MockV3Aggregator.sol";
 
 /**
  * @title SHProtocolTest
  * @author Conrad Japhet
- * @notice Test suite for the SessionHandler ERC-4337 smart account contract
- * @dev Tests cover access control, session validation, EntryPoint integration,
- *      spending limits, view functions, and event emissions.
+ * @notice Test suite for SessionHandler, the ERC-7579 smart account with delegated,
+ *         spending-limited session-key permissions.
+ * @dev Tests cover access control, session validation, EntryPoint integration, spending limits,
+ *      view functions, and event emissions. A few shape notes worth knowing up front:
+ *      - execute() takes (bytes32 mode, bytes executionCalldata), the standard ERC-7579 shape --
+ *        the target/value/inner-calldata are packed together into executionCalldata.
+ *      - Session-key state/logic lives entirely in SessionHandlerModule (installed as both
+ *        validator and hook), not on the account itself; SessionHandler only exposes passthroughs.
+ *      - execute/installModule/uninstallModule are gated by onlyEntryPointOrSelfOrOwner, which
+ *        reverts with OZAccount.AccountUnauthorized (inherited from OZ's Account.sol);
+ *        addSessionKey/revokeSessionKey are gated by plain onlyOwner (Ownable), which reverts with
+ *        Ownable.OwnableUnauthorizedAccount instead -- two different errors depending on which
+ *        function you're testing.
+ *      - There is no owner-mode UserOp path: SessionHandlerModule is the only installed validator
+ *        and it rejects any signer that isn't a registered session key. SendPackedUserOp only
+ *        signs session-key ops; tests that need an owner-signed UserOp (to prove it's rejected)
+ *        build one manually with the same script, signing with the Anvil owner key.
+ *      - execute() charges a flat protocol fee on session-key-driven calls, determined via
+ *        SessionHandlerModule.pendingSessionKey rather than an internal transient variable, since
+ *        session state lives in the module.
  *
- *  NB Casting to 'uint160' is safe because we extract the lower 160 bits
+ * NB Casting to 'uint160' is safe because we extract the lower 160 bits
  *      of the packed validation data which contains the aggregator/sig validation result
- *
- * Test Categories:
- * - Access Control: Owner/non-owner permissions for execute, pause, session management
- * - Validation: UserOp signature and session constraint validation
- * - Recover Signed UserOp: Signature recovery for owner and session key operations
- * - EntryPoint: Full ERC-4337 flow through handleOps
- * - Session: Session key lifecycle and constraint enforcement
- * - View Functions: Session state queries and budget tracking
- * - Events: Correct event emission for session lifecycle actions
  */
 contract SHProtocolTest is Test {
     ERC20Mock usdc;
@@ -73,6 +62,7 @@ contract SHProtocolTest is Test {
     SHTreasury treasury;
     HelperConfig.NetworkConfig config;
     SessionHandler sessionHandler;
+    SessionHandlerModule spendingLimitModule;
     SendPackedUserOp sendPackedUserOp;
     bytes4[] selectors;
 
@@ -82,16 +72,16 @@ contract SHProtocolTest is Test {
     /// @dev Initial ETH balance given to SessionHandler
     uint256 constant INTITIAL_ACCOUNT_BALANCE = 10 ether;
 
-    /// @dev Sentinel values used to signal that the owner key should be used instead of a session key
-    address constant DEFAULT_SESSION_SIGNER = address(0);
-    uint256 constant DEFAULT_SESSION_KEY = 0;
-
     /// @dev Spending limit in USD with 18 decimals (e.g., 5000 USDC = 5000 * 10^18 for precision in the oracle)
     uint256 constant BUDGET = 5000e18;
     /// @dev Example ETH value used in tests that verify USD value tracking through the oracle
     uint256 constant ETH_VALUE = 5e18;
 
     uint256 constant AMOUNT_TO_TRANSFER = 1000e6;
+
+    /// @dev Anvil's default private key for config.account (0xf39Fd6e51aad88F6F4ce6aB8827279cffFb9226),
+    ///      used only by the two tests that must prove an owner-signed UserOp is rejected.
+    uint256 constant ANVIL_OWNER_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
 
     /// @dev Session key holder — generated with a known private key for signature tests
     address user;
@@ -108,7 +98,6 @@ contract SHProtocolTest is Test {
     /**
      * @dev Adds a standard ERC20 transfer session for `user` on the `usdc` mock token.
      *      Grants access to ERC20Mock.transfer only, within a 1-day window, with BUDGET spending limit.
-     *      Used by tests that need a valid active session without ETH value transfers.
      */
     modifier sessionAdded() {
         address sessionKey = user;
@@ -129,8 +118,7 @@ contract SHProtocolTest is Test {
     }
 
     /**
-     * @dev Adds a session for `user` that allows calling ERC20Mock.sendEth with ETH value.
-     *      Used by tests that verify spending limit tracking and ETH value flow through sessions.
+     * @dev Adds a session for `user` scoped to the WETH contract (transfer/transferFrom/approve/deposit/withdraw).
      */
     modifier wethSessionAdded() {
         address sessionKey = user;
@@ -173,8 +161,8 @@ contract SHProtocolTest is Test {
      * @dev Deploys all required contracts and funds the SessionHandler.
      *      - Generates a named user address and private key for session signing
      *      - Deploys SessionHandler via DeploySHProtocol + SHFactory.deployWallet()
-     *      - Deploys SendPackedUserOp helper and ERC20Mock token
-     *      - Funds SessionHandler with 1 ETH and mints 10,000 USDC mock tokens to it
+     *      - Deploys SendPackedUserOp helper and reads the mock tokens from config
+     *      - Funds SessionHandler with 1 ETH and mints mock tokens to it
      */
     function setUp() public {
         (user, privateKey) = makeAddrAndKey("user");
@@ -182,10 +170,10 @@ contract SHProtocolTest is Test {
         SHFactory factory;
         (factory, treasury, config, oracle) = deployer.run();
         feeRegistry = SHRegistry(treasury.REGISTRY());
+        spendingLimitModule = SessionHandlerModule(factory.spendingLimitModule());
         vm.prank(config.account);
         sessionHandler = SessionHandler(payable(factory.deployWallet()));
         sendPackedUserOp = new SendPackedUserOp();
-        //usdc = new ERC20Mock();
         usdc = ERC20Mock(config.usdc);
         dai = ERC20Mock(config.dai);
         weth = MockWeth(payable(config.weth));
@@ -196,47 +184,73 @@ contract SHProtocolTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                       ORACLE REFRESH HELPERS
+                          CALLDATA / ORACLE HELPERS
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @dev Refreshes every mock price feed's publishTime to block.timestamp after a vm.warp.
-     *      Required whenever warping more than the per-feed heartbeat (1 hour on Anvil) in
-     *      tests where the session is still active and the oracle will be queried.
-     *      Not needed when the session has already expired — _checkAndUpdateSessionStatus
-     *      deletes the session before the oracle is ever reached.
-     */
-    function _refreshMockFeeds() internal {
-        _refreshMockFeed(ETH_USD_PRICE_FEED);
-        _refreshMockFeed(USDC_USD_PRICE_FEED);
-        _refreshMockFeed(DAI_USD_PRICE_FEED);
-        _refreshMockFeed(USDT_USD_PRICE_FEED);
-        _refreshMockFeed(AAVE_USD_PRICE_FEED);
-        _refreshMockFeed(LINK_USD_PRICE_FEED);
-        _refreshMockFeed(ONEINCH_USD_PRICE_FEED);
-        _refreshMockFeed(APE_USD_PRICE_FEED);
-        _refreshMockFeed(ARB_USD_PRICE_FEED);
-        _refreshMockFeed(BNB_USD_PRICE_FEED);
-        _refreshMockFeed(BTC_USD_PRICE_FEED);
-        _refreshMockFeed(COMP_USD_PRICE_FEED);
-        _refreshMockFeed(CRV_USD_PRICE_FEED);
-        _refreshMockFeed(ENS_USD_PRICE_FEED);
-        _refreshMockFeed(SAND_USD_PRICE_FEED);
-        _refreshMockFeed(SUSHI_USD_PRICE_FEED);
-        _refreshMockFeed(WTAO_USD_PRICE_FEED);
-        _refreshMockFeed(UNI_USD_PRICE_FEED);
-        _refreshMockFeed(YFI_USD_PRICE_FEED);
+    /// @dev Packs (dest, value, data) into the ERC-7579 single-execution calldata expected by
+    ///      SessionHandler.execute(bytes32 mode, bytes executionCalldata) when called directly
+    ///      (owner path) rather than through a signed UserOp.
+    function _encodeExecutionCalldata(address dest, uint256 value, bytes memory data)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(dest, value, data);
     }
 
-    function _refreshMockFeed(bytes32 feedId) private {
-        MockPyth pyth = MockPyth(config.pyth);
-        PythStructs.Price memory p = IPyth(config.pyth).getPriceUnsafe(feedId);
-        bytes memory updateData = pyth.createPriceFeedUpdateData(
-            feedId, p.price, p.conf, p.expo, p.price, p.conf, uint64(block.timestamp), 0
-        );
-        bytes[] memory updates = new bytes[](1);
-        updates[0] = updateData;
-        pyth.updatePriceFeeds(updates);
+    /**
+     * @dev SendPackedUserOp returns account-abstraction's PackedUserOperation (needed for
+     *      IEntryPoint.handleOps, which is typed against that same package). SessionHandler's
+     *      validateUserOp is typed against OZ's own PackedUserOperation (via OZ's Account.sol) --
+     *      structurally identical (same field order/types) but a distinct Solidity type, so a direct
+     *      call (bypassing the real EntryPoint's raw calldata dispatch) needs an explicit field-by-field
+     *      copy rather than an implicit conversion.
+     */
+    function _toOzUserOp(PackedUserOperation memory userOp) internal pure returns (OZPackedUserOperation memory) {
+        return OZPackedUserOperation({
+            sender: userOp.sender,
+            nonce: userOp.nonce,
+            initCode: userOp.initCode,
+            callData: userOp.callData,
+            accountGasLimits: userOp.accountGasLimits,
+            preVerificationGas: userOp.preVerificationGas,
+            gasFees: userOp.gasFees,
+            paymasterAndData: userOp.paymasterAndData,
+            signature: userOp.signature
+        });
+    }
+
+    /**
+     * @dev Refreshes every mock price feed's updatedAt to block.timestamp after a vm.warp.
+     *      Required whenever warping more than the per-feed heartbeat (1 hour on Anvil) in
+     *      tests where the session is still active and the oracle will be queried.
+     */
+    function _refreshMockFeeds() internal {
+        _refreshMockFeed(config.ethUsdPriceFeed);
+        _refreshMockFeed(config.usdcUsdPriceFeed);
+        _refreshMockFeed(config.daiUsdPriceFeed);
+        _refreshMockFeed(config.usdtUsdPriceFeed);
+        _refreshMockFeed(config.aaveUsdPriceFeed);
+        _refreshMockFeed(config.linkUsdPriceFeed);
+        _refreshMockFeed(config.oneinchUsdPriceFeed);
+        _refreshMockFeed(config.apeUsdPriceFeed);
+        _refreshMockFeed(config.arbUsdPriceFeed);
+        _refreshMockFeed(config.bnbUsdPriceFeed);
+        _refreshMockFeed(config.btcUsdPriceFeed);
+        _refreshMockFeed(config.compUsdPriceFeed);
+        _refreshMockFeed(config.crvUsdPriceFeed);
+        _refreshMockFeed(config.ensUsdPriceFeed);
+        _refreshMockFeed(config.sandUsdPriceFeed);
+        _refreshMockFeed(config.sushiUsdPriceFeed);
+        _refreshMockFeed(config.wtaoUsdPriceFeed);
+        _refreshMockFeed(config.uniUsdPriceFeed);
+        _refreshMockFeed(config.yfiUsdPriceFeed);
+    }
+
+    function _refreshMockFeed(address feed) private {
+        if (feed == address(0)) return;
+        MockV3Aggregator mock = MockV3Aggregator(feed);
+        mock.updateAnswer(mock.latestAnswer());
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -245,62 +259,52 @@ contract SHProtocolTest is Test {
 
     /// @notice validateUserOp must revert when called by any address other than the EntryPoint
     function testValidateUserOpRevertsForNonEntryPoint() public {
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, "", new bytes[](0));
         (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
-            address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, "", user, privateKey
         );
 
-        vm.expectRevert(SessionHandler.SessionHandler_NotEntryPoint.selector);
+        vm.expectRevert(abi.encodeWithSelector(OZAccount.AccountUnauthorized.selector, user));
         vm.prank(user); // not the EntryPoint
-        sessionHandler.validateUserOp(userOp, userOpHash, 0);
+        sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, 0);
     }
 
     /// @notice Non-owners must not be able to call execute directly
     function testNonOwnerCannotExecuteCommand() public {
-        address dest = address(usdc);
-        uint256 value = 0;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
 
-        vm.expectRevert(SessionHandler.SessionHandler_NotEntryPointOrOwner.selector);
+        vm.expectRevert(abi.encodeWithSelector(OZAccount.AccountUnauthorized.selector, user));
         vm.prank(user);
-        sessionHandler.execute(dest, value, data, new bytes[](0));
+        sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(address(usdc), 0, data));
     }
 
-    /// @notice Owner must be able to execute arbitrary calls on behalf of the account
+    /// @notice Owner must be able to execute arbitrary calls on behalf of the account directly (no UserOp)
     function testOwnerCanExecuteCommand() public {
-        address dest = address(usdc);
-        uint256 value = 0;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
 
         vm.prank(sessionHandler.owner());
-        sessionHandler.execute(dest, value, data, new bytes[](0));
+        sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(address(usdc), 0, data));
         assertEq(usdc.balanceOf(user), AMOUNT_TO_MINT);
     }
 
     /// @notice Owner must be able to pause the contract, blocking execute calls
     function testOwnerCanPauseExecution() public {
-        address dest = address(usdc);
-        uint256 value = 0;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
 
         vm.startPrank(sessionHandler.owner());
         sessionHandler.pause();
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        sessionHandler.execute(dest, value, data, new bytes[](0));
+        sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(address(usdc), 0, data));
         vm.stopPrank();
     }
 
     /// @notice Owner must be able to unpause and resume normal execution
     function testOwnerCanUpauseExecution() public {
-        address dest = address(usdc);
-        uint256 value = 0;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
 
         vm.startPrank(sessionHandler.owner());
         sessionHandler.pause();
         sessionHandler.unpause();
-        sessionHandler.execute(dest, value, data, new bytes[](0));
+        sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(address(usdc), 0, data));
         vm.stopPrank();
 
         assertEq(usdc.balanceOf(user), AMOUNT_TO_MINT);
@@ -367,13 +371,11 @@ contract SHProtocolTest is Test {
      *      Direct calls to execute must be rejected even for registered session keys.
      */
     function testSessionKeyCannotCallExecuteDirectly() public sessionAdded {
-        address dest = address(usdc);
-        uint256 value = 0;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, 1000e18);
 
-        vm.expectRevert(SessionHandler.SessionHandler_NotEntryPointOrOwner.selector);
+        vm.expectRevert(abi.encodeWithSelector(OZAccount.AccountUnauthorized.selector, user));
         vm.prank(user);
-        sessionHandler.execute(dest, value, data, new bytes[](0));
+        sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(address(usdc), 0, data));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -383,78 +385,74 @@ contract SHProtocolTest is Test {
     /// @notice validateUserOp must return SIG_VALIDATION_FAILED when the signer is neither the owner nor a registered session key
     function testValidateUserOpFailsWithUnknownSigner() public {
         (address random, uint256 randomKey) = makeAddrAndKey("random");
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, "", new bytes[](0));
 
-        (PackedUserOperation memory userOp, bytes32 userOpHash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, random, randomKey);
+        (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, "", random, randomKey
+        );
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, userOpHash, 0);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, 0);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(uint160(validationData), 1); // SIG_VALIDATION_FAILED
     }
 
-    /// @notice execute must revert with SessionHandler_ExecutionFailed when the underlying call reverts
+    /// @notice execute must revert (OZ's Errors.FailedCall) when the underlying call reverts
     function testExecuteRevertsWhenCallFails() public {
         // Call a non-existent function on a contract that doesn't accept it
         bytes memory badCallData = abi.encodeWithSignature("nonExistentFunction()");
 
         vm.prank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_ExecutionFailed.selector);
-        sessionHandler.execute(address(usdc), 0, badCallData, new bytes[](0));
+        vm.expectRevert(Errors.FailedCall.selector);
+        sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(address(usdc), 0, badCallData));
     }
 
     /**
-     * @notice Owner-signed UserOps must pass validation
-     * @dev Validates the full owner signature flow:
-     *      userOpHash → EIP-191 digest → ECDSA recover → owner match → SIG_VALIDATION_SUCCESS
-     *      Checks lower 160 bits of validationData equal 0 (success)
+     * @notice An owner-signed UserOp must fail validation on SessionHandler
+     * @dev SessionHandler has no owner validator module installed — SessionHandlerModule is the
+     *      only validator and it explicitly rejects any signer that isn't a registered session
+     *      key. Owner actions go through the direct-call escape hatch instead (see execute()),
+     *      never through the EntryPoint. Signs with the Anvil default key backing config.account,
+     *      routed (via the nonce key) to SessionHandlerModule exactly like a real session-key op
+     *      would be, to prove that path is rejected rather than just untested.
      */
-    function testValidateUserOp() public {
-        address dest = address(usdc);
+    function testValidateUserOpFailsForOwnerSignedUserOp() public {
         uint256 missingAccountFunds = 1 ether;
-        uint256 value = 0;
-
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
         (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
-            address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
+            address(sessionHandler),
+            config,
+            address(spendingLimitModule),
+            address(usdc),
+            0,
+            data,
+            config.account,
+            ANVIL_OWNER_KEY
         );
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, userOpHash, missingAccountFunds);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, missingAccountFunds);
 
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint160 aggregator = uint160(validationData);
-        assertEq(aggregator, 0);
+        assertEq(uint160(validationData), 1); // SIG_VALIDATION_FAILED — owner is not a registered session key
     }
 
     /**
      * @notice Session-key-signed UserOps must pass validation when all session constraints are met
-     * @dev Validates the session key flow:
-     *      recovered signer → active session lookup → time/target/selector/budget checks → SIG_VALIDATION_SUCCESS
-     *      Checks lower 160 bits of validationData equal 0 (success)
      */
     function testValidateUserOpWithSession() public sessionAdded {
-        address dest = address(usdc);
         uint256 missingAccountFunds = 1 ether;
-        uint256 value = 0;
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp, bytes32 userOpHash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
 
         vm.warp(block.timestamp + 1 hours);
         vm.startPrank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, userOpHash, missingAccountFunds);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, missingAccountFunds);
         vm.stopPrank();
 
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -464,24 +462,19 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice Session-key-signed UserOps must fail validation when targeting a non-whitelisted contract
-     * @dev Session is scoped to `usdc`. Attempting to call a different address must be rejected.
-     *      Expects SIG_VALIDATION_FAILED (aggregator = 1).
      */
     function testValidateUserOpFailsWithWrongTarget() public sessionAdded {
         address wrongDest = makeAddr("wrongTarget");
         uint256 missingAccountFunds = 1 ether;
-        uint256 value = 0;
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, wrongDest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp, bytes32 userOpHash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), wrongDest, 0, data, user, privateKey
+        );
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, userOpHash, missingAccountFunds);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, missingAccountFunds);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         uint160 aggregator = uint160(validationData);
@@ -490,24 +483,18 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice Session-key-signed UserOps must fail validation when using a non-whitelisted function selector
-     * @dev Session only allows ERC20Mock.transfer. Attempting to call ERC20Mock.mint must be rejected.
-     *      Expects SIG_VALIDATION_FAILED (aggregator = 1).
      */
     function testValidateUserOpFailsWithUnauthorisedSelector() public sessionAdded {
-        address dest = address(usdc);
         uint256 missingAccountFunds = 1 ether;
-        uint256 value = 0;
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp, bytes32 userOpHash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, userOpHash, missingAccountFunds);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, missingAccountFunds);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         uint160 aggregator = uint160(validationData);
@@ -516,27 +503,21 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice Session-key-signed UserOps must fail validation after the session has been revoked
-     * @dev Revokes the session before submitting the UserOp.
-     *      Recovered signer will no longer have an active session → SIG_VALIDATION_FAILED (aggregator = 1).
      */
     function testValidateUserOpFailsWithRevokedSession() public sessionAdded {
-        address dest = address(usdc);
         uint256 missingAccountFunds = 1 ether;
-        uint256 value = 0;
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
 
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp, bytes32 userOpHash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp, bytes32 userOpHash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
 
         vm.prank(sessionHandler.owner());
         sessionHandler.revokeSessionKey(user);
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, userOpHash, missingAccountFunds);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), userOpHash, missingAccountFunds);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         uint160 aggregator = uint160(validationData);
@@ -548,43 +529,40 @@ contract SHProtocolTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice The owner's signature must be correctly recoverable from a signed UserOp
-     * @dev Signs with the default anvil owner key and verifies ECDSA.recover returns the owner address.
+     * @notice The Anvil owner key's signature must be correctly recoverable from a signed UserOp
+     * @dev Pure signature-math check on SendPackedUserOp's own signing flow — does not imply
+     *      the UserOp would validate on-chain (it wouldn't; see testValidateUserOpFailsForOwnerSignedUserOp).
      */
-    function testRecoverSignedUserOp() public view {
-        address dest = address(usdc);
-        uint256 value = 0;
-        address expectedSigner = sessionHandler.owner();
+    function testRecoverSignedUserOpForOwner() public view {
         bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
-
-        bytes memory callData =
-            abi.encodeWithSelector(sessionHandler.execute.selector, dest, value, data, new bytes[](0));
         (PackedUserOperation memory userOp,, bytes32 digest) = sendPackedUserOp.generateSignedUserOp(
-            address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
+            address(sessionHandler),
+            config,
+            address(spendingLimitModule),
+            address(usdc),
+            0,
+            data,
+            config.account,
+            ANVIL_OWNER_KEY
         );
         address actualSigner = ECDSA.recover(digest, userOp.signature);
 
-        assertEq(actualSigner, expectedSigner);
+        assertEq(actualSigner, config.account);
     }
 
     /**
      * @notice The session key's signature must be correctly recoverable from a signed UserOp
-     * @dev Signs with the user's private key and verifies ECDSA.recover returns the user address.
      */
     function testRecoverSignedUserOpWithSession() public view {
-        address dest = address(usdc);
-        uint256 value = 0;
-        address expectedSigner = user;
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
 
-        bytes memory callData =
-            abi.encodeWithSelector(sessionHandler.execute.selector, dest, value, data, new bytes[](0));
-        (PackedUserOperation memory userOp,, bytes32 digest) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,, bytes32 digest) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
         address actualSigner = ECDSA.recover(digest, userOp.signature);
 
-        assertEq(actualSigner, expectedSigner);
+        assertEq(actualSigner, user);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -592,48 +570,19 @@ contract SHProtocolTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice EntryPoint must be able to execute an owner-signed UserOp end-to-end
-     * @dev Submits a handleOps call as a bundler with an owner-signed mint operation.
-     *      Verifies the ERC20 balance of user increases by AMOUNT_TO_MINT.
-     */
-    function testEntryPointCanExecuteCommand() public {
-        address dest = address(usdc);
-        uint256 value = 0;
-        PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
-        bytes memory data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, AMOUNT_TO_MINT);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
-            address(sessionHandler), config, callData, DEFAULT_SESSION_SIGNER, DEFAULT_SESSION_KEY
-        );
-        packedUserOp[0] = userOp;
-
-        vm.startPrank(bundler, bundler);
-        IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
-        vm.stopPrank();
-
-        assertEq(usdc.balanceOf(user), AMOUNT_TO_MINT);
-    }
-
-    /**
      * @notice EntryPoint must be able to execute a session-key-signed UserOp end-to-end
-     * @dev Warps 5 seconds forward to ensure block.timestamp > validFrom.
-     *      Submits a handleOps call as a bundler with a session-key-signed transfer operation.
-     *      Verifies the ERC20 balance of user increases by amountToTransfer.
+     * @dev SessionHandler has no owner-mode-via-EntryPoint path (see contract-level note), so
+     *      unlike SHProtocolTest's testEntryPointCanExecuteCommand, this is the only "EntryPoint
+     *      executes a command" happy path that exists for V2.
      */
     function testEntryPointCanExecuteCommandWithSession() public sessionAdded {
-        address dest = address(usdc);
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
-        uint256 value = 0;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
@@ -651,8 +600,6 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice address(0) is the ETH-send sentinel and must be registered with an empty selector array
-     * @dev Passing address(0) as target alongside a non-empty selector array must revert with
-     *      SessionHandler_InvalidTarget, because a native ETH transfer has no function selector.
      */
     function testCannotAddSessionWithZeroAddressTargetAndSelector() public {
         address sessionKey = user;
@@ -664,28 +611,22 @@ contract SHProtocolTest is Test {
         uint256 spendingLimit = BUDGET;
 
         vm.prank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_InvalidTarget.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_InvalidTarget.selector);
         sessionHandler.addSessionKey(sessionKey, target, sel, validFrom, validUntil, spendingLimit);
     }
 
     /**
      * @notice Sending native ETH via a session key deducts the correct USD value from the session budget
-     * @dev Constructs a UserOp with empty calldata and value == 1 ether targeting an EOA.
-     *      The ETH-send session (target == address(0)) must validate successfully and charge the
-     *      oracle-priced USD equivalent against the spending limit. Verifies both the remaining
-     *      budget and the recipient's post-transfer balance.
      */
     function testSpendingLimitUpdatesForSendingEthWithSession() public ethSessionAdded {
         address dest = kani;
         uint256 value = 1 ether;
         uint256 valueInUsd = oracle.getUsdValue(address(0), value);
 
-        bytes memory data = ""; // No data needed for native ETH transfer
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, value, "", user, privateKey
+        );
 
         packedUserOp[0] = userOp;
 
@@ -702,10 +643,7 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice Overwriting a session must clear the previous selector whitelist
-     * @dev Registers a session allowing `approve`, then overwrites it with `transfer`.
-     *      Verifies that `approve` is no longer permitted after the overwrite.
      */
-
     function testOverwritingSessionClearsOldSelectors() public {
         bytes4[] memory first = new bytes4[](1);
         first[0] = ERC20Mock.approve.selector;
@@ -724,13 +662,12 @@ contract SHProtocolTest is Test {
 
         // `approve` should no longer be allowed — if it is, the old mapping was never cleared
         bytes memory data = abi.encodeWithSelector(ERC20Mock.approve.selector, makeAddr("s"), 1e6);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data, new bytes[](0));
-        (PackedUserOperation memory userOp, bytes32 hash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp, bytes32 hash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, hash, 0);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), hash, 0);
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(uint160(validationData), 1); // should fail — approve was only in the first session
     }
@@ -745,7 +682,7 @@ contract SHProtocolTest is Test {
         uint256 spendingLimit = 2e18;
 
         vm.startPrank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_InvalidSessionKey.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_InvalidSessionKey.selector);
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
     }
@@ -760,7 +697,7 @@ contract SHProtocolTest is Test {
         uint256 spendingLimit = 2e18;
 
         vm.startPrank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_InvalidTarget.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_InvalidTarget.selector);
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
     }
@@ -775,7 +712,7 @@ contract SHProtocolTest is Test {
         uint256 spendingLimit = 2e18;
 
         vm.startPrank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_InvalidTimeRange.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_InvalidTimeRange.selector);
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
     }
@@ -784,31 +721,26 @@ contract SHProtocolTest is Test {
     function testCannotRevokeNonExistantSession() public sessionAdded {
         address ben = makeAddr("ben");
         vm.startPrank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_SessionIsNotActive.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_SessionIsNotActive.selector);
         sessionHandler.revokeSessionKey(ben);
         vm.stopPrank();
     }
 
     /**
      * @notice Spending limit must accumulate correctly across multiple sequential UserOps
-     * @dev Uses wethSessionAdded which scopes the session to the WETH contract and whitelists deposit().
-     *      Submits 3 ops each forwarding 0.1 ETH to deposit() and verifies getRemainingBudget decreases
-     *      by the correct USD amount after each op.
      */
     function testBudgetAccumulatesAcrossMultipleOps() public wethSessionAdded {
         uint256 singleSpend = 0.1 ether;
         address dest = address(weth);
         uint256 singleSpendUsd = oracle.getUsdValue(dest, singleSpend);
         address reciever = kani;
-        uint256 value = 0;
 
         for (uint256 i = 0; i < 3; i++) {
             PackedUserOperation[] memory ops = new PackedUserOperation[](1);
             bytes memory data = abi.encodeWithSelector(MockWeth.transfer.selector, reciever, singleSpend);
-            bytes memory callData =
-                abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-            (PackedUserOperation memory userOp,,) =
-                sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+            (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+                address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+            );
             ops[0] = userOp;
 
             vm.warp(block.timestamp + 1.1 hours);
@@ -822,7 +754,6 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice Sessions with multiple selectors must allow all listed selectors and reject unlisted ones
-     * @dev Registers a session with both `transfer` and `approve`. Verifies `approve` passes and `mint` fails.
      */
     function testMultipleSelectorsAllowedInSession() public {
         selectors.push(ERC20Mock.transfer.selector);
@@ -834,32 +765,29 @@ contract SHProtocolTest is Test {
 
         // approve selector should pass
         bytes memory data = abi.encodeWithSelector(ERC20Mock.approve.selector, makeAddr("spender"), 1e6);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data, new bytes[](0));
-        (PackedUserOperation memory userOp, bytes32 hash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp, bytes32 hash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
 
         vm.prank(config.entryPoint);
-        uint256 validationData = sessionHandler.validateUserOp(userOp, hash, 0);
+        uint256 validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), hash, 0);
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(uint160(validationData), 0); // success
 
         // mint (unlisted) should still fail
         data = abi.encodeWithSelector(ERC20Mock.mint.selector, user, 1e6);
-        callData = abi.encodeWithSelector(SessionHandler.execute.selector, address(usdc), 0, data, new bytes[](0));
-        (userOp, hash,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (userOp, hash,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
 
         vm.prank(config.entryPoint);
-        validationData = sessionHandler.validateUserOp(userOp, hash, 0);
+        validationData = sessionHandler.validateUserOp(_toOzUserOp(userOp), hash, 0);
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(uint160(validationData), 1); // failure
     }
 
     /**
      * @notice Owner must be able to register a new session for a key that was previously revoked
-     * @dev Revokes the existing session for `user`, then adds a new session with a different target and selector.
-     *      Verifies the new session is active and the updated parameters are reflected in storage.
      */
     function testOwnerCanReAddSessionAfterRevoke() public sessionAdded {
         vm.prank(sessionHandler.owner());
@@ -873,10 +801,9 @@ contract SHProtocolTest is Test {
             user, address(dai), newSelectors, uint48(block.timestamp), uint48(block.timestamp + 1 days), BUDGET
         );
 
-        SessionHandler.Session memory s = sessionHandler.getSession(user);
+        SessionHandlerModule.Session memory s = sessionHandler.getSession(user);
         assertEq(s.active, true);
         assertEq(s.target, address(dai));
-        // old selector must be gone
         assertEq(sessionHandler.isSessionActive(user), true);
     }
 
@@ -891,23 +818,17 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice getRemainingBudget must decrease by the ETH value spent in a successful session UserOp
-     * @dev Uses wethSessionAdded which scopes the session to the WETH contract and whitelists deposit().
-     *      Forwards 0.1 ETH to deposit() via handleOps and reads the budget afterwards to confirm
-     *      spentAmount was updated by the correct USD equivalent.
      */
     function testRemainingBudgetDecreasesAfterSpend() public wethSessionAdded {
         address dest = address(weth);
-        uint256 value = 0;
         address receiver = kani;
         uint256 amountToTransfer = 0.1 ether;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.transfer.selector, receiver, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 5);
@@ -951,7 +872,7 @@ contract SHProtocolTest is Test {
         vm.prank(sessionHandler.owner());
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
 
-        SessionHandler.Session memory session = sessionHandler.getSession(sessionKey);
+        SessionHandlerModule.Session memory session = sessionHandler.getSession(sessionKey);
         assertEq(session.target, target);
         assertEq(session.validFrom, validFrom);
         assertEq(session.validUntil, validUntil);
@@ -962,23 +883,17 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice getRemainingBudget must return 0 when the full spending limit has been consumed
-     * @dev Uses wethSessionAdded which scopes the session to the WETH contract and whitelists deposit().
-     *      Submits a UserOp that forwards exactly ETH_VALUE to deposit(), consuming the full BUDGET.
-     *      Verifies getRemainingBudget returns 0 after the op.
      */
     function testGetRemainingBudgetReturnsZeroWhenFullySpent() public wethSessionAdded {
         address dest = address(weth);
         uint256 amountToTransfer = ETH_VALUE;
         address receiver = kani;
-        uint256 value = 0;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.transfer.selector, receiver, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
@@ -991,10 +906,7 @@ contract SHProtocolTest is Test {
     }
 
     /**
-     * @notice getRemainingBudget must return the full budget when the session is scoped to WETH and the user deposits ETH equal to the budget
-     * @dev Uses wethSessionAdded which scopes the session to the WETH contract and whitelists deposit().
-     *      Submits a UserOp that forwards exactly ETH_VALUE to deposit(), consuming the full BUDGET.
-     *      Verifies getRemainingBudget returns 5000e18 after the op.
+     * @notice getRemainingBudget must be unaffected when the session key deposits ETH into WETH
      */
     function testDespositWethDoesntAffectBudget() public wethSessionAdded {
         address dest = address(weth);
@@ -1002,11 +914,9 @@ contract SHProtocolTest is Test {
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.deposit.selector);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, value, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
@@ -1020,21 +930,15 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice getRemainingBudget must return the full budget after an approve() call
-     * @dev Uses wethSessionAdded which scopes the session to the WETH contract and whitelists approve().
-     *      Submits a UserOp that calls approve() with a large allowance (no ETH value forwarded).
-     *      Verifies the budget is unchanged since approvals do not represent a USD spend.
      */
     function testApproveDoesNotAffectBudget() public wethSessionAdded {
         address dest = address(weth);
-        uint256 value = 0;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.approve.selector, kani, type(uint256).max);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
@@ -1048,9 +952,6 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice transferFrom must decrement the remaining budget by the USD value of the transferred amount
-     * @dev Uses wethSessionAdded which scopes the session to the WETH contract and whitelists transferFrom().
-     *      kani is minted WETH and approves the SessionHandler. A UserOp calls transferFrom(kani, user, amount).
-     *      Verifies getRemainingBudget decreases, confirming the amount parameter is extracted and priced correctly.
      */
     function testTransferFromAffectsBudget() public wethSessionAdded {
         uint256 amountToTransfer = 1e18;
@@ -1060,15 +961,12 @@ contract SHProtocolTest is Test {
         weth.approve(address(sessionHandler), amountToTransfer);
 
         address dest = address(weth);
-        uint256 value = 0;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(MockWeth.transferFrom.selector, kani, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);
@@ -1084,16 +982,22 @@ contract SHProtocolTest is Test {
                                EMIT TESTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice revokeSessionKey must emit SessionRevoked with the correct indexed session key address
+    /**
+     * @notice revokeSessionKey must emit SessionHandlerModule.SessionRevoked with the correct
+     *         indexed account and session key
+     * @dev The event now originates from SessionHandlerModule (addSessionKey/revokeSessionKey are
+     *      forwarded there), not SessionHandler, and carries an extra leading indexed `account`
+     *      field since one module instance serves many accounts.
+     */
     function testRevokeSessionEmitsEvent() public sessionAdded {
-        vm.expectEmit(true, false, false, false);
-        emit SessionHandler.SessionRevoked(user);
+        vm.expectEmit(true, true, false, false);
+        emit SessionHandlerModule.SessionRevoked(address(sessionHandler), user);
 
         vm.prank(sessionHandler.owner());
         sessionHandler.revokeSessionKey(user);
     }
 
-    /// @notice addSessionKey must emit SessionAdded with the correct session key, target, and validUntil
+    /// @notice addSessionKey must emit SessionHandlerModule.SessionAdded with the correct account, session key, target, and validUntil
     function testAddSessionEmitsEvent() public {
         address sessionKey = user;
         address target = address(usdc);
@@ -1102,8 +1006,8 @@ contract SHProtocolTest is Test {
         uint48 validUntil = uint48(block.timestamp + 1 days);
         uint256 spendingLimit = 0.005e18;
 
-        vm.expectEmit(true, true, false, true);
-        emit SessionHandler.SessionAdded(sessionKey, target, validUntil);
+        vm.expectEmit(true, true, true, true);
+        emit SessionHandlerModule.SessionAdded(address(sessionHandler), sessionKey, target, validUntil);
         vm.prank(sessionHandler.owner());
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
     }
@@ -1114,28 +1018,23 @@ contract SHProtocolTest is Test {
 
     /**
      * @notice addSessionKey must revert with InvalidTimeRange for any input where validFrom >= validUntil.
-     * @dev Constrains validUntil to be in the future to isolate the time-range check from the
-     *      end-time check, ensuring only SessionHandler_InvalidTimeRange is triggered.
      */
     function testAddSessionKeyRevertsWithInvalidTimeRange(uint48 validFrom, uint48 validUntil) public {
         vm.assume(validFrom >= validUntil); // ensure we have a invalid time range to start with
-        vm.assume(validUntil > block.timestamp); // ensure validUntil is in the future to avoid hitting SessionHandler_InvalidEndTime instead
+        vm.assume(validUntil > block.timestamp); // isolate from SessionHandlerModule_InvalidEndTime
         address sessionKey = user;
         address target = address(usdc);
         selectors.push(ERC20Mock.transfer.selector);
         uint256 spendingLimit = BUDGET;
 
         vm.startPrank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_InvalidTimeRange.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_InvalidTimeRange.selector);
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
     }
 
     /**
      * @notice addSessionKey must revert with InvalidEndTime for any validUntil already in the past.
-     * @dev Warps 150 days forward to create a large past range, then constrains validUntil to be
-     *      strictly before block.timestamp while keeping validFrom < validUntil, isolating the
-     *      end-time guard from the time-range guard.
      */
     function testAddSessionKeyRevertsWithEndTimeInThePast(uint48 validFrom, uint48 validUntil) public {
         vm.warp(block.timestamp + 150 days); // warp far into the future to ensure validUntil is in the past
@@ -1147,20 +1046,17 @@ contract SHProtocolTest is Test {
         uint256 spendingLimit = BUDGET;
 
         vm.startPrank(sessionHandler.owner());
-        vm.expectRevert(SessionHandler.SessionHandler_InvalidEndTime.selector);
+        vm.expectRevert(SessionHandlerModule.SessionHandlerModule_InvalidEndTime.selector);
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
     }
 
     /**
-     * @notice Selector whitelists must be isolated per session key — granting a selector to keyA
-     *         must not affect keyB's session storage.
-     * @dev Fuzzes two distinct non-zero addresses and an arbitrary selector. Registers a session
-     *      for keyA only and asserts keyB has no session and an empty selector array.
+     * @notice Selector whitelists must be isolated per (account, session key) pair — granting a
+     *         selector to keyA must not affect keyB's session storage on the same account.
      */
     function testSelectorIsolationBetweenSessions(address keyA, address keyB, bytes4 selector) public {
         vm.assume(keyA != keyB && keyA != address(0) && keyB != address(0));
-        // add keyA with selector, verify keyB doesn't have it
         selectors.push(selector);
         address target = address(usdc);
         uint48 validFrom = uint48(block.timestamp + 1 hours);
@@ -1171,17 +1067,13 @@ contract SHProtocolTest is Test {
         sessionHandler.addSessionKey(keyA, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
 
-        SessionHandler.Session memory sessionB = sessionHandler.getSession(keyB);
+        SessionHandlerModule.Session memory sessionB = sessionHandler.getSession(keyB);
         assertEq(sessionB.active, false); // keyB should have no session
         assertEq(sessionB.selectors.length, 0); // keyB should have no selectors
     }
 
     /**
      * @notice isSessionActive must return true at any timestamp within [validFrom, validUntil].
-     * @dev Fuzzes the session window and warps to validUntil (the inclusive upper boundary) to
-     *      confirm the session is still considered active at its exact expiry second.
-     *      Uses sessionAdded modifier to pre-register a session, then overwrites it with the
-     *      fuzzed window via a second addSessionKey call.
      */
     function testIsSessionActiveAtTimeBoundaries(uint48 validFrom, uint48 validUntil) public sessionAdded {
         vm.assume(validFrom < validUntil && validUntil > block.timestamp);
@@ -1193,31 +1085,18 @@ contract SHProtocolTest is Test {
         vm.startPrank(sessionHandler.owner());
         sessionHandler.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
         vm.stopPrank();
-        // at validFrom
         vm.warp(validUntil);
         assertEq(sessionHandler.isSessionActive(user), true);
     }
 
     /**
-     * @notice _packValidationData must produce a lossless round-trip for all input combinations.
-     * @dev Fuzzes sigFailed, validFrom, and validUntil across their full ranges and verifies the
-     *      three fields can be extracted back from the packed uint256 without loss:
-     *        - bits   0-159: sigFailed flag (0 = success, 1 = failed)
-     *        - bits 160-207: validUntil
-     *        - bits 208-255: validFrom
-     *      Uses SessionHandlerHarness to call the internal _packValidationData without modifying
+     * @notice SessionHandlerModule._packValidationData must produce a lossless round-trip for all input combinations.
+     * @dev Uses SessionHandlerModuleHarness to call the internal _packValidationData without modifying
      *      the production contract.
      */
     function testPackValidationDataRoundTrip(bool sigFailed, uint48 validAfter, uint48 validUntil) public {
-        SessionHandlerHarness sessionHandlerHarness = new SessionHandlerHarness(
-            config.account,
-            config.entryPoint,
-            config.reputationRegistry,
-            config.identityRegistry,
-            address(feeRegistry),
-            0
-        );
-        uint256 packed = sessionHandlerHarness.packValidationData(sigFailed, validAfter, validUntil);
+        SessionHandlerModuleHarness harness = new SessionHandlerModuleHarness(address(feeRegistry));
+        uint256 packed = harness.packValidationData(sigFailed, validAfter, validUntil);
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(uint160(packed), sigFailed ? 1 : 0);
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -1229,24 +1108,21 @@ contract SHProtocolTest is Test {
     /**
      * @notice The treasury registered in SHRegistry must receive the flat protocol fee when a
      *         session-key-signed UserOp is executed through the EntryPoint.
-     * @dev Mirrors testEntryPointCanExecuteCommandWithSession but asserts on the treasury's ETH
-     *      balance instead of the recipient's token balance, confirming execute()'s session-key
-     *      fee transfer reaches the address FEE_REGISTRY.treasury() resolves to.
+     * @dev Fee collection lives in SessionHandler.execute() itself (not SessionHandlerModule) —
+     *      see the account-level fee-charging note on execute() — using
+     *      SessionHandlerModule.pendingSessionKey to tell whether this particular call was
+     *      session-key-driven.
      */
     function testTreasuryRecievesProtocolFeeWithSession() public sessionAdded {
-        address dest = address(usdc);
         uint256 amountToTransfer = AMOUNT_TO_TRANSFER;
-        uint256 value = 0;
         address treasuryAddr = feeRegistry.treasury();
         uint256 treasuryBalanceBefore = treasuryAddr.balance;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(ERC20Mock.transfer.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
-
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), address(usdc), 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 1.1 hours);

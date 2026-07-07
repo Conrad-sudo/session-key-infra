@@ -5,7 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {EntryPoint} from "@account-abstraction/contracts/core/EntryPoint.sol";
 import {ERC20Mock} from "../src/mocks/ERC20Mock.sol";
 import {MockWeth} from "../src/mocks/MockWeth.sol";
-import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
+import {MockV3Aggregator} from "../src/mocks/MockV3Aggregator.sol";
 import {MockIdentityRegistry} from "../src/mocks/MockIdentityRegistry.sol";
 import {MockReputationRegistry} from "../src/mocks/MockReputationRegistry.sol";
 // forge-lint: disable-next-line(unaliased-plain-import)
@@ -49,10 +49,9 @@ contract HelperConfig is Script {
      * @notice Encapsulates the chain-specific addresses required for deployment
      * @param entryPoint Address of the ERC-4337 EntryPoint contract on the current chain.
      *                   Set to address(0) on zkSync which uses native account abstraction.
-     * @param uniswapRouter Address of the Uniswap V2 Router02 contract on the current chain. Set to address(0) on chains where Uniswap is unavailable.
+     *@param router Address of the Uniswap V2 Router02 contract on the current chain. Set to address(0) on chains where Uniswap is unavailable.
      * @param account    Deployer/owner address used when broadcasting transactions.
      *                   Becomes the Ownable owner of the deployed SessionHandler.
-     * @param pyth       Address of the Pyth contract on the current chain.
      * @param usdc       Circle USD (USDC) ERC-20 token address
      * @param dai        DAI Stablecoin ERC-20 token address
      * @param usdt       Tether (USDT) ERC-20 token address
@@ -66,56 +65,70 @@ contract HelperConfig is Script {
      * @param comp       Compound (COMP) ERC-20 token address. address(0) on Sepolia.
      * @param crv        Curve DAO Token (CRV) ERC-20 token address. address(0) on Sepolia.
      * @param ens        Ethereum Name Service (ENS) ERC-20 token address. address(0) on Sepolia.
+     * @param wfil       Wrapped Filecoin (WFIL) ERC-20 token address. address(0) on Sepolia.
      * @param sand       The Sandbox (SAND) ERC-20 token address. address(0) on Sepolia.
      * @param sushi      SushiSwap (SUSHI) ERC-20 token address. address(0) on Sepolia.
      * @param wtao       Wrapped Bittensor (wTAO) ERC-20 token address. address(0) on Sepolia.
      * @param uni        Uniswap (UNI) ERC-20 token address
      * @param yfi        yearn.finance (YFI) ERC-20 token address. address(0) on Sepolia.
-     * @param wavax      Wrapped AVAX (WAVAX) ERC-20 token address. address(0) on Sepolia.
-     * @param bat        Basic Attention Token (BAT) ERC-20 token address. address(0) on Sepolia.
-     * @param imx        Immutable X (IMX) ERC-20 token address. address(0) on Sepolia.
-     * @param knc        Kyber Network Crystal (KNC) ERC-20 token address. address(0) on Sepolia.
-     * @param rdnt       Radiant Capital (RDNT) ERC-20 token address. address(0) on Sepolia.
-     *
-     * Pyth price feed IDs (bytes32) are network-agnostic — the same ID is used on every chain.
-     * No MKR/USD feed exists on Pyth, so MKR has been dropped from this config entirely.
-     *
-     * @param ethUsdPriceFeed     Pyth ETH/USD price feed ID
-     * @param usdcUsdPriceFeed    Pyth USDC/USD price feed ID
-     * @param daiUsdPriceFeed     Pyth DAI/USD price feed ID
-     * @param usdtUsdPriceFeed    Pyth USDT/USD price feed ID
-     * @param aaveUsdPriceFeed    Pyth AAVE/USD price feed ID
-     * @param linkUsdPriceFeed    Pyth LINK/USD price feed ID
-     * @param oneinchUsdPriceFeed Pyth 1INCH/USD price feed ID
-     * @param apeUsdPriceFeed     Pyth APE/USD price feed ID
-     * @param arbUsdPriceFeed     Pyth ARB/USD price feed ID
-     * @param bnbUsdPriceFeed     Pyth BNB/USD price feed ID
-     * @param btcUsdPriceFeed     Pyth BTC/USD price feed ID (used for WBTC)
-     * @param compUsdPriceFeed    Pyth COMP/USD price feed ID
-     * @param crvUsdPriceFeed     Pyth CRV/USD price feed ID
-     * @param ensUsdPriceFeed     Pyth ENS/USD price feed ID
-     * @param sandUsdPriceFeed    Pyth SAND/USD price feed ID
-     * @param sushiUsdPriceFeed   Pyth SUSHI/USD price feed ID
-     * @param wtaoUsdPriceFeed    Pyth TAO/USD price feed ID (used for wTAO)
-     * @param uniUsdPriceFeed     Pyth UNI/USD price feed ID
-     * @param yfiUsdPriceFeed     Pyth YFI/USD price feed ID
-     * @param wavaxUsdPriceFeed   Pyth AVAX/USD price feed ID (used for WAVAX)
-     * @param batUsdPriceFeed     Pyth BAT/USD price feed ID
-     * @param imxUsdPriceFeed     Pyth IMX/USD price feed ID
-     * @param kncUsdPriceFeed     Pyth KNC/USD price feed ID
-     * @param rdntUsdPriceFeed    Pyth RDNT/USD price feed ID
-     *
-     * @param heartbeat   Passed to SHOracle as the maximum allowed age (in seconds) of any
-     *                    registered Pyth price before it's considered stale. Shared across
-     *                    every token — SHOracle no longer tracks a per-token max age.
+     * @param ethUsdPriceFeed     Chainlink ETH/USD price feed address
+     * @param usdcUsdPriceFeed    Chainlink USDC/USD price feed address
+     * @param daiUsdPriceFeed     Chainlink DAI/USD price feed address
+     * @param usdtUsdPriceFeed    Chainlink USDT/USD price feed address. address(0) on Sepolia.
+     * @param aaveUsdPriceFeed    Chainlink AAVE/USD price feed address. address(0) on Sepolia.
+     * @param linkUsdPriceFeed    Chainlink LINK/USD price feed address. address(0) on Sepolia.
+     * @param oneinchUsdPriceFeed Chainlink 1INCH/USD price feed address. address(0) on Sepolia.
+     * @param apeUsdPriceFeed     Chainlink APE/USD price feed address. address(0) on Sepolia.
+     * @param arbUsdPriceFeed     Chainlink ARB/USD price feed address. address(0) on Sepolia.
+     * @param bnbUsdPriceFeed     Chainlink BNB/USD price feed address. address(0) on Sepolia.
+     * @param btcUsdPriceFeed     Chainlink BTC/USD price feed address (used for WBTC). address(0) on Sepolia.
+     * @param compUsdPriceFeed    Chainlink COMP/USD price feed address. address(0) on Sepolia.
+     * @param crvUsdPriceFeed     Chainlink CRV/USD price feed address. address(0) on Sepolia.
+     * @param ensUsdPriceFeed     Chainlink ENS/USD price feed address. address(0) on Sepolia.
+     * @param wfilUsdPriceFeed    address(0) — no Chainlink FIL/USD feed exists on Ethereum mainnet or Sepolia.
+     * @param sandUsdPriceFeed    Chainlink SAND/USD price feed address. address(0) on Sepolia.
+     * @param sushiUsdPriceFeed   Chainlink SUSHI/USD price feed address. address(0) on Sepolia.
+     * @param wtaoUsdPriceFeed    Chainlink TAO/USD price feed address. address(0) on Sepolia.
+     * @param uniUsdPriceFeed     Chainlink UNI/USD price feed address. address(0) on Sepolia.
+     * @param yfiUsdPriceFeed     Chainlink YFI/USD price feed address. address(0) on Sepolia.
+     * @param wavax              Wrapped AVAX (WAVAX) ERC-20 token address. address(0) on Sepolia.
+     * @param wavaxUsdPriceFeed  Chainlink AVAX/USD price feed address. address(0) on Sepolia.
+     * @param wavaxHeartbeat     Chainlink AVAX/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param imx                Immutable X (IMX) ERC-20 token address. address(0) on Sepolia.
+     * @param imxUsdPriceFeed    Chainlink IMX/USD price feed address. address(0) on Sepolia.
+     * @param imxHeartbeat       Chainlink IMX/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param knc                Kyber Network Crystal (KNC) ERC-20 token address. address(0) on Sepolia.
+     * @param kncUsdPriceFeed    Chainlink KNC/USD price feed address. address(0) on Sepolia.
+     * @param kncHeartbeat       Chainlink KNC/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param cake               PancakeSwap Token (CAKE) ERC-20 address. address(0) on Sepolia.
+     * @param cakeUsdPriceFeed   Chainlink CAKE/USD price feed. address(0) on mainnet (feed deprecated Nov 2022) and Sepolia.
+     * @param cakeHeartbeat      Chainlink CAKE/USD feed heartbeat in seconds (BSC: 60)
+     * @param ethHeartbeat        Chainlink ETH/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param usdcHeartbeat       Chainlink USDC/USD feed heartbeat in seconds (mainnet: 82800)
+     * @param daiHeartbeat        Chainlink DAI/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param usdtHeartbeat       Chainlink USDT/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param aaveHeartbeat       Chainlink AAVE/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param linkHeartbeat       Chainlink LINK/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param oneinchHeartbeat    Chainlink 1INCH/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param apeHeartbeat        Chainlink APE/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param arbHeartbeat        Chainlink ARB/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param bnbHeartbeat        Chainlink BNB/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param btcHeartbeat        Chainlink BTC/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param compHeartbeat       Chainlink COMP/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param crvHeartbeat        Chainlink CRV/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param ensHeartbeat        Chainlink ENS/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param sandHeartbeat       Chainlink SAND/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param sushiHeartbeat      Chainlink SUSHI/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param wtaoHeartbeat       Chainlink TAO/USD feed heartbeat in seconds (mainnet: 86400)
+     * @param uniHeartbeat        Chainlink UNI/USD feed heartbeat in seconds (mainnet: 3600)
+     * @param yfiHeartbeat        Chainlink YFI/USD feed heartbeat in seconds (mainnet: 86400)
      */
     struct NetworkConfig {
         address entryPoint;
         address account;
-        address uniswapRouter;
+        address router;
         address identityRegistry;
         address reputationRegistry;
-        address pyth;
         // Stablecoins
         address usdc;
         address dai;
@@ -127,7 +140,7 @@ contract HelperConfig is Script {
         address oneinch;
         address ape;
         address arb;
-        address bnb;
+        address wbnb;
         address wbtc;
         address comp;
         address crv;
@@ -138,44 +151,63 @@ contract HelperConfig is Script {
         address uni;
         address yfi;
         address wavax;
-        address bat;
         address imx;
         address knc;
-        address rdnt;
-        // Pyth price feed IDs (network-agnostic)
-        bytes32 ethUsdPriceFeed;
-        bytes32 usdcUsdPriceFeed;
-        bytes32 daiUsdPriceFeed;
-        bytes32 usdtUsdPriceFeed;
-        bytes32 aaveUsdPriceFeed;
-        bytes32 linkUsdPriceFeed;
-        bytes32 oneinchUsdPriceFeed;
-        bytes32 apeUsdPriceFeed;
-        bytes32 arbUsdPriceFeed;
-        bytes32 bnbUsdPriceFeed;
-        bytes32 btcUsdPriceFeed; // BTC/USD — used for WBTC pricing
-        bytes32 compUsdPriceFeed;
-        bytes32 crvUsdPriceFeed;
-        bytes32 ensUsdPriceFeed;
-        bytes32 sandUsdPriceFeed;
-        bytes32 sushiUsdPriceFeed;
-        bytes32 wtaoUsdPriceFeed;
-        bytes32 uniUsdPriceFeed;
-        bytes32 yfiUsdPriceFeed;
-        bytes32 wavaxUsdPriceFeed;
-        bytes32 batUsdPriceFeed;
-        bytes32 imxUsdPriceFeed;
-        bytes32 kncUsdPriceFeed;
-        bytes32 rdntUsdPriceFeed;
-        // Max price age in seconds (maximum allowed staleness of a Pyth price), shared by every token
-        uint256 heartbeat;
+        address cake;
+        // Chainlink price feeds
+        address ethUsdPriceFeed;
+        address usdcUsdPriceFeed;
+        address daiUsdPriceFeed;
+        address usdtUsdPriceFeed;
+        address aaveUsdPriceFeed;
+        address linkUsdPriceFeed;
+        address oneinchUsdPriceFeed;
+        address apeUsdPriceFeed;
+        address arbUsdPriceFeed;
+        address bnbUsdPriceFeed;
+        address btcUsdPriceFeed; // BTC/USD — used for WBTC pricing
+        address compUsdPriceFeed;
+        address crvUsdPriceFeed;
+        address ensUsdPriceFeed;
+        address sandUsdPriceFeed;
+        address sushiUsdPriceFeed;
+        address wtaoUsdPriceFeed;
+        address uniUsdPriceFeed;
+        address yfiUsdPriceFeed;
+        address wavaxUsdPriceFeed;
+        address imxUsdPriceFeed;
+        address kncUsdPriceFeed;
+        address cakeUsdPriceFeed;
+        // Chainlink price feed heartbeats (maximum seconds between updates)
+        uint256 ethHeartbeat;
+        uint256 usdcHeartbeat;
+        uint256 daiHeartbeat;
+        uint256 usdtHeartbeat;
+        uint256 aaveHeartbeat;
+        uint256 linkHeartbeat;
+        uint256 oneinchHeartbeat;
+        uint256 apeHeartbeat;
+        uint256 arbHeartbeat;
+        uint256 bnbHeartbeat;
+        uint256 btcHeartbeat;
+        uint256 compHeartbeat;
+        uint256 crvHeartbeat;
+        uint256 ensHeartbeat;
+        uint256 sandHeartbeat;
+        uint256 sushiHeartbeat;
+        uint256 wtaoHeartbeat;
+        uint256 uniHeartbeat;
+        uint256 yfiHeartbeat;
+        uint256 wavaxHeartbeat;
+        uint256 imxHeartbeat;
+        uint256 kncHeartbeat;
+        uint256 cakeHeartbeat;
     }
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
 
-    
     /// @notice Deployer account used on live networks — must be funded before broadcasting
     address public sepoliaAccount = vm.envOr("SEPOLIA_ACCOUNT", address(0));
 
@@ -190,7 +222,6 @@ contract HelperConfig is Script {
     ///      broadcasting an actual mainnet deployment.
     uint256 private constant MAINNET_DEPLOYER_PK = uint256(keccak256("session-handler-mainnet-deployer"));
 
-   
     /**
      * @dev Cached Anvil network config. Populated on first call to getOrCreateAnvilConfig.
      *      Both fields must be non-zero for the cache to be considered valid.
@@ -224,10 +255,14 @@ contract HelperConfig is Script {
      * @return config NetworkConfig for the specified chain
      */
     function getConfigByChainId(uint256 chainId) internal returns (NetworkConfig memory) {
-        if (chainId == ETH_SEPOLIA_CHAIN_ID) {
+        if (chainId == SEPOLIA_CHAIN_ID) {
             return getEthSepoliaConfig();
         } else if (chainId == LOCAL_CHAIN_ID) {
             return getOrCreateAnvilConfig();
+        } else if (chainId == MAINNET_CHAIN_ID) {
+            return getMainnetConfig();
+        } else if (chainId == BSC_CHAIN_ID) {
+            return getBscConfig();
         } else {
             return getMainnetConfig();
         }
@@ -243,22 +278,21 @@ contract HelperConfig is Script {
         return NetworkConfig({
             entryPoint: ENTRYPOINT_V07,
             account: sepoliaAccount,
-            identityRegistry: SEPOLIA_IDENTITY_REGISTRY,
-            reputationRegistry: SEPOLIA_REPUTATION_REGISTRY,
-            pyth: SEPOLIA_ORACLE_CONTRACT,
+            identityRegistry: TESTNET_IDENTITY_REGISTRY,
+            reputationRegistry: TESTNET_REPUTATION_REGISTRY,
             // Stablecoins
             usdc: SEPOLIA_USDC,
             weth: SEPOLIA_WETH,
-            uniswapRouter: address(0), // No official UniswapV2 deployment on Sepolia
+            router: address(0), // No official UniswapV2 deployment on Sepolia
             dai: SEPOLIA_DAI,
-            usdt: SEPOLIA_USDT,
+            usdt: address(0),
             // ERC-20 tokens — address(0) where no official Sepolia deployment exists
-            aave: SEPOLIA_AAVE,
+            aave: address(0),
             link: SEPOLIA_LINK,
             oneinch: address(0), // No official Sepolia deployment
             ape: address(0), // No official Sepolia deployment
             arb: address(0), // No official Sepolia deployment
-            bnb: address(0), // No official Sepolia deployment
+            wbnb: address(0), // No official Sepolia deployment
             wbtc: SEPOLIA_WBTC,
             comp: address(0), // No official Sepolia deployment
             crv: address(0), // No official Sepolia deployment
@@ -266,40 +300,60 @@ contract HelperConfig is Script {
             sand: address(0), // No official Sepolia deployment
             sushi: address(0), // No official Sepolia deployment
             wtao: address(0), // No official Sepolia deployment
-            uni: SEPOLIA_UNI,
+            uni: address(0),
             yfi: address(0), // No official Sepolia deployment
             wavax: address(0), // No official Sepolia deployment
-            bat: address(0), // No official Sepolia deployment
             imx: address(0), // No official Sepolia deployment
             knc: address(0), // No official Sepolia deployment
-            rdnt: address(0), // No official Sepolia deployment
-            // Pyth price feed IDs are network-agnostic, so the same IDs are used here as on mainnet
-            ethUsdPriceFeed: ETH_USD_PRICE_FEED,
-            usdcUsdPriceFeed: USDC_USD_PRICE_FEED,
-            daiUsdPriceFeed: DAI_USD_PRICE_FEED,
-            usdtUsdPriceFeed: USDT_USD_PRICE_FEED,
-            aaveUsdPriceFeed: AAVE_USD_PRICE_FEED,
-            linkUsdPriceFeed: LINK_USD_PRICE_FEED,
-            oneinchUsdPriceFeed: ONEINCH_USD_PRICE_FEED,
-            apeUsdPriceFeed: APE_USD_PRICE_FEED,
-            arbUsdPriceFeed: ARB_USD_PRICE_FEED,
-            bnbUsdPriceFeed: BNB_USD_PRICE_FEED,
-            btcUsdPriceFeed: BTC_USD_PRICE_FEED,
-            compUsdPriceFeed: COMP_USD_PRICE_FEED,
-            crvUsdPriceFeed: CRV_USD_PRICE_FEED,
-            ensUsdPriceFeed: ENS_USD_PRICE_FEED,
-            sandUsdPriceFeed: SAND_USD_PRICE_FEED,
-            sushiUsdPriceFeed: SUSHI_USD_PRICE_FEED,
-            wtaoUsdPriceFeed: WTAO_USD_PRICE_FEED,
-            uniUsdPriceFeed: UNI_USD_PRICE_FEED,
-            yfiUsdPriceFeed: YFI_USD_PRICE_FEED,
-            wavaxUsdPriceFeed: WAVAX_USD_PRICE_FEED,
-            batUsdPriceFeed: BAT_USD_PRICE_FEED,
-            imxUsdPriceFeed: IMX_USD_PRICE_FEED,
-            kncUsdPriceFeed: KNC_USD_PRICE_FEED,
-            rdntUsdPriceFeed: RDNT_USD_PRICE_FEED,
-            // Heartbeat (max price age) — 24 hours, shared across every feed
-            heartbeat: HEARTBEAT_1H
+            cake: address(0), // No official Sepolia deployment
+            // Chainlink price feeds — only ETH, USDC, DAI, LINK, BTC have feeds on Sepolia
+            ethUsdPriceFeed: SEPOLIA_ETH_USD_PRICE_FEED,
+            usdcUsdPriceFeed: SEPOLIA_USDC_USD_PRICE_FEED,
+            daiUsdPriceFeed: SEPOLIA_DAI_USD_PRICE_FEED,
+            usdtUsdPriceFeed: address(0), // No USDT/USD feed on Sepolia
+            aaveUsdPriceFeed: address(0),
+            linkUsdPriceFeed: SEPOLIA_LINK_USD_PRICE_FEED,
+            oneinchUsdPriceFeed: address(0),
+            apeUsdPriceFeed: address(0),
+            arbUsdPriceFeed: address(0),
+            bnbUsdPriceFeed: address(0),
+            btcUsdPriceFeed: SEPOLIA_BTC_USD_PRICE_FEED,
+            compUsdPriceFeed: address(0),
+            crvUsdPriceFeed: address(0),
+            ensUsdPriceFeed: address(0),
+            sandUsdPriceFeed: address(0),
+            sushiUsdPriceFeed: address(0),
+            wtaoUsdPriceFeed: address(0),
+            uniUsdPriceFeed: address(0),
+            yfiUsdPriceFeed: address(0),
+            wavaxUsdPriceFeed: address(0),
+            imxUsdPriceFeed: address(0),
+            kncUsdPriceFeed: address(0),
+            cakeUsdPriceFeed: address(0),
+            // Heartbeats — use 1 hour for all Sepolia feeds (conservative default for testnet)
+            ethHeartbeat: HEARTBEAT_1H,
+            usdcHeartbeat: HEARTBEAT_1H,
+            daiHeartbeat: HEARTBEAT_1H,
+            usdtHeartbeat: HEARTBEAT_1H,
+            aaveHeartbeat: HEARTBEAT_1H,
+            linkHeartbeat: HEARTBEAT_1H,
+            oneinchHeartbeat: HEARTBEAT_1H,
+            apeHeartbeat: HEARTBEAT_1H,
+            arbHeartbeat: HEARTBEAT_1H,
+            bnbHeartbeat: HEARTBEAT_1H,
+            btcHeartbeat: HEARTBEAT_1H,
+            compHeartbeat: HEARTBEAT_1H,
+            crvHeartbeat: HEARTBEAT_1H,
+            ensHeartbeat: HEARTBEAT_1H,
+            sandHeartbeat: HEARTBEAT_1H,
+            sushiHeartbeat: HEARTBEAT_1H,
+            wtaoHeartbeat: HEARTBEAT_1H,
+            uniHeartbeat: HEARTBEAT_1H,
+            yfiHeartbeat: HEARTBEAT_1H,
+            wavaxHeartbeat: HEARTBEAT_1H,
+            imxHeartbeat: HEARTBEAT_1H,
+            kncHeartbeat: HEARTBEAT_1H,
+            cakeHeartbeat: HEARTBEAT_1H
         });
     }
 
@@ -316,9 +370,8 @@ contract HelperConfig is Script {
             account: vm.addr(MAINNET_DEPLOYER_PK),
             identityRegistry: MNT_IDENTITY_REGISTRY,
             reputationRegistry: MNT_REPUTATION_REGISTRY,
-            pyth: MNT_ORACLE_CONTRACT,
             //swap for the deployer account on mainnet and ensure it's funded before broadcasting
-            uniswapRouter: UNISWAP_V2_ROUTER_02,
+            router: UNISWAP_V2_ROUTER_02,
             // Stablecoins
             usdc: MNT_USDC,
             dai: MNT_DAI,
@@ -330,7 +383,7 @@ contract HelperConfig is Script {
             oneinch: MNT_ONEINCH,
             ape: MNT_APE,
             arb: MNT_ARB,
-            bnb: MNT_BNB,
+            wbnb: MNT_BNB,
             wbtc: MNT_WBTC,
             comp: MNT_COMP,
             crv: MNT_CRV,
@@ -341,37 +394,146 @@ contract HelperConfig is Script {
             uni: MNT_UNI,
             yfi: MNT_YFI,
             wavax: MNT_WAVAX,
-            bat: MNT_BAT,
             imx: MNT_IMX,
             knc: MNT_KNC,
-            rdnt: MNT_RDNT,
-            // Pyth price feed IDs
-            ethUsdPriceFeed: ETH_USD_PRICE_FEED,
-            usdcUsdPriceFeed: USDC_USD_PRICE_FEED,
-            daiUsdPriceFeed: DAI_USD_PRICE_FEED,
-            usdtUsdPriceFeed: USDT_USD_PRICE_FEED,
-            aaveUsdPriceFeed: AAVE_USD_PRICE_FEED,
-            linkUsdPriceFeed: LINK_USD_PRICE_FEED,
-            oneinchUsdPriceFeed: ONEINCH_USD_PRICE_FEED,
-            apeUsdPriceFeed: APE_USD_PRICE_FEED,
-            arbUsdPriceFeed: ARB_USD_PRICE_FEED,
-            bnbUsdPriceFeed: BNB_USD_PRICE_FEED,
-            btcUsdPriceFeed: BTC_USD_PRICE_FEED,
-            compUsdPriceFeed: COMP_USD_PRICE_FEED,
-            crvUsdPriceFeed: CRV_USD_PRICE_FEED,
-            ensUsdPriceFeed: ENS_USD_PRICE_FEED,
-            sandUsdPriceFeed: SAND_USD_PRICE_FEED,
-            sushiUsdPriceFeed: SUSHI_USD_PRICE_FEED,
-            wtaoUsdPriceFeed: WTAO_USD_PRICE_FEED,
-            uniUsdPriceFeed: UNI_USD_PRICE_FEED,
-            yfiUsdPriceFeed: YFI_USD_PRICE_FEED,
-            wavaxUsdPriceFeed: WAVAX_USD_PRICE_FEED,
-            batUsdPriceFeed: BAT_USD_PRICE_FEED,
-            imxUsdPriceFeed: IMX_USD_PRICE_FEED,
-            kncUsdPriceFeed: KNC_USD_PRICE_FEED,
-            rdntUsdPriceFeed: RDNT_USD_PRICE_FEED,
-            // Heartbeat (max price age) — 24 hours, shared across every feed
-            heartbeat: HEARTBEAT_24H
+            cake: address(0),
+            // Chainlink price feeds
+            ethUsdPriceFeed: MNT_ETH_USD_PRICE_FEED,
+            usdcUsdPriceFeed: MNT_USDC_USD_PRICE_FEED,
+            daiUsdPriceFeed: MNT_DAI_USD_PRICE_FEED,
+            usdtUsdPriceFeed: MNT_USDT_USD_PRICE_FEED,
+            aaveUsdPriceFeed: MNT_AAVE_USD_PRICE_FEED,
+            linkUsdPriceFeed: MNT_LINK_USD_PRICE_FEED,
+            oneinchUsdPriceFeed: MNT_ONEINCH_USD_PRICE_FEED,
+            apeUsdPriceFeed: MNT_APE_USD_PRICE_FEED,
+            arbUsdPriceFeed: MNT_ARB_USD_PRICE_FEED,
+            bnbUsdPriceFeed: MNT_BNB_USD_PRICE_FEED,
+            btcUsdPriceFeed: MNT_BTC_USD_PRICE_FEED,
+            compUsdPriceFeed: MNT_COMP_USD_PRICE_FEED,
+            crvUsdPriceFeed: MNT_CRV_USD_PRICE_FEED,
+            ensUsdPriceFeed: MNT_ENS_USD_PRICE_FEED,
+            sandUsdPriceFeed: MNT_SAND_USD_PRICE_FEED,
+            sushiUsdPriceFeed: MNT_SUSHI_USD_PRICE_FEED,
+            wtaoUsdPriceFeed: MNT_WTAO_USD_PRICE_FEED,
+            uniUsdPriceFeed: MNT_UNI_USD_PRICE_FEED,
+            yfiUsdPriceFeed: MNT_YFI_USD_PRICE_FEED,
+            wavaxUsdPriceFeed: MNT_WAVAX_USD_PRICE_FEED,
+            imxUsdPriceFeed: MNT_IMX_USD_PRICE_FEED,
+            kncUsdPriceFeed: MNT_KNC_USD_PRICE_FEED,
+            cakeUsdPriceFeed: address(0), // Chainlink CAKE/USD feed deprecated Nov 2022
+            // Heartbeats sourced from Chainlink reference data (feeds-mainnet.json)
+            ethHeartbeat: HEARTBEAT_1H,
+            usdcHeartbeat: HEARTBEAT_24H,
+            daiHeartbeat: HEARTBEAT_1H,
+            usdtHeartbeat: HEARTBEAT_24H,
+            aaveHeartbeat: HEARTBEAT_1H,
+            linkHeartbeat: HEARTBEAT_1H,
+            oneinchHeartbeat: HEARTBEAT_24H,
+            apeHeartbeat: HEARTBEAT_24H,
+            arbHeartbeat: HEARTBEAT_24H,
+            bnbHeartbeat: HEARTBEAT_24H,
+            btcHeartbeat: HEARTBEAT_1H,
+            compHeartbeat: HEARTBEAT_1H,
+            crvHeartbeat: HEARTBEAT_24H,
+            ensHeartbeat: HEARTBEAT_24H,
+            sandHeartbeat: HEARTBEAT_24H,
+            sushiHeartbeat: HEARTBEAT_24H,
+            wtaoHeartbeat: HEARTBEAT_24H,
+            uniHeartbeat: HEARTBEAT_1H,
+            yfiHeartbeat: HEARTBEAT_24H,
+            wavaxHeartbeat: HEARTBEAT_24H,
+            imxHeartbeat: HEARTBEAT_24H,
+            kncHeartbeat: HEARTBEAT_24H,
+            cakeHeartbeat: HEARTBEAT_24H
+        });
+    }
+
+    /**
+     * @notice Returns the BSC (Binance Smart Chain) mainnet configuration
+     * @dev Uses PancakeSwap V2 as the router. Tokens without a BSC deployment
+     *      (APE, ARB, ENS, SAND, wTAO, IMX) are set to address(0).
+     * @return config NetworkConfig for BSC mainnet
+     */
+    function getBscConfig() internal view returns (NetworkConfig memory) {
+        return NetworkConfig({
+            entryPoint: ENTRYPOINT_V07,
+            account: vm.addr(MAINNET_DEPLOYER_PK),
+            identityRegistry: MNT_IDENTITY_REGISTRY,
+            reputationRegistry: MNT_REPUTATION_REGISTRY,
+            router: PANCAKE_V2_ROUTER_02,
+            // Stablecoins
+            usdc: BSC_USDC,
+            dai: BSC_DAI,
+            usdt: BSC_USDT,
+            // ERC-20 tokens
+            weth: BSC_WETH,
+            aave: BSC_AAVE,
+            link: BSC_LINK,
+            oneinch: BSC_ONEINCH,
+            ape: address(0), // No BSC deployment
+            arb: address(0), // No BSC deployment
+            wbnb: BSC_WBNB, // Wrapped BNB — the IWETH-compatible ERC-20 form of BSC's native gas token
+            wbtc: BSC_WBTC,
+            comp: BSC_COMP,
+            crv: BSC_CRV,
+            ens: address(0), // No BSC deployment
+            sand: address(0), // No BSC deployment
+            sushi: BSC_SUSHI,
+            wtao: address(0), // No BSC deployment
+            uni: BSC_UNI,
+            yfi: BSC_YFI,
+            wavax: BSC_WAVAX,
+            imx: address(0), // No BSC deployment
+            knc: BSC_KNC,
+            cake: BSC_CAKE,
+            // Chainlink price feeds
+            ethUsdPriceFeed: BSC_ETH_USD_PRICE_FEED,
+            usdcUsdPriceFeed: BSC_USDC_USD_PRICE_FEED,
+            daiUsdPriceFeed: BSC_DAI_USD_PRICE_FEED,
+            usdtUsdPriceFeed: BSC_USDT_USD_PRICE_FEED,
+            aaveUsdPriceFeed: BSC_AAVE_USD_PRICE_FEED,
+            linkUsdPriceFeed: BSC_LINK_USD_PRICE_FEED,
+            oneinchUsdPriceFeed: BSC_ONEINCH_USD_PRICE_FEED,
+            apeUsdPriceFeed: address(0),
+            arbUsdPriceFeed: address(0),
+            bnbUsdPriceFeed: BSC_BNB_USD_PRICE_FEED,
+            btcUsdPriceFeed: BSC_BTC_USD_PRICE_FEED,
+            compUsdPriceFeed: BSC_COMP_USD_PRICE_FEED,
+            crvUsdPriceFeed: BSC_CRV_USD_PRICE_FEED,
+            ensUsdPriceFeed: address(0),
+            sandUsdPriceFeed: address(0),
+            sushiUsdPriceFeed: BSC_SUSHI_USD_PRICE_FEED,
+            wtaoUsdPriceFeed: address(0),
+            uniUsdPriceFeed: BSC_UNI_USD_PRICE_FEED,
+            yfiUsdPriceFeed: BSC_YFI_USD_PRICE_FEED,
+            wavaxUsdPriceFeed: BSC_AVAX_USD_PRICE_FEED,
+            imxUsdPriceFeed: address(0),
+            kncUsdPriceFeed: BSC_KNC_USD_PRICE_FEED,
+            cakeUsdPriceFeed: BSC_CAKE_USD_PRICE_FEED,
+            // Heartbeats — sourced from Chainlink BSC feed data
+            ethHeartbeat: HEARTBEAT_1H,
+            usdcHeartbeat: HEARTBEAT_24H,
+            daiHeartbeat: HEARTBEAT_24H,
+            usdtHeartbeat: HEARTBEAT_24H,
+            aaveHeartbeat: HEARTBEAT_1H,
+            linkHeartbeat: HEARTBEAT_1H,
+            oneinchHeartbeat: HEARTBEAT_24H,
+            apeHeartbeat: HEARTBEAT_24H,
+            arbHeartbeat: HEARTBEAT_24H,
+            bnbHeartbeat: HEARTBEAT_24H,
+            btcHeartbeat: HEARTBEAT_1H,
+            compHeartbeat: HEARTBEAT_24H,
+            crvHeartbeat: HEARTBEAT_24H,
+            ensHeartbeat: HEARTBEAT_24H,
+            sandHeartbeat: HEARTBEAT_24H,
+            sushiHeartbeat: HEARTBEAT_24H,
+            wtaoHeartbeat: HEARTBEAT_24H,
+            uniHeartbeat: HEARTBEAT_24H,
+            yfiHeartbeat: HEARTBEAT_24H,
+            wavaxHeartbeat: HEARTBEAT_24H,
+            imxHeartbeat: HEARTBEAT_24H,
+            kncHeartbeat: HEARTBEAT_24H,
+            cakeHeartbeat: HEARTBEAT_1H // BSC CAKE/USD feed heartbeat is 1 min; 1h gives a safety buffer
         });
     }
 
@@ -417,39 +579,36 @@ contract HelperConfig is Script {
             ERC20Mock uni = new ERC20Mock("Uniswap", "UNI", 18);
             ERC20Mock yfi = new ERC20Mock("yearn.finance", "YFI", 18);
             ERC20Mock wavax = new ERC20Mock("Wrapped AVAX", "WAVAX", 18);
-            ERC20Mock bat = new ERC20Mock("Basic Attention Token", "BAT", 18);
             ERC20Mock imx = new ERC20Mock("Immutable X", "IMX", 18);
             ERC20Mock knc = new ERC20Mock("Kyber Network Crystal", "KNC", 18);
-            ERC20Mock rdnt = new ERC20Mock("Radiant Capital", "RDNT", 18);
+            ERC20Mock cake = new ERC20Mock("PancakeSwap Token", "Cake", 18);
 
-            // Single mock Pyth contract seeded with every feed ID used by the protocol.
-            // validTimePeriod/singleUpdateFeeInWei are both 0 — SHOracle reads via getPriceUnsafe
-            // and enforces staleness itself, so neither value affects test behaviour.
-            MockPyth pyth = new MockPyth(0, 0);
-            _seedPythPrice(pyth, ETH_USD_PRICE_FEED, ETH_USD_PRICE);
-            _seedPythPrice(pyth, USDC_USD_PRICE_FEED, USDC_USD_PRICE);
-            _seedPythPrice(pyth, DAI_USD_PRICE_FEED, DAI_USD_PRICE);
-            _seedPythPrice(pyth, USDT_USD_PRICE_FEED, USDT_USD_PRICE);
-            _seedPythPrice(pyth, AAVE_USD_PRICE_FEED, AAVE_USD_PRICE);
-            _seedPythPrice(pyth, LINK_USD_PRICE_FEED, LINK_USD_PRICE);
-            _seedPythPrice(pyth, ONEINCH_USD_PRICE_FEED, ONEINCH_USD_PRICE);
-            _seedPythPrice(pyth, APE_USD_PRICE_FEED, APE_USD_PRICE);
-            _seedPythPrice(pyth, ARB_USD_PRICE_FEED, ARB_USD_PRICE);
-            _seedPythPrice(pyth, BNB_USD_PRICE_FEED, BNB_USD_PRICE);
-            _seedPythPrice(pyth, BTC_USD_PRICE_FEED, BTC_USD_PRICE);
-            _seedPythPrice(pyth, COMP_USD_PRICE_FEED, COMP_USD_PRICE);
-            _seedPythPrice(pyth, CRV_USD_PRICE_FEED, CRV_USD_PRICE);
-            _seedPythPrice(pyth, ENS_USD_PRICE_FEED, ENS_USD_PRICE);
-            _seedPythPrice(pyth, SAND_USD_PRICE_FEED, SAND_USD_PRICE);
-            _seedPythPrice(pyth, SUSHI_USD_PRICE_FEED, SUSHI_USD_PRICE);
-            _seedPythPrice(pyth, WTAO_USD_PRICE_FEED, TAO_USD_PRICE);
-            _seedPythPrice(pyth, UNI_USD_PRICE_FEED, UNI_USD_PRICE);
-            _seedPythPrice(pyth, YFI_USD_PRICE_FEED, YFI_USD_PRICE);
-            _seedPythPrice(pyth, WAVAX_USD_PRICE_FEED, WAVAX_USD_PRICE);
-            _seedPythPrice(pyth, BAT_USD_PRICE_FEED, BAT_USD_PRICE);
-            _seedPythPrice(pyth, IMX_USD_PRICE_FEED, IMX_USD_PRICE);
-            _seedPythPrice(pyth, KNC_USD_PRICE_FEED, KNC_USD_PRICE);
-            _seedPythPrice(pyth, RDNT_USD_PRICE_FEED, RDNT_USD_PRICE);
+            // Stablecoin price feed mocks
+            MockV3Aggregator ethUsdPriceFeed = new MockV3Aggregator(DECIMALS, ETH_USD_PRICE);
+            MockV3Aggregator usdcUsdPriceFeed = new MockV3Aggregator(DECIMALS, USDC_USD_PRICE);
+            MockV3Aggregator daiUsdPriceFeed = new MockV3Aggregator(DECIMALS, DAI_USD_PRICE);
+            MockV3Aggregator usdtUsdPriceFeed = new MockV3Aggregator(DECIMALS, USDT_USD_PRICE);
+
+            // ERC-20 token price feed mocks
+            MockV3Aggregator aaveUsdPriceFeed = new MockV3Aggregator(DECIMALS, AAVE_USD_PRICE);
+            MockV3Aggregator linkUsdPriceFeed = new MockV3Aggregator(DECIMALS, LINK_USD_PRICE);
+            MockV3Aggregator oneinchUsdPriceFeed = new MockV3Aggregator(DECIMALS, ONEINCH_USD_PRICE);
+            MockV3Aggregator apeUsdPriceFeed = new MockV3Aggregator(DECIMALS, APE_USD_PRICE);
+            MockV3Aggregator arbUsdPriceFeed = new MockV3Aggregator(DECIMALS, ARB_USD_PRICE);
+            MockV3Aggregator bnbUsdPriceFeed = new MockV3Aggregator(DECIMALS, BNB_USD_PRICE);
+            MockV3Aggregator btcUsdPriceFeed = new MockV3Aggregator(DECIMALS, BTC_USD_PRICE);
+            MockV3Aggregator compUsdPriceFeed = new MockV3Aggregator(DECIMALS, COMP_USD_PRICE);
+            MockV3Aggregator crvUsdPriceFeed = new MockV3Aggregator(DECIMALS, CRV_USD_PRICE);
+            MockV3Aggregator ensUsdPriceFeed = new MockV3Aggregator(DECIMALS, ENS_USD_PRICE);
+            MockV3Aggregator sandUsdPriceFeed = new MockV3Aggregator(DECIMALS, SAND_USD_PRICE);
+            MockV3Aggregator sushiUsdPriceFeed = new MockV3Aggregator(DECIMALS, SUSHI_USD_PRICE);
+            MockV3Aggregator wtaoUsdPriceFeed = new MockV3Aggregator(DECIMALS, TAO_USD_PRICE);
+            MockV3Aggregator uniUsdPriceFeed = new MockV3Aggregator(DECIMALS, UNI_USD_PRICE);
+            MockV3Aggregator yfiUsdPriceFeed = new MockV3Aggregator(DECIMALS, YFI_USD_PRICE);
+            MockV3Aggregator wavaxUsdPriceFeed = new MockV3Aggregator(DECIMALS, WAVAX_USD_PRICE);
+            MockV3Aggregator imxUsdPriceFeed = new MockV3Aggregator(DECIMALS, IMX_USD_PRICE);
+            MockV3Aggregator kncUsdPriceFeed = new MockV3Aggregator(DECIMALS, KNC_USD_PRICE);
+            MockV3Aggregator cakeUsdPriceFeed = new MockV3Aggregator(DECIMALS, CAKE_USD_PRICE);
 
             MockIdentityRegistry identityRegistry = new MockIdentityRegistry();
             MockReputationRegistry reputationRegistry = new MockReputationRegistry(address(identityRegistry));
@@ -461,8 +620,7 @@ contract HelperConfig is Script {
                 account: ANVIL_BURNER_WALLET,
                 identityRegistry: address(identityRegistry),
                 reputationRegistry: address(reputationRegistry),
-                pyth: address(pyth),
-                uniswapRouter: address(0), // Uniswap not deployed on Anvil by default
+                router: address(0), // Uniswap not deployed on Anvil by default
                 // Stablecoins
                 usdc: address(usdc),
                 dai: address(dai),
@@ -474,7 +632,7 @@ contract HelperConfig is Script {
                 oneinch: address(oneinch),
                 ape: address(ape),
                 arb: address(arb),
-                bnb: address(bnb),
+                wbnb: address(bnb),
                 wbtc: address(wbtc),
                 comp: address(comp),
                 crv: address(crv),
@@ -485,57 +643,59 @@ contract HelperConfig is Script {
                 uni: address(uni),
                 yfi: address(yfi),
                 wavax: address(wavax),
-                bat: address(bat),
                 imx: address(imx),
                 knc: address(knc),
-                rdnt: address(rdnt),
-                // Pyth price feed IDs (network-agnostic — same constants used on every chain)
-                ethUsdPriceFeed: ETH_USD_PRICE_FEED,
-                usdcUsdPriceFeed: USDC_USD_PRICE_FEED,
-                daiUsdPriceFeed: DAI_USD_PRICE_FEED,
-                usdtUsdPriceFeed: USDT_USD_PRICE_FEED,
-                aaveUsdPriceFeed: AAVE_USD_PRICE_FEED,
-                linkUsdPriceFeed: LINK_USD_PRICE_FEED,
-                oneinchUsdPriceFeed: ONEINCH_USD_PRICE_FEED,
-                apeUsdPriceFeed: APE_USD_PRICE_FEED,
-                arbUsdPriceFeed: ARB_USD_PRICE_FEED,
-                bnbUsdPriceFeed: BNB_USD_PRICE_FEED,
-                btcUsdPriceFeed: BTC_USD_PRICE_FEED,
-                compUsdPriceFeed: COMP_USD_PRICE_FEED,
-                crvUsdPriceFeed: CRV_USD_PRICE_FEED,
-                ensUsdPriceFeed: ENS_USD_PRICE_FEED,
-                sandUsdPriceFeed: SAND_USD_PRICE_FEED,
-                sushiUsdPriceFeed: SUSHI_USD_PRICE_FEED,
-                wtaoUsdPriceFeed: WTAO_USD_PRICE_FEED,
-                uniUsdPriceFeed: UNI_USD_PRICE_FEED,
-                yfiUsdPriceFeed: YFI_USD_PRICE_FEED,
-                wavaxUsdPriceFeed: WAVAX_USD_PRICE_FEED,
-                batUsdPriceFeed: BAT_USD_PRICE_FEED,
-                imxUsdPriceFeed: IMX_USD_PRICE_FEED,
-                kncUsdPriceFeed: KNC_USD_PRICE_FEED,
-                rdntUsdPriceFeed: RDNT_USD_PRICE_FEED,
-                // Heartbeat (max price age) — 1 hour, shared across every feed
-                heartbeat: HEARTBEAT_1H
+                cake: address(cake),
+                // Price feeds
+                ethUsdPriceFeed: address(ethUsdPriceFeed),
+                usdcUsdPriceFeed: address(usdcUsdPriceFeed),
+                daiUsdPriceFeed: address(daiUsdPriceFeed),
+                usdtUsdPriceFeed: address(usdtUsdPriceFeed),
+                aaveUsdPriceFeed: address(aaveUsdPriceFeed),
+                linkUsdPriceFeed: address(linkUsdPriceFeed),
+                oneinchUsdPriceFeed: address(oneinchUsdPriceFeed),
+                apeUsdPriceFeed: address(apeUsdPriceFeed),
+                arbUsdPriceFeed: address(arbUsdPriceFeed),
+                bnbUsdPriceFeed: address(bnbUsdPriceFeed),
+                btcUsdPriceFeed: address(btcUsdPriceFeed),
+                compUsdPriceFeed: address(compUsdPriceFeed),
+                crvUsdPriceFeed: address(crvUsdPriceFeed),
+                ensUsdPriceFeed: address(ensUsdPriceFeed),
+                sandUsdPriceFeed: address(sandUsdPriceFeed),
+                sushiUsdPriceFeed: address(sushiUsdPriceFeed),
+                wtaoUsdPriceFeed: address(wtaoUsdPriceFeed),
+                uniUsdPriceFeed: address(uniUsdPriceFeed),
+                yfiUsdPriceFeed: address(yfiUsdPriceFeed),
+                wavaxUsdPriceFeed: address(wavaxUsdPriceFeed),
+                imxUsdPriceFeed: address(imxUsdPriceFeed),
+                kncUsdPriceFeed: address(kncUsdPriceFeed),
+                cakeUsdPriceFeed: address(cakeUsdPriceFeed),
+                // Heartbeats — use 1 hour for all Anvil mock feeds
+                ethHeartbeat: HEARTBEAT_1H,
+                usdcHeartbeat: HEARTBEAT_1H,
+                daiHeartbeat: HEARTBEAT_1H,
+                usdtHeartbeat: HEARTBEAT_1H,
+                aaveHeartbeat: HEARTBEAT_1H,
+                linkHeartbeat: HEARTBEAT_1H,
+                oneinchHeartbeat: HEARTBEAT_1H,
+                apeHeartbeat: HEARTBEAT_1H,
+                arbHeartbeat: HEARTBEAT_1H,
+                bnbHeartbeat: HEARTBEAT_1H,
+                btcHeartbeat: HEARTBEAT_1H,
+                compHeartbeat: HEARTBEAT_1H,
+                crvHeartbeat: HEARTBEAT_1H,
+                ensHeartbeat: HEARTBEAT_1H,
+                sandHeartbeat: HEARTBEAT_1H,
+                sushiHeartbeat: HEARTBEAT_1H,
+                wtaoHeartbeat: HEARTBEAT_1H,
+                uniHeartbeat: HEARTBEAT_1H,
+                yfiHeartbeat: HEARTBEAT_1H,
+                wavaxHeartbeat: HEARTBEAT_1H,
+                imxHeartbeat: HEARTBEAT_1H,
+                kncHeartbeat: HEARTBEAT_1H,
+                cakeHeartbeat: HEARTBEAT_1H
             });
             return sLocalNetworkConfig;
         }
-    }
-
-    /**
-     * @dev Pushes a single price into a MockPyth instance so SHOracle's getPriceUnsafe reads
-     *      succeed in tests. Uses block.timestamp as the publish time so the price is always
-     *      fresh relative to whichever heartbeat SHOracle checks it against.
-     * @param pyth  The MockPyth instance to seed
-     * @param id    The Pyth price feed ID being seeded
-     * @param price The mock price, in the same 8-decimal fixed-point format Chainlink mocks used
-     */
-    function _seedPythPrice(MockPyth pyth, bytes32 id, int256 price) private {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        int64 p = int64(price);
-        bytes memory updateData =
-            pyth.createPriceFeedUpdateData(id, p, 0, -int32(uint32(DECIMALS)), p, 0, uint64(block.timestamp), 0);
-        bytes[] memory updates = new bytes[](1);
-        updates[0] = updateData;
-        pyth.updatePriceFeeds(updates);
     }
 }

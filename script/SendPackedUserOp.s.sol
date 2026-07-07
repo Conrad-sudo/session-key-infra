@@ -6,73 +6,68 @@ import {HelperConfig} from "./HelperConfig.s.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {IERC7579Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
 
 /**
  * @title SendPackedUserOp
- * @notice Helper script for generating and signing ERC-4337 PackedUserOperations
- * @dev Used in tests and deployment scripts to construct valid signed UserOps
- *      for submission to the EntryPoint via handleOps.
- *
- *      Supports two signing modes:
- *      - Owner mode: pass sessionSigner = address(0) and sessionSignerKey = 0
- *        to sign with the default account from HelperConfig (or the anvil key on chain 31337)
- *      - Session key mode: pass a valid sessionSigner address and its corresponding
- *        private key to sign as a delegated session key
+ * @notice Helper script for generating and signing ERC-4337 PackedUserOperations targeting
+ *         SessionHandler, an ERC-7579 account whose only installed validator is
+ *         SessionHandlerModule.
+ * @dev This script has no "owner mode" -- SessionHandler deliberately never routes owner actions
+ *      through the EntryPoint at all. The only installed validator (SessionHandlerModule) rejects
+ *      any signer that isn't a registered session key, and there is no separate owner-validator
+ *      module. Owners call the account directly instead (see
+ *      SessionHandler.onlyEntryPointOrSelfOrOwner). Every UserOp this script builds is therefore a
+ *      session-key-signed call to `execute(...)`.
  *
  *      Signing flow:
- *      1. Fetch nonce from EntryPoint
- *      2. Build unsigned PackedUserOperation
- *      3. Get userOpHash from EntryPoint (EIP-712 typed structured data hash)
- *      4. Wrap in EIP-191 envelope via toEthSignedMessageHash
- *      5. Sign the digest with vm.sign
- *      6. Attach (r, s, v) signature to the UserOp
+ *      1. Fetch nonce from EntryPoint using a key whose top 20 bytes equal the spending-limit
+ *         module's address -- SessionHandler dispatches UserOp validation to whichever validator
+ *         module address is embedded in the nonce key (see AccountERC7579._extractUserOpValidator).
+ *      2. Pack (dest, value, data) into ERC-7579's single-execution calldata and wrap it in an
+ *         execute(mode, executionCalldata) call.
+ *      3. Get userOpHash from EntryPoint (EIP-712 typed structured data hash).
+ *      4. Wrap in EIP-191 envelope via toEthSignedMessageHash.
+ *      5. Sign the digest with vm.sign.
+ *      6. Attach (r, s, v) signature to the UserOp.
  */
 contract SendPackedUserOp is Script {
     using MessageHashUtils for bytes32;
 
     /**
-     * @notice Generates a signed ERC-4337 PackedUserOperation ready for EntryPoint submission
-     * @dev Determines the signing key based on whether a session signer is provided:
-     *      - If sessionSigner == address(0) and sessionSignerKey == 0: signs as owner
-     *        using config.account. On Anvil (chainid 31337) uses the hardcoded default key.
-     *      - Otherwise: signs as the provided session key using sessionSignerKey.
-     *
-     *      The digest is constructed as:
-     *      keccak256("\x19Ethereum Signed Message:\n32" || userOpHash)
-     *
-     * @param sender The smart account address that will send the UserOp (i.e. SessionHandler)
-     * @param config Network configuration containing entryPoint address and default account
-     * @param callData Encoded calldata to be executed by the smart account (e.g. execute(...))
-     * @param sessionSigner Address of the session key signer. Pass address(0) to use owner mode
-     * @param sessionSignerKey Private key of the session signer. Pass 0 to use owner mode
-     * @return userOp The fully constructed and signed PackedUserOperation
-     * @return userOpHash The raw EIP-712 hash of the UserOp as returned by the EntryPoint
-     * @return digest The EIP-191 wrapped digest that was actually signed
+     * @notice Generates a signed ERC-4337 PackedUserOperation for a session-key call on a
+     *         SessionHandler account.
+     * @param sender              The SessionHandler account address that will send the UserOp.
+     * @param config              Network configuration containing the entryPoint address.
+     * @param spendingLimitModule Address of the SessionHandlerModule installed on `sender`. Its
+     *                            address is embedded in the nonce key so the account routes
+     *                            validation to it; it is also the module that will enforce the
+     *                            session's target/selector/time-window/budget rules.
+     * @param dest                Target contract for the inner call.
+     * @param value               Native ETH value (wei) to forward with the inner call.
+     * @param data                Calldata for the inner call.
+     * @param sessionSigner       Address of the session key signer.
+     * @param sessionSignerKey    Private key of the session key signer.
+     * @return userOp     The fully constructed and signed PackedUserOperation.
+     * @return userOpHash The raw EIP-712 hash of the UserOp as returned by the EntryPoint.
+     * @return digest     The EIP-191 wrapped digest that was actually signed.
      */
     function generateSignedUserOp(
         address sender,
         HelperConfig.NetworkConfig memory config,
-        bytes calldata callData,
+        address spendingLimitModule,
+        address dest,
+        uint256 value,
+        bytes memory data,
         address sessionSigner,
         uint256 sessionSignerKey
     ) external view returns (PackedUserOperation memory, bytes32, bytes32) {
-        uint256 privateKey;
-        address signer;
+        // Nonce key convention (AccountERC7579._extractUserOpValidator): top 20 bytes of the
+        // 192-bit key select the validator module; the low 32 bits are free sub-key space.
+        uint192 nonceKey = uint192(uint160(spendingLimitModule)) << 32;
+        uint256 nonce = IEntryPoint(config.entryPoint).getNonce(sender, nonceKey);
 
-        if (sessionSigner == address(0) && sessionSignerKey == 0) {
-            // Owner mode: use the default account from config
-            signer = config.account;
-            if (block.chainid == 31337) {
-                // Anvil default private key for address 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
-                privateKey = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
-            }
-        } else {
-            // Session key mode: use the provided signer and key
-            signer = sessionSigner;
-            privateKey = sessionSignerKey;
-        }
-
-        uint256 nonce = IEntryPoint(config.entryPoint).getNonce(sender, 0);
+        bytes memory callData = _encodeExecuteCalldata(dest, value, data);
 
         // 1. Build the unsigned UserOp with hardcoded gas parameters
         PackedUserOperation memory userOp = _generateUnsignedUserOp(sender, nonce, callData);
@@ -84,12 +79,31 @@ contract SendPackedUserOp is Script {
         bytes32 digest = userOpHash.toEthSignedMessageHash();
 
         // 4. Sign the digest — vm.sign returns v as 0 or 1 on Anvil, adjusted to 27/28
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(sessionSignerKey, digest);
+        require(ecrecover(digest, v, r, s) == sessionSigner, "sessionSigner does not match sessionSignerKey");
 
         // 5. Attach the packed (r, s, v) signature to the UserOp
         userOp.signature = abi.encodePacked(r, s, v);
 
         return (userOp, userOpHash, digest);
+    }
+
+    /**
+     * @notice Packs (dest, value, data) into an ERC-7579 execute(mode, executionCalldata) call.
+     * @dev Single-call mode only (CALLTYPE_SINGLE = 0x00, EXECTYPE_DEFAULT = 0x00, no selector or
+     *      payload), so `mode` is simply bytes32(0). SessionHandlerModule's validator rejects batch
+     *      and delegatecall modes for session keys, so this script never needs to build those.
+     *      The inner (target, value, data) triple is packed with abi.encodePacked, not abi.encode,
+     *      matching ERC7579Utils.encodeSingle/decodeSingle's fixed-offset layout.
+     */
+    function _encodeExecuteCalldata(address dest, uint256 value, bytes memory data)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        bytes memory executionCalldata = abi.encodePacked(dest, value, data);
+        bytes32 mode = bytes32(0);
+        return abi.encodeCall(IERC7579Execution.execute, (mode, executionCalldata));
     }
 
     /**
@@ -100,13 +114,8 @@ contract SendPackedUserOp is Script {
      *      - gasFees: maxFeePerGas (upper 128 bits) | maxPriorityFeePerGas (lower 128 bits)
      *      initCode and paymasterAndData are empty as this account is already deployed
      *      and self-funded. signature is empty as it is attached after hashing.
-     *
-     * @param sender The smart account address submitting the operation
-     * @param nonce The current nonce for the sender as returned by the EntryPoint
-     * @param callData The encoded function call to execute on the smart account
-     * @return userOp An unsigned PackedUserOperation ready to be hashed and signed
      */
-    function _generateUnsignedUserOp(address sender, uint256 nonce, bytes calldata callData)
+    function _generateUnsignedUserOp(address sender, uint256 nonce, bytes memory callData)
         internal
         pure
         returns (PackedUserOperation memory)

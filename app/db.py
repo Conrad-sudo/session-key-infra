@@ -5,10 +5,10 @@ import threading
 from web3 import Web3
 from datetime import datetime, timezone
 from constants import (
-    CHAIN_ID_ANVIL, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA, WEI_PER_ETH,
+    CHAIN_ID_ANVIL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA, WEI_PER_ETH,
 )
 
-CHAIN_IDs=[CHAIN_ID_ANVIL, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA]
+CHAIN_IDs=[CHAIN_ID_ANVIL, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA, CHAIN_ID_BSC, CHAIN_ID_CELO]
 
 DB_PATH = "./app/wallet.db"
 
@@ -20,6 +20,10 @@ _NETWORK_DB_PREFIX: dict[str, str] = {
     "mainnet-fork": "mainnet",
     "sepolia": "sepolia",
     "sepolia-fork": "sepolia",
+    "bsc": "bsc",
+    "bsc-fork": "bsc",
+    "celo": "celo",
+    "celo-fork": "celo",
 }
 
 
@@ -94,11 +98,19 @@ def init_db():
          CREATE TABLE IF NOT EXISTS mainnet_tokens (
             ticker  TEXT PRIMARY KEY,
             address TEXT NOT NULL
-        ); 
+        );
         CREATE TABLE IF NOT EXISTS sepolia_tokens (
             ticker  TEXT PRIMARY KEY,
             address TEXT NOT NULL
-        );             
+        );
+        CREATE TABLE IF NOT EXISTS bsc_tokens (
+            ticker  TEXT PRIMARY KEY,
+            address TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS celo_tokens (
+            ticker  TEXT PRIMARY KEY,
+            address TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS session_handlers (
             chat_id INTEGER PRIMARY KEY,
@@ -119,11 +131,19 @@ def init_db():
             interval_hrs INTEGER NOT NULL
         );
                      
-          CREATE TABLE IF NOT EXISTS pricefeeds (
+          CREATE TABLE IF NOT EXISTS mainnet_pricefeeds (
             token TEXT PRIMARY KEY,
-            id TEXT  NOT NULL
+            address TEXT  NOT NULL
         );
-        
+        CREATE TABLE IF NOT EXISTS sepolia_pricefeeds (
+            token TEXT PRIMARY KEY,
+            address TEXT  NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS bsc_pricefeeds (
+            token TEXT PRIMARY KEY,
+            address TEXT  NOT NULL
+        );
+
 
         CREATE TABLE IF NOT EXISTS session_keys (
             chat_id         INTEGER NOT NULL,
@@ -155,69 +175,101 @@ def migrate_json_to_db():
     """
     db = get_db()
 
-    if os.path.exists("./app/migrate/ERC20_Selectors.json"):
+    if os.path.exists("./app/migrate/selectors/ERC20_Selectors.json"):
         for name, selector in get_json(
-            "./app/migrate/ERC20_Selectors.json"
+            "./app/migrate/selectors/ERC20_Selectors.json"
         ).items():
             db.execute(
                 "INSERT OR REPLACE INTO erc20_selectors (name, selector) VALUES (?, ?)",
                 (name, selector),
             )
 
-    if os.path.exists("./app/migrate/UniswapV2_Selectors.json"):
+    if os.path.exists("./app/migrate/contracts/UniswapV2_Selectors.json"):
         for name, selector in get_json(
-            "./app/migrate/UniswapV2_Selectors.json"
+            "./app/migrate/contracts/UniswapV2_Selectors.json"
         ).items():
             db.execute(
                 "INSERT OR REPLACE INTO uniswapv2_selectors (name, selector) VALUES (?, ?)",
                 (name, selector),
             )
 
-    if os.path.exists("./app/migrate/ReputationRegistry_Selectors.json"):
+    if os.path.exists("./app/migrate/selectors/ReputationRegistry_Selectors.json"):
         for name, selector in get_json(
-            "./app/migrate/ReputationRegistry_Selectors.json"
+            "./app/migrate/selectors/ReputationRegistry_Selectors.json"
         ).items():
             db.execute(
                 "INSERT OR REPLACE INTO reputation_registry_selectors (name, selector) VALUES (?, ?)",
                 (name, selector),
             )
 
-    if os.path.exists("./app/migrate/Chains.json"):
-        for name, chain_id in get_json("./app/migrate/Chains.json").items():
+    if os.path.exists("./app/migrate/network/Chains.json"):
+        for name, chain_id in get_json("./app/migrate/network/Chains.json").items():
             db.execute(
                 "INSERT OR REPLACE INTO chains (name, chain_id) VALUES (?, ?)",
                 (name, chain_id),
             )
 
-    if os.path.exists("./app/migrate/Mainnet_Tokens.json"):
+    if os.path.exists("./app/migrate/tokens/Mainnet_Tokens.json"):
         for name, address in get_json(
-            "./app/migrate/Mainnet_Tokens.json"
+            "./app/migrate/tokens/Mainnet_Tokens.json"
         ).items():
             db.execute(
                 "INSERT OR REPLACE INTO mainnet_tokens (ticker, address) VALUES (?, ?)",
                 (name, Web3.to_checksum_address(address)),
             )
-    if os.path.exists("./app/migrate/Sepolia_Tokens.json"):
+    if os.path.exists("./app/migrate/tokens/Sepolia_Tokens.json"):
         for name, address in get_json(
-            "./app/migrate/Sepolia_Tokens.json"
+            "./app/migrate/tokens/Sepolia_Tokens.json"
         ).items():
             db.execute(
                 "INSERT OR REPLACE INTO sepolia_tokens (ticker, address) VALUES (?, ?)",
                 (name, Web3.to_checksum_address(address)),
             )
-
-    if os.path.exists("./app/migrate/Pricefeeds.json"):
-        for name, feed_id in get_json(
-            "./app/migrate/Pricefeeds.json"
+    if os.path.exists("./app/migrate/tokens/Bsc_Tokens.json"):
+        for name, address in get_json(
+            "./app/migrate/tokens/Bsc_Tokens.json"
         ).items():
             db.execute(
-                "INSERT OR REPLACE INTO pricefeeds (token, id) VALUES (?, ?)",
-                (name, feed_id),
+                "INSERT OR REPLACE INTO bsc_tokens (ticker, address) VALUES (?, ?)",
+                (name, Web3.to_checksum_address(address)),
             )
-    
+    if os.path.exists("./app/migrate/tokens/Celo_Tokens.json"):
+        for name, address in get_json(
+            "./app/migrate/tokens/Celo_Tokens.json"
+        ).items():
+            db.execute(
+                "INSERT OR REPLACE INTO celo_tokens (ticker, address) VALUES (?, ?)",
+                (name, Web3.to_checksum_address(address)),
+            )
 
-    if os.path.exists("./app/migrate/RPC.json"):
-        for name, rpc_url in get_json("./app/migrate/RPC.json").items():
+    if os.path.exists("./app/migrate/pricefeeds/Mainnet_Pricefeeds.json"):
+        for name, address in get_json(
+            "./app/migrate/pricefeeds/Mainnet_Pricefeeds.json"
+        ).items():
+            db.execute(
+                "INSERT OR REPLACE INTO mainnet_pricefeeds (token, address) VALUES (?, ?)",
+                (name, address),
+            )
+    if os.path.exists("./app/migrate/pricefeeds/Sepolia_Pricefeeds.json"):
+        for name, address in get_json(
+            "./app/migrate/pricefeeds/Sepolia_Pricefeeds.json"
+        ).items():
+            db.execute(
+                "INSERT OR REPLACE INTO sepolia_pricefeeds (token, address) VALUES (?, ?)",
+                (name, address),
+            )
+    if os.path.exists("./app/migrate/pricefeeds/Bsc_Pricefeeds.json"):
+        for name, address in get_json(
+            "./app/migrate/pricefeeds/Bsc_Pricefeeds.json"
+        ).items():
+            db.execute(
+                "INSERT OR REPLACE INTO bsc_pricefeeds (token, address) VALUES (?, ?)",
+                (name, address),
+            )
+
+
+    if os.path.exists("./app/migrate/network/RPC.json"):
+        for name, rpc_url in get_json("./app/migrate/network/RPC.json").items():
             db.execute(
                 "INSERT OR REPLACE INTO rpcs (name, rpc_url) VALUES (?, ?)",
                 (name, rpc_url),
@@ -313,6 +365,8 @@ def get_token_address(chain_id: int, token: str) -> str:
         CHAIN_ID_ANVIL: "anvil_tokens",
         CHAIN_ID_MAINNET: "mainnet_tokens",
         CHAIN_ID_SEPOLIA: "sepolia_tokens",
+        CHAIN_ID_BSC: "bsc_tokens",
+        CHAIN_ID_CELO: "celo_tokens",
     }.get(chain_id)
     if table is None:
         raise ValueError(f"Unsupported chain_id: {chain_id}")
@@ -607,37 +661,26 @@ def get_supported_tokens(chat_id: int) -> list[str]:
 
 
 
-def get_pricefeed_id(token: str) -> str:
+def get_pricefeed_address(chat_id: int, token: str) -> str:
     """
-    Retrieves the Pyth price feed ID for a given token ticker.
+    Retrieves the price feed address for a specific token on the user's network.
 
-    Pyth feed IDs are network-agnostic — the same ID is valid on every chain Pyth
-    supports — so unlike token addresses, this lookup doesn't need a chain/network.
-
-    @param token  The token ticker symbol (e.g. "usdc", "weth").
-    @return       The Pyth price feed ID as a 0x-prefixed 32-byte hex string.
-    @raises ValueError  If the token has no registered feed.
+    @param chat_id  The Telegram chat ID of the user. Used to determine which network.
+    @param token    The token ticker symbol (e.g. "usdc", "weth").
+    @return  A single Chainlink feed address (e.g. "0xD10a...").
+    @raises ValueError  If the network is unsupported or the token has no feed.
     """
+    network = get_user_network(chat_id)
+    prefix = _NETWORK_DB_PREFIX.get(network)
+    if prefix is None:
+        raise ValueError(f"Unsupported network: '{network}'")
+    table = f"{prefix}_pricefeeds"
     row = get_db().execute(
-        "SELECT id FROM pricefeeds WHERE token = ?", (token.lower(),)
+        f"SELECT address FROM {table} WHERE token = ?", (token.lower(),)
     ).fetchone()
     if row is None:
-        raise ValueError(f"No price feed for token '{token}'")
-    return row["id"]
-
-
-def get_all_pricefeed_tokens() -> list[str]:
-    """
-    Returns every token ticker that has a registered Pyth feed.
-
-    Used to refresh the oracle's full price set in one shot rather than tracking which
-    specific tokens a given call touches — SHOracle's heartbeat gate means most calls skip
-    the actual on-chain update anyway, so there's no per-call cost to requesting all of them.
-
-    @return  A list of ticker strings (e.g. ["aave", "ape", ...]).
-    """
-    rows = get_db().execute("SELECT token FROM pricefeeds ORDER BY token ASC").fetchall()
-    return [row["token"] for row in rows]
+        raise ValueError(f"No price feed for token '{token}' on network '{network}'")
+    return row["address"]
 
 
 # ── Contacts ──────────────────────────────────────────────────────────────────

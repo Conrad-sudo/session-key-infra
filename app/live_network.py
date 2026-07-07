@@ -7,6 +7,10 @@ from network_config import load_network_config
 from contracts import (
     load_session_handler,
     load_entry_point,
+    load_session_handler_module,
+    pack_execution_calldata,
+    session_key_nonce_key,
+    ERC7579_SINGLE_CALL_MODE,
 )
 import db
 from vault_signer import encrypt_key, decrypt_key
@@ -259,14 +263,16 @@ def create_signed_user_op(
 
 
 def send_live_user_op_as_session(
-    chat_id: int, key_ciphertext: str, target: str, value: int, data: bytes, price_update_data: list[str] = []
+    chat_id: int, key_ciphertext: str, target: str, value: int, data: bytes
 ):
     """
     Orchestrates the full ERC-4337 UserOperation flow for a session key holder.
 
-    Encodes SessionHandler.execute() as the UserOp calldata, estimates gas via the
-    bundler, builds and signs a PackedUserOperation, submits it via eth_sendUserOperation,
-    and polls for inclusion via eth_getUserOperationReceipt.
+    Packs (target, value, data) into ERC-7579 executionCalldata and encodes
+    SessionHandler.execute(mode, executionCalldata) as the UserOp calldata, fetches a
+    nonce keyed to the installed SessionHandlerModule (so the account routes validation to
+    it), estimates gas via the bundler, builds and signs a PackedUserOperation, submits it
+    via eth_sendUserOperation, and polls for inclusion via eth_getUserOperationReceipt.
 
     No bundler EOA is required — the Alchemy bundler handles submission and gas payment.
 
@@ -275,9 +281,6 @@ def send_live_user_op_as_session(
     @param target         The contract address SessionHandler will call (e.g. USDC).
     @param value          The ETH value in wei to forward with the inner call.
     @param data           ABI-encoded inner calldata to execute on the target.
-    @param price_update_data Pyth update payload(s) from fetch_price_update_data(), or
-                          [] to skip the refresh (SessionHandler forwards this to
-                          SHOracle.updatePrices before computing USD values).
     @return               A tuple of (user_op_hash_bytes, receipt) where receipt["status"]
                           is 1 on success, matching the return shape of anvil.py for
                           compatibility with tools.py callers.
@@ -286,12 +289,18 @@ def send_live_user_op_as_session(
     rpc_url = str(w3.provider.endpoint_uri)
 
     session_handler = load_session_handler(chat_id=chat_id)
+    module = load_session_handler_module(chat_id=chat_id)
+
+    execution_calldata = pack_execution_calldata(target, value, data)
     calldata = session_handler.encode_abi(
-        abi_element_identifier="execute", args=[target, value, data, price_update_data]
+        abi_element_identifier="execute",
+        args=[ERC7579_SINGLE_CALL_MODE, execution_calldata],
     )
 
     entry_point = load_entry_point(chat_id=chat_id)
-    nonce = entry_point.functions.getNonce(session_handler.address, 0).call()
+    nonce = entry_point.functions.getNonce(
+        session_handler.address, session_key_nonce_key(module.address)
+    ).call()
 
     print("\n[1/3] Creating transaction  ...")
     user_op = create_unsigned_user_op(

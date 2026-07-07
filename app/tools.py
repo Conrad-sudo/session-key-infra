@@ -24,10 +24,7 @@ from anvil import (
 
 from live_network import send_live_user_op_as_session as _send_live_user_op_as_session
 
-from pyth import fetch_price_update_data
-from db import get_all_pricefeed_tokens
-
-from constants import ETH_SENTINEL, WEI_PER_ETH
+from constants import ETH_SENTINEL, WEI_PER_ETH, get_native_wrapped_ticker
 
 
 def _to_base_units(amount: float, decimals: int) -> int:
@@ -40,16 +37,10 @@ def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
     either the local Anvil backend (for fork/test networks) or the live Alchemy bundler
     (for all other networks), based on the chain name stored in the user's network config.
 
-    Every @tool function that submits an on-chain transaction calls this function. Before
-    dispatching, it checks SessionHandler.oracleIsUpToDate() — a cheap eth_call mirroring the
-    same heartbeat condition execute() itself uses — and only hits Hermes for a fresh price update
-    when the oracle's cache has actually gone stale. Whoever's transaction happens to land
-    after the heartbeat elapses pays to refresh it for everyone, so this avoids paying Hermes'
-    round-trip and the calldata cost of attaching update data on every single call. The full
+    Every @tool function that submits an on-chain transaction calls this function. The full
     ERC-4337 flow — gas estimation, signing, submission, and receipt polling — is handled by
-    the appropriate backend. RuntimeError from either backend or from the Hermes fetch is
-    converted to ToolException so LangChain's tool error handler can surface it to the agent
-    cleanly.
+    the appropriate backend. RuntimeError from either backend is converted to ToolException
+    so LangChain's tool error handler can surface it to the agent cleanly.
 
     @param chat_id        The Telegram chat ID of the user making the request.
     @param key_ciphertext Vault Transit ciphertext for the session key ('vault:v1:...').
@@ -58,27 +49,18 @@ def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
     @param data           ABI-encoded calldata for the inner call on target.
     @return               A tuple of (tx_hash_bytes, receipt_dict) where receipt_dict
                           contains at least {"status": 1} on success.
-    @raises ToolException If the UserOperation fails, the bundler rejects the submission,
-                          or the Hermes price fetch fails.
+    @raises ToolException If the UserOperation fails or the bundler rejects the submission.
     """
     _,_,chain_name = load_network_config(chat_id)
 
-    session_handler = load_session_handler(chat_id)
-    price_update_data = []
-    if not session_handler.functions.oracleIsUpToDate().call():
-        try:
-            price_update_data = fetch_price_update_data(get_all_pricefeed_tokens())
-        except (RuntimeError, ValueError) as e:
-            raise ToolException(f"Failed to fetch fresh price data: {e}")
-
     if "fork" in chain_name.lower() or "anvil" in chain_name.lower():
         try:
-            return _send_user_op_as_session(chat_id, key_ciphertext, target, value, data, price_update_data)
+            return _send_user_op_as_session(chat_id, key_ciphertext, target, value, data)
         except RuntimeError as e:
             raise ToolException(str(e))
     else:
         try:
-            return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data, price_update_data)
+            return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data)
         except RuntimeError as e:
             raise ToolException(str(e))
         
@@ -339,7 +321,7 @@ def get_session_keys(chat_id: int, token: str) -> tuple[str, str]:
     print("Running get_session_keys")
 
     if token == "uniswapv2_router":
-        target_address = load_session_handler(chat_id).functions.getUniswapRouter().call()
+        target_address = load_session_handler(chat_id).functions.getRouter().call()
     elif token == "eth":
         target_address = ETH_SENTINEL
     elif token == "reputation_registry":
@@ -616,24 +598,28 @@ def get_erc20_allowance(chat_id: int, token: str, spender: str) -> float:
 @tool
 def wrap_eth(chat_id: int, session_key_ciphertext: str, amount_eth: float):
     """
-    Wraps ETH into WETH by calling deposit() on the WETH contract.
+    Wraps native ETH/BNB into the chain's wrapped-native token (WETH on Ethereum, WBNB on
+    BSC) by calling deposit() on that contract.
 
-    Use this tool when the user wants to convert ETH to WETH. This does not go through
-    the Uniswap router — it is a direct 1:1 wrap on the WETH contract. Retrieve the
-    session key by calling get_session_keys("weth").
+    Use this tool when the user wants to convert native ETH/BNB to its wrapped form. This
+    does not go through the router — it is a direct 1:1 wrap. Retrieve the session key by
+    calling get_session_keys() with the chain's wrapped-native ticker (e.g. "weth" on
+    Ethereum, "wbnb" on BSC).
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         session_key_ciphertext: The Vault ciphertext for the session key authorized
-                                for the WETH contract. Obtain by calling get_session_keys("weth").
-        amount_eth: The amount of ETH to wrap, in whole units (e.g. 1.5 for 1.5 ETH).
+                                for the chain's wrapped-native contract. Obtain via
+                                get_session_keys() with that chain's wrapped-native ticker.
+        amount_eth: The amount of native ETH/BNB to wrap, in whole units (e.g. 1.5).
                     The tool converts this to wei internally before sending the transaction.
 
     Returns:
         A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running wrap_eth")
-    iweth = load_ierc20(chat_id, "weth")
+    _, chain_id, _ = load_network_config(chat_id)
+    iweth = load_ierc20(chat_id, get_native_wrapped_ticker(chain_id))
     value = _to_base_units(amount_eth, 18)
 
     data = load_calldata(
@@ -824,7 +810,8 @@ def get_quote_in(
 ) -> dict:
     """
     Returns how much of token_in is required to receive an exact amount of token_out,
-    using the Uniswap V2 router's getAmountsIn. Routes through WETH when neither token is WETH.
+    using the Uniswap V2 router's getAmountsIn. Routes through the chain's wrapped-native token
+    (WETH on Ethereum, WBNB on BSC) when neither token is the wrapped-native token.
 
     Use this tool when the user wants to know the cost of acquiring a specific amount of a token
     (e.g. "How much USDC do I need to buy exactly 100 DAI?"). Call this before a swap to give
@@ -849,18 +836,20 @@ def get_quote_in(
         Never expose path, amount_in_base, or amount_out_base.
     """
     print("Running get_amount_in")
-    token_in = "weth" if token_in.lower() == "eth" else token_in
-    token_out = "weth" if token_out.lower() == "eth" else token_out
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
+    token_in = native_wrapped if token_in.lower() == "eth" else token_in
+    token_out = native_wrapped if token_out.lower() == "eth" else token_out
     router = load_iuniswap_router(chat_id=chat_id)
     erc20_out = load_ierc20(chat_id=chat_id, token=token_out)
     erc20_in = load_ierc20(chat_id=chat_id, token=token_in)
     decimals_out = erc20_out.functions.decimals().call()
     decimals_in = erc20_in.functions.decimals().call()
     amount_out_base = _to_base_units(amount_out, decimals_out)
-    if token_in.lower() != "weth" and token_out.lower() != "weth":
+    if token_in.lower() != native_wrapped and token_out.lower() != native_wrapped:
         path = [
             erc20_in.address,
-            load_ierc20(chat_id, "weth").address,
+            load_ierc20(chat_id, native_wrapped).address,
             erc20_out.address,
         ]
     else:
@@ -889,7 +878,8 @@ def get_quote_out(
 ) -> dict:
     """
     Returns how much of token_out will be received when spending an exact amount of token_in,
-    using the Uniswap V2 router's getAmountsOut. Routes through WETH when neither token is WETH.
+    using the Uniswap V2 router's getAmountsOut. Routes through the chain's wrapped-native token
+    (WETH on Ethereum, WBNB on BSC) when neither token is the wrapped-native token.
 
     Use this tool when the user wants to know how much they'll receive for a given spend
     (e.g. "How much DAI will I get for 100 USDC?"). Call this before a swap to give
@@ -914,18 +904,20 @@ def get_quote_out(
         Never expose path, amount_in_base, or amount_out_base.
     """
     print("Running get_amount_out")
-    token_in = "weth" if token_in.lower() == "eth" else token_in
-    token_out = "weth" if token_out.lower() == "eth" else token_out
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
+    token_in = native_wrapped if token_in.lower() == "eth" else token_in
+    token_out = native_wrapped if token_out.lower() == "eth" else token_out
     router = load_iuniswap_router(chat_id=chat_id)
     erc20_out = load_ierc20(chat_id=chat_id, token=token_out)
     erc20_in = load_ierc20(chat_id=chat_id, token=token_in)
     decimals_out = erc20_out.functions.decimals().call()
     decimals_in = erc20_in.functions.decimals().call()
     amount_in_base = _to_base_units(amount_in, decimals_in)
-    if token_in.lower() != "weth" and token_out.lower() != "weth":
+    if token_in.lower() != native_wrapped and token_out.lower() != native_wrapped:
         path = [
             erc20_in.address,
-            load_ierc20(chat_id, "weth").address,
+            load_ierc20(chat_id, native_wrapped).address,
             erc20_out.address,
         ]
     else:
@@ -950,7 +942,7 @@ def get_quote_out(
 
 @tool
 def get_liquidity_token_balance(
-    chat_id: int, token_a: str, token_b: str = "weth"
+    chat_id: int, token_a: str, token_b: str | None = None
 ) -> float:
     """
     Retrieves the smart wallet's balance of Uniswap V2 liquidity tokens for a given pair.
@@ -962,12 +954,16 @@ def get_liquidity_token_balance(
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         token_a: The ticker symbol of the first token in the pair (e.g. "dai").
-        token_b: The ticker symbol of the second token in the pair. Defaults to "weth".
+        token_b: The ticker symbol of the second token in the pair. Defaults to the chain's
+                 wrapped-native token (WETH on Ethereum, WBNB on BSC).
 
     Returns:
         The wallet's balance of liquidity tokens for the specified pair, in whole units (e.g. 10.5).
     """
     print("Running get_liquidity_token_balance")
+    if token_b is None:
+        _, chain_id, _ = load_network_config(chat_id)
+        token_b = get_native_wrapped_ticker(chain_id)
     pair = load_iuniswap_pair(chat_id, token_a, token_b)
     address = load_session_handler(chat_id).address
     pair_address = pair.address
@@ -1009,10 +1005,12 @@ def is_derived_input_sufficient(
     else:
         balance = get_erc20_balance.func(chat_id, token_in)
 
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     if token_in.lower() == "eth":
-        token_in = "weth"
+        token_in = native_wrapped
     if token_out.lower() == "eth":
-        token_out = "weth"
+        token_out = native_wrapped
 
     quote = get_quote_in.func(chat_id, token_in, token_out, amount_out)
 
@@ -1061,22 +1059,25 @@ def is_liquidity_sufficient(
     Checks whether the wallet holds enough of both tokens to add liquidity to a Uniswap V2 pool.
 
     Derives the required token_b amount from live pool reserves via get_pool_quote internally —
-    no need to pre-compute it. Pass "eth" as token_b when the pool pairs an ERC20 with native ETH
-    (i.e. for add_liquidity_eth); the function maps "eth" to "weth" for the reserve lookup and
-    checks the ETH balance accordingly.
+    no need to pre-compute it. Pass "eth" as token_b when the pool pairs an ERC20 with native
+    ETH/BNB (i.e. for add_liquidity_eth); the function maps "eth" to the chain's wrapped-native
+    ticker (WETH on Ethereum, WBNB on BSC) for the reserve lookup and checks the native balance
+    accordingly.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         token_a: The ticker of the first token (e.g. "dai").
         amount_a: The desired token_a deposit amount in whole units.
-        token_b: The ticker of the second token (e.g. "weth"), or "eth" for native ETH.
+        token_b: The ticker of the second token (e.g. "weth" on Ethereum, "wbnb" on BSC), or
+                 "eth" for native ETH/BNB.
 
     Returns:
         A dict with:
           - is_sufficient (bool): True if the wallet holds enough of both tokens, False otherwise.
           - amount_b (float): The proportional token_b amount required, in whole units.
     """
-    quote_token_b = "weth" if token_b.lower() == "eth" else token_b
+    _, chain_id, _ = load_network_config(chat_id)
+    quote_token_b = get_native_wrapped_ticker(chain_id) if token_b.lower() == "eth" else token_b
     quote = get_pool_quote.func(chat_id, token_a, quote_token_b, amount_a)
     amount_b = quote["amount_b_desired"]
 
@@ -1105,7 +1106,7 @@ def is_liquidity_removal_sufficient(
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         token_a: The ticker of the first token in the pair (e.g. "dai").
-        token_b: The ticker of the second token in the pair (e.g. "weth").
+        token_b: The ticker of the second token in the pair (e.g. "weth" on Ethereum, "wbnb" on BSC).
         lp_amount: The amount of LP tokens to burn, in whole units (e.g. 0.5).
 
     Returns:
@@ -1124,13 +1125,14 @@ def get_pool_quote(chat_id: int, token_a: str, token_b: str, amount_a: float) ->
 
     Use this tool when the user wants to preview how much of the second token they need to
     provide before adding liquidity (e.g. "How much ETH do I need to pair with 2500 DAI?").
-    For ETH pools, pass token_b="weth". When presenting the result to the user, only show
-    amount_a and amount_b_desired — never expose token addresses or base-unit fields.
+    For native-paired pools, pass token_b as the chain's wrapped-native ticker ("weth" on
+    Ethereum, "wbnb" on BSC). When presenting the result to the user, only show amount_a and
+    amount_b_desired — never expose token addresses or base-unit fields.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         token_a: The ticker of the first token (e.g. "dai").
-        token_b: The ticker of the second token (e.g. "weth").
+        token_b: The ticker of the second token (e.g. "weth" on Ethereum, "wbnb" on BSC).
         amount_a: The amount of token_a to deposit, in whole units (e.g. 2500 for 2500 DAI).
 
     Returns:
@@ -1188,14 +1190,15 @@ def get_lp_amounts(chat_id: int, token_a: str, token_b: str, lp_amount: float) -
     remove_liquidity and remove_liquidity_eth tools.
 
     Use this tool when the user wants to preview how much they'll receive before removing
-    liquidity (e.g. "How much DAI and ETH will I get back for 0.5 LP tokens?"). For ETH
-    pools, pass token_b="weth". When presenting the result to the user, only show
-    expected_a and expected_b — never expose token addresses, base-unit fields, or liquidity.
+    liquidity (e.g. "How much DAI and ETH will I get back for 0.5 LP tokens?"). For native-paired
+    pools, pass token_b as the chain's wrapped-native ticker ("weth" on Ethereum, "wbnb" on BSC).
+    When presenting the result to the user, only show expected_a and expected_b — never expose
+    token addresses, base-unit fields, or liquidity.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         token_a: The ticker of the first token in the pair (e.g. "dai").
-        token_b: The ticker of the second token in the pair (e.g. "weth").
+        token_b: The ticker of the second token in the pair (e.g. "weth" on Ethereum, "wbnb" on BSC).
         lp_amount: The amount of LP tokens to burn, in whole units (e.g. 0.5).
 
     Returns:
@@ -1278,8 +1281,10 @@ def swap_ETH_for_exact_tokens(
              ETH spent, and amount of token_out received.
     """
     print("Running swap_ETH_for_exact_tokens")
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
-    quote = get_quote_in.func(chat_id, "weth", token_out, amount_out)
+    quote = get_quote_in.func(chat_id, native_wrapped, token_out, amount_out)
     derived_check = is_derived_input_sufficient.func(
         chat_id, "eth", token_out, amount_out, slippage_bps
     )
@@ -1509,8 +1514,10 @@ def swap_exact_tokens_for_ETH(
     if not is_exact_input_sufficient.func(chat_id, token_in, amount_in):
         raise ToolException(f"Insufficient {token_in.upper()} balance for this swap.")
 
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
-    quote = get_quote_out.func(chat_id, token_in, "weth", amount_in)
+    quote = get_quote_out.func(chat_id, token_in, native_wrapped, amount_in)
 
     amount_out_min = int(
         quote["amount_out_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
@@ -1582,8 +1589,10 @@ def swap_tokens_for_exact_ETH(
              amount of token_in spent, and ETH received.
     """
     print("Running swap_tokens_for_exact_ETH")
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
-    quote = get_quote_in.func(chat_id, token_in, "weth", amount_out_eth)
+    quote = get_quote_in.func(chat_id, token_in, native_wrapped, amount_out_eth)
     derived_check = is_derived_input_sufficient.func(
         chat_id, token_in, "eth", amount_out_eth, slippage_bps
     )
@@ -1666,8 +1675,10 @@ def swap_exact_ETH_for_tokens(
     if not is_exact_input_sufficient.func(chat_id, "eth", eth_amount_in):
         raise ToolException(f"Insufficient ETH balance for this swap.")
 
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
-    quote = get_quote_out.func(chat_id, "weth", token_out, eth_amount_in)
+    quote = get_quote_out.func(chat_id, native_wrapped, token_out, eth_amount_in)
 
     amount_out_min = int(
         quote["amount_out_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
@@ -1712,7 +1723,7 @@ def add_liquidity(
     session_key_ciphertext: str,
     token_a: str,
     amount_a: float,
-    token_b: str = "weth",
+    token_b: str | None = None,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
@@ -1732,8 +1743,9 @@ def add_liquidity(
         token_a: The ticker symbol of the first token to deposit (e.g. "dai").
         amount_a: The desired amount of token_a to deposit, in whole units (e.g. 2500 for 2500 DAI).
                   The proportional token_b amount is computed from pool reserves automatically.
-        token_b: The ticker symbol of the second token to deposit. Defaults to "weth", which is
-                 the standard pairing on Uniswap V2. Only override if depositing into a non-WETH pair.
+        token_b: The ticker symbol of the second token to deposit. Defaults to the chain's
+                 wrapped-native token (WETH on Ethereum, WBNB on BSC), the standard pairing.
+                 Only override if depositing into a non-wrapped-native pair.
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). Applied to
                       both amountAMin and amountBMin. Defaults to 50 bps.
 
@@ -1741,6 +1753,9 @@ def add_liquidity(
         A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running add_liquidity")
+    if token_b is None:
+        _, chain_id, _ = load_network_config(chat_id)
+        token_b = get_native_wrapped_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
     quote = get_pool_quote.func(chat_id, token_a, token_b, amount_a)
 
@@ -1805,10 +1820,11 @@ def add_liquidity_eth(
     Adds liquidity to a Uniswap V2 token/ETH pool via addLiquidityETH. The user specifies
     the ERC20 token and an amount; the proportional ETH amount is derived from live pool
     reserves via router.quote() so the deposit always matches the current pool ratio. ETH
-    is forwarded directly as msg.value — no prior WETH wrapping is required.
+    is forwarded directly as msg.value — no prior wrapping is required.
 
     Use this tool when the user wants to add liquidity to a Uniswap V2 pool using raw ETH
-    (as opposed to WETH). The session key must be authorized for the Uniswap router. Retrieve
+    (as opposed to the chain's wrapped-native token). The session key must be authorized for
+    the Uniswap router. Retrieve
     it by calling get_session_keys("uniswapv2_router") before calling this tool. The token
     must already have its ERC20 allowance set for the router so it can pull the token amount.
 
@@ -1828,8 +1844,10 @@ def add_liquidity_eth(
         token min deposited, and ETH min deposited.
     """
     print("Running add_liquidity_eth")
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     router = load_iuniswap_router(chat_id)
-    quote = get_pool_quote.func(chat_id, token, "weth", amount_token)
+    quote = get_pool_quote.func(chat_id, token, native_wrapped, amount_token)
 
     liquidity_check = is_liquidity_sufficient.func(chat_id, token, amount_token, "eth")
     if not liquidity_check["is_sufficient"]:
@@ -1884,7 +1902,7 @@ def remove_liquidity(
     session_key_ciphertext: str,
     token_a: str,
     lp_amount: float,
-    token_b: str = "weth",
+    token_b: str | None = None,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
 ):
     """
@@ -1908,7 +1926,8 @@ def remove_liquidity(
         token_a: The ticker symbol of the first token in the pair (e.g. "dai").
         lp_amount: The amount of LP tokens to burn, in whole units (e.g. 0.5 for 0.5 LP tokens).
                    The tool converts this to base units using the pair's decimals internally.
-        token_b: The ticker symbol of the second token in the pair. Defaults to "weth".
+        token_b: The ticker symbol of the second token in the pair. Defaults to the chain's
+                 wrapped-native token (WETH on Ethereum, WBNB on BSC).
         slippage_bps: Maximum acceptable slippage in basis points (e.g. 50 = 0.5%). Applied
                       as a downward buffer on amountAMin and amountBMin. Defaults to 50 bps.
 
@@ -1916,6 +1935,9 @@ def remove_liquidity(
         A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running remove_liquidity")
+    if token_b is None:
+        _, chain_id, _ = load_network_config(chat_id)
+        token_b = get_native_wrapped_ticker(chain_id)
     if not is_liquidity_removal_sufficient.func(chat_id, token_a, token_b, lp_amount):
         raise ToolException(
             "Insufficient LP tokens. Use get_liquidity_token_balance to check your balance."
@@ -1976,7 +1998,7 @@ def remove_liquidity_eth(
     specifies the ERC20 token and the LP amount to burn; expected return amounts for the
     token and ETH are derived from live reserves using the proportional share formula
     (liquidity * reserve / totalSupply). Slippage is applied downward to compute
-    amountTokenMin and amountETHMin. The router unwraps the WETH share to raw ETH before
+    amountTokenMin and amountETHMin. The router unwraps the wrapped-native share to raw ETH/BNB before
     sending it back to the wallet.
 
     Use this tool when the user wants to remove liquidity from a token/ETH pool and receive
@@ -2002,13 +2024,15 @@ def remove_liquidity_eth(
         A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running remove_liquidity_eth")
-    if not is_liquidity_removal_sufficient.func(chat_id, token, "weth", lp_amount):
+    _, chain_id, _ = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
+    if not is_liquidity_removal_sufficient.func(chat_id, token, native_wrapped, lp_amount):
         raise ToolException(
             "Insufficient LP tokens. Use get_liquidity_token_balance to check your balance."
         )
 
     router = load_iuniswap_router(chat_id)
-    lp = get_lp_amounts.func(chat_id, token, "weth", lp_amount)
+    lp = get_lp_amounts.func(chat_id, token, native_wrapped, lp_amount)
 
     amount_token_min = int(
         lp["expected_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR

@@ -5,10 +5,10 @@ import {Test} from "forge-std/Test.sol";
 import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
+import {SessionHandlerModule} from "../../src/SessionHandlerModule.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {SendPackedUserOp} from "../../script/SendPackedUserOp.s.sol";
 import {DeploySHProtocol} from "../../script/DeploySHProtocol.s.sol";
-import {PriceUpdate} from "../../script/PriceUpdate.s.sol";
 import {SHOracle} from "../../src/SHOracle.sol";
 import {SHRegistry} from "../../src/SHRegistry.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
@@ -17,13 +17,23 @@ import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
 import {IReputationRegistry} from "../../src/interfaces/IReputationRegistry.sol";
 import {IIdentityRegistry} from "../../src/interfaces/IIdentityRegistry.sol";
 
+/**
+ * @title SHSepoliaTest
+ * @notice Integration test suite for SessionHandler's session-key enforcement against real
+ *         Sepolia contracts (LINK, the ERC-8004 Identity/Reputation Registries).
+ * @dev The Reputation Registry isn't a priced token, so SHValueInterpreter can't price calls to
+ *      it (SHOracle has no feed for it). Sessions targeting it use addUnpricedSessionKey, which
+ *      registers a session that skips pricing/budget tracking entirely while still enforcing
+ *      target + selector allowlisting. See registrySessionAdded and SessionHandlerModule's
+ *      top-level comment.
+ */
 contract SHSepoliaTest is Test {
     SHOracle oracle;
     SHRegistry feeRegistry;
     HelperConfig.NetworkConfig config;
     SessionHandler sessionHandler;
+    SessionHandlerModule spendingLimitModule;
     SendPackedUserOp sendPackedUserOp;
-    PriceUpdate priceUpdate;
     address user;
     uint256 privateKey;
     address kani = makeAddr("kani");
@@ -46,9 +56,9 @@ contract SHSepoliaTest is Test {
     }
 
     /**
-     * @dev Adds a standard ERC20 transfer session for `user` on the `usdc` mock token.
-     *      Grants access to ERC20Mock.transfer only, within a 1-day window, with BUDGET spending limit.
-     *      Used by tests that need a valid active session without ETH value transfers.
+     * @dev Adds a standard ERC20 transfer session for `user` on the `link` token.
+     *      Grants access to transfer/transferFrom/approve, within a 1-day window, with BUDGET
+     *      spending limit.
      */
     modifier linkSessionAdded() {
         address sessionKey = user;
@@ -68,6 +78,8 @@ contract SHSepoliaTest is Test {
         _;
     }
 
+    /// @dev Uses addUnpricedSessionKey, not addSessionKey — the Reputation Registry isn't a priced
+    ///      token, and SessionHandlerModule now exposes an explicit opt-out for exactly this case.
     modifier registrySessionAdded() {
         address sessionKey = user;
         address target = config.reputationRegistry;
@@ -75,10 +87,9 @@ contract SHSepoliaTest is Test {
         sel[0] = IReputationRegistry.giveFeedback.selector;
         uint48 validFrom = uint48(block.timestamp);
         uint48 validUntil = uint48(block.timestamp + 1 days);
-        uint256 spendingLimit = 0;
 
         vm.prank(sessionHandler.owner());
-        sessionHandler.addSessionKey(sessionKey, target, sel, validFrom, validUntil, spendingLimit);
+        sessionHandler.addUnpricedSessionKey(sessionKey, target, sel, validFrom, validUntil);
         _;
     }
 
@@ -88,12 +99,11 @@ contract SHSepoliaTest is Test {
         SHTreasury treasury;
         (factory, treasury, config, oracle) = deployer.run();
         feeRegistry = SHRegistry(treasury.REGISTRY());
+        spendingLimitModule = SessionHandlerModule(factory.spendingLimitModule());
         vm.prank(config.account);
         sessionHandler = SessionHandler(payable(factory.deployWallet()));
         (user, privateKey) = makeAddrAndKey("user");
         sendPackedUserOp = new SendPackedUserOp();
-        priceUpdate = new PriceUpdate();
-        priceUpdate.updateOracle(address(oracle));
         vm.deal(address(sessionHandler), 10 ether);
         deal(config.link, address(sessionHandler), 10000e18);
 
@@ -114,12 +124,10 @@ contract SHSepoliaTest is Test {
         uint256 value = 1 ether;
         uint256 valueInUsd = oracle.getUsdValue(address(0), value);
 
-        bytes memory data = ""; // No data needed for native ETH transfer
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, value, "", user, privateKey
+        );
 
         packedUserOp[0] = userOp;
 
@@ -142,15 +150,13 @@ contract SHSepoliaTest is Test {
     function testTransferERC20WithSession() public linkSessionAdded {
         address dest = config.link;
         uint256 amountToTransfer = 20e18;
-        uint256 value = 0;
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(IERC20.transfer.selector, user, amountToTransfer);
-        bytes memory callData =
-            abi.encodeWithSelector(SessionHandler.execute.selector, dest, value, data, new bytes[](0));
 
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+        );
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 10 minutes);
@@ -161,13 +167,13 @@ contract SHSepoliaTest is Test {
     }
 
     /**
-     * @notice Session keys with access to the Reputation Registry can successfully submit feedback
-     * @dev Adds a session key with permission to call giveFeedback on the Reputation Registry.
-     *      Constructs a UserOp that calls giveFeedback via the session key, and submits it through the EntryPoint.
-     *      Verifies the feedback is recorded in the Reputation Registry by reading it back.
+     * @notice Session keys with an unpriced session on the Reputation Registry can successfully
+     *         submit feedback through SessionHandler.
+     * @dev Uses addUnpricedSessionKey (see registrySessionAdded), which skips
+     *      SHValueInterpreter/SHOracle pricing entirely instead of trying and reverting on
+     *      SHOracle_UnsupportedToken -- see SessionHandlerModule's Session.pricingExempt.
      */
     function testGiveFeedbackWithSession() public registrySessionAdded {
-        uint256 value = 0;
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(
             IReputationRegistry.giveFeedback.selector,
@@ -181,11 +187,16 @@ contract SHSepoliaTest is Test {
             // forge-lint: disable-next-line(unsafe-typecast)
             bytes32("feedbackHash")
         );
-        bytes memory callData = abi.encodeWithSelector(
-            SessionHandler.execute.selector, config.reputationRegistry, value, data, new bytes[](0)
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler),
+            config,
+            address(spendingLimitModule),
+            config.reputationRegistry,
+            0,
+            data,
+            user,
+            privateKey
         );
-        (PackedUserOperation memory userOp,,) =
-            sendPackedUserOp.generateSignedUserOp(address(sessionHandler), config, callData, user, privateKey);
         packedUserOp[0] = userOp;
 
         vm.warp(block.timestamp + 10 minutes);

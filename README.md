@@ -1,6 +1,6 @@
 # SessionHandler Protocol 🤖⛓️
 
-A capability-based delegation system built on ERC-4337 account abstraction. Each user instantiates a smart-contract account via `SHFactory` and grants scoped, time-bounded, rate-limited signing authority to ephemeral session keys — enabling an autonomous agent to construct and authorize transactions on the owner's behalf from natural-language instructions, without gaining custody of the owner's root private key. Session keys can be scoped to ERC20 primitives (transfer, approve) and DeFi primitives such as Uniswap V2 swaps and liquidity provisioning, with spend caps enforced in USD terms via on-chain price oracles.
+A capability-based delegation system built on **ERC-7579** modular account abstraction. Each user instantiates a smart-contract account via `SHFactory` and grants scoped, time-bounded, rate-limited signing authority to ephemeral session keys — enabling an autonomous agent to construct and authorize transactions on the owner's behalf from natural-language instructions, without gaining custody of the owner's root private key. Session keys can be scoped to ERC20 primitives (transfer, approve) and DeFi primitives such as Uniswap/PancakeSwap V2 swaps and liquidity provisioning, with spend caps enforced in USD terms via Chainlink price feeds.
 
 The protocol is composed of five layers: Solidity smart contracts, a Python blockchain interface, HashiCorp Vault (key custody), a LangChain AI agent, and a Telegram bot front end. It also integrates the **ERC-8004** canonical on-chain agent identity and reputation registries.
 
@@ -12,13 +12,13 @@ The protocol is composed of five layers: Solidity smart contracts, a Python bloc
 ├─────────────────────────────────┤
 │     Blockchain Interface        │  ← web3.py builds and submits UserOps
 ├─────────────────────────────────┤
-│    ERC-4337 Smart Contracts     │  ← SessionHandler validates and executes
+│    ERC-7579 Smart Contracts     │  ← SessionHandler (account) + SessionHandlerModule (session logic)
 ├─────────────────────────────────┤
 │  HashiCorp Vault (Docker)       │  ← Transit encrypt/decrypt for session keys
 └─────────────────────────────────┘
 ```
 
-**Network support:** Anvil (local), mainnet fork, Sepolia fork, and live Sepolia testnet.
+**Network support:** Anvil (local), Ethereum mainnet fork, Sepolia fork, live Sepolia testnet, BSC (mainnet + fork, via PancakeSwap V2). Celo has partial Python-side scaffolding but no Solidity deployment path yet — see [docs/app.md](docs/app.md).
 
 ---
 
@@ -32,16 +32,17 @@ The protocol is composed of five layers: Solidity smart contracts, a Python bloc
          │  signs UserOps with scoped session keys (via HashiCorp Vault)
          ▼
    ERC-4337 EntryPoint
-         │ validateUserOp / execute
+         │ validateUserOp / preCheck+execute
          ▼
-   SessionHandler  (per-user smart account)
-         ├─ reads config at runtime ──▶  SHRegistry
-         │                               (fee, treasury, oracle, agentId, router, interpreter)
-         ├─ USD computation ──────────▶  SHValueInterpreter → SHOracle (Pyth Network)
+   SessionHandler  (per-user ERC-7579 smart account)
+         ├─ delegates session-key logic ──▶  SessionHandlerModule (Validator + Hook)
+         │                                    ├─ reads config at runtime ──▶ SHRegistry
+         │                                    │                              (fee, treasury, oracle, agentId, router, interpreter)
+         │                                    └─ USD computation ──────────▶ SHValueInterpreter → SHOracle (Chainlink)
          ├─ protocol fee ─────────────▶  SHTreasury (owns SHRegistry)
          └─ identity / reputation ────▶  ERC-8004 Registries
 
-   SHFactory  (deploys new SessionHandlers on demand)
+   SHFactory  (deploys new SessionHandlers on demand, installs SessionHandlerModule as both Validator + Hook)
 ```
 
 ### Contract Hierarchy
@@ -49,12 +50,14 @@ The protocol is composed of five layers: Solidity smart contracts, a Python bloc
 ```
 SHTreasury  (protocol operator — owns SHRegistry)
     └── SHRegistry  (fee, treasury, oracle, agentId, router, interpreter)
-              ├── SHOracle           (Pyth Network USD price feeds)
+              ├── SHOracle           (Chainlink USD price feeds)
               └── SHValueInterpreter (calldata → USD debit/credit)
 
 SHFactory   (user-facing factory)
-    └── SessionHandler  (per-user ERC-4337 smart account)
-              reads ──▶ SHRegistry  (at execution time)
+    └── SessionHandler  (per-user ERC-7579 smart account, sequential walletId)
+              installs (Validator + Hook) ──▶ SessionHandlerModule
+                                                (all session-key state and USD enforcement)
+              reads ──▶ SHRegistry  (via SessionHandlerModule, at execution time)
               pays  ──▶ SHTreasury  (protocol fee per session-key execution)
 ```
 
@@ -67,7 +70,7 @@ SHFactory   (user-facing factory)
 - Python 3.12+
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - An Anthropic API key (or any [LangChain-supported LLM provider](https://python.langchain.com/docs/integrations/chat/))
-- An Alchemy API key (required for live Sepolia and mainnet fork)
+- An Alchemy API key (required for live Sepolia, mainnet fork, and BSC fork)
 
 ## Clone and Install
 
@@ -78,14 +81,13 @@ cd sh-protocol
 # Foundry dependencies
 forge install
 
-# Node dependencies (Pyth Solidity SDK, used by SHOracle)
-npm install
-
 # Python dependencies
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+> No Node/npm install step is required — `SHOracle` uses Chainlink price feeds (`lib/chainlink-brownie-contracts`, installed via `forge install`), not a JS-toolchain dependency.
 
 ---
 

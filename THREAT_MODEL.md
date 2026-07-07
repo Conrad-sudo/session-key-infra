@@ -38,17 +38,17 @@
 
 ---
 
-### 3.2 Uniswap Spending Limit Enforcement
+### 3.2 Uniswap/PancakeSwap Spending Limit Enforcement
 **Status: Mitigated.**  
-`_validateSession` decodes calldata via inline assembly for all six Uniswap V2 swap functions (`swapExactTokensForTokens`, `swapTokensForExactTokens`, `swapExactTokensForETH`, `swapTokensForExactETH`, `swapExactETHForTokens`, `swapETHForExactTokens`) plus `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, and `removeLiquidityETH`. The extracted token amounts are priced via `SHOracle.getUSDValue()` and charged against `spentAmount` before validation succeeds.  
-**Residual risk:** `swapETHForExactTokens` charges the full forwarded `msg.value` against the budget, not the actual ETH consumed — the Uniswap router refunds unused ETH but the budget is decremented by the full amount. This is conservative (over-charges the session) rather than exploitable. See §3.8.
+`SHValueInterpreter.computeUsdValue()` (called from `SessionHandlerModule.preCheck`, the ERC-7579 Hook entrypoint) decodes calldata via inline assembly for all six Uniswap V2-shaped swap functions (`swapExactTokensForTokens`, `swapTokensForExactTokens`, `swapExactTokensForETH`, `swapTokensForExactETH`, `swapExactETHForTokens`, `swapETHForExactTokens`) plus `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, and `removeLiquidityETH`. This is DEX-agnostic — the same code path applies identically to Uniswap V2 on mainnet and PancakeSwap V2 on BSC, since both expose the same router ABI. The extracted token amounts are priced via `SHOracle.getUsdValue()` and charged against `spentAmount` before the inner call is allowed to proceed.  
+**Residual risk:** `swapETHForExactTokens` charges the full forwarded `msg.value` against the budget, not the actual ETH/BNB consumed — the router refunds unused native asset but the budget is decremented by the full amount. This is conservative (over-charges the session) rather than exploitable. See §3.8.
 
 ---
 
 ### 3.3 Price Oracle — Staleness
-**Threat:** A stale Pyth feed (e.g. nobody has pushed an update recently) could cause USD value calculations to be incorrect — either allowing overspending or incorrectly rejecting valid operations.  
-**Mitigation in place:** `SHOracle._stalePriceCheck()` reverts with `SHOracle_StalePrice` if a feed's `getPriceUnsafe()` reading is older than `heartbeat` — a single value shared across every registered token (24 hours on mainnet/Sepolia, 1 hour on Anvil), set once at construction. `SHOracle.updatePrices(bytes[] updateData)` pushes a fresh, Hermes-signed update on-chain and is callable by anyone; the fee is paid from the oracle's own ETH balance, so callers never need to attach value. `SessionHandler.execute()` forwards any `priceUpdateData` it's given to `updatePrices()` automatically, but only when `block.timestamp - SHOracle.lastUpdated() >= heartbeat` — whoever's transaction happens to land after the heartbeat elapses pays to refresh the price for everyone, so most calls skip the refresh (and its fee) entirely. `SessionHandler.oracleIsUpToDate()` exposes that same check so the off-chain bot can decide whether to fetch fresh data from Hermes before submitting a UserOp at all.  
-**Residual risk:** Low. A 24-hour window means a fast-moving token could meaningfully diverge from its on-chain price within the window before someone's transaction triggers a refresh. `updatePrices()` being permissionless means anyone can pay to refresh early if this matters for a specific operation.
+**Threat:** A stale Chainlink feed (e.g. the feed's underlying node network hasn't pushed an update within its heartbeat) could cause USD value calculations to be incorrect — either allowing overspending or incorrectly rejecting valid operations.  
+**Mitigation in place:** `SHOracle._stalePriceCheck()` reverts with `SHOracle_StalePrice` if `block.timestamp - updatedAt > heartbeat` for that specific feed, where `updatedAt` comes from `AggregatorV3Interface.latestRoundData()`. Unlike a single protocol-wide value, **each registered feed has its own heartbeat**, set once at construction from `HelperConfig`'s per-token heartbeat table — volatile assets (ETH, LINK, BTC) typically use a ~1 hour heartbeat, stablecoins 23–24 hours, matching Chainlink's own published cadence per feed. Chainlink nodes push updates automatically off-chain; there's no on-chain refresh call or fee for `SessionHandler` or its owner to manage.  
+**Residual risk:** Low under normal operation — Chainlink's decentralized oracle network is expected to keep feeds within their heartbeat continuously. A genuinely stale feed (e.g. during a Chainlink network incident) blocks any operation pricing that token entirely (a hard revert, not silent overspending) until the feed updates again.
 
 ---
 
@@ -66,15 +66,15 @@
 ---
 
 ### 3.6 State Mutation in `validateUserOp`
-**Threat:** `_validateSession` writes to EIP-1153 transient storage slots inside `validateUserOp`. The EntryPoint calls `validateUserOp` during simulation — if simulation triggers state writes, the actual execution may behave differently than simulated.  
-**Status: Mitigated.** Transient storage slots (`tPendingSessionKey`, `tPendingSelector`) are scoped to the sender account and are zeroed automatically at transaction end. ERC-4337 v0.7 simulation rules permit transient storage writes by the account itself. Verified against a live Alchemy bundler on Ethereum Sepolia — UserOps pass simulation and execute correctly with no bundler rejection.
+**Threat:** `SessionHandlerModule._validateSession` writes to an EIP-1153 transient storage slot inside `validateUserOp`. The EntryPoint calls `validateUserOp` during simulation — if simulation triggers state writes, the actual execution may behave differently than simulated.  
+**Status: Mitigated.** The transient slot (`keccak256(abi.encode("SessionHandlerModule.pendingSession", account))`) is scoped per-account and zeroed automatically at transaction end. `SessionHandlerModule` is installed as both Validator and Hook on the same contract instance specifically so this transient-storage bridge works — EIP-1153 storage is scoped per contract address, and a validator/hook split across two different contracts couldn't share it this way. ERC-4337 v0.7 simulation rules permit transient storage writes by the account itself (a validator module is treated as part of the account for this purpose). Verified against a live Alchemy bundler on Ethereum Sepolia — UserOps pass simulation and execute correctly with no bundler rejection.
 
 ---
 
 ### 3.7 Owner Key — Full Execution Access
-**Threat:** The owner can call `execute()` directly for any arbitrary call. A compromised owner key gives an attacker full control over all funds.  
-**Mitigation in place:** `Ownable`, `Pausable` (owner can pause the contract).  
-**Residual risk:** There is no time-lock or multi-sig on owner actions. A compromised owner key has no recovery path.
+**Threat:** The owner can call `execute()` directly for any arbitrary call (via the `onlyEntryPointOrSelfOrOwner` escape hatch — a deliberate deviation from stock ERC-7579 accounts, which normally restrict `execute`/`installModule`/`uninstallModule` to `onlyEntryPointOrSelf`). A compromised owner key gives an attacker full control over all funds, and can also install or uninstall arbitrary ERC-7579 modules on the account. Session management (`addSessionKey`, `addUnpricedSessionKey`, `revokeSessionKey`) is gated by a plain `onlyOwner`, independent of the EntryPoint-or-self path.  
+**Mitigation in place:** `Ownable`, `Pausable` (owner can pause the contract). `SessionHandler` has no owner-signed UserOp path at all — the only installed validator (`SessionHandlerModule`) rejects any signer that isn't a registered session key, so a compromised owner key cannot be used to forge a UserOp through the EntryPoint; it can only act via direct calls to the account.  
+**Residual risk:** There is no time-lock or multi-sig on owner actions. A compromised owner key has no recovery path, and can install a malicious module (including one impersonating a validator) since `installModule` is owner-callable.
 
 ---
 
@@ -85,10 +85,10 @@
 
 ---
 
-### 3.9 Reputation Registry Calls Skip Budget Tracking and Auto-Cleanup
-**Threat:** `execute()` skips its entire budget-debit/credit block — including the auto-revocation check that fires when a session has expired or exhausted its budget — whenever `dest == REPUTATION_REGISTRY`. This avoids a pre-existing issue where pricing a non-token destination (any call with ≥68 bytes of calldata to a contract with no registered Pyth feed) would revert with `SHOracle_UnsupportedToken`.  
-**Impact:** A session scoped only to the Reputation Registry never self-revokes via the `execute()` path on expiry — it just sits inactive (still rejected by `isSessionActive`/`_isSessionUsable` at validation time) until something else touches it. Reputation Registry sessions are already required to use a `spendingLimit` of `0` (see `addSessionKey`'s exemption), so there's no budget to track in the first place.  
-**Residual risk:** Low — no funds or spending authority are affected, since `giveFeedback` and related calls move no value and have no USD cost.
+### 3.9 Unpriced Sessions Skip Budget Tracking (`addUnpricedSessionKey`)
+**Threat:** Sessions registered via `SessionHandlerModule.addUnpricedSessionKey` (`Session.pricingExempt = true`) skip the `SHValueInterpreter`/`SHOracle` pricing call in `preCheck` entirely — used for targets `SHOracle` has no price feed for, chiefly the ERC-8004 Reputation Registry. This avoids a pre-existing issue where pricing a non-token destination (any call with ≥68 bytes of calldata to a contract with no registered Chainlink feed) would revert with `SHOracle_UnsupportedToken`, which would otherwise make such sessions unusable rather than merely unpriced.  
+**Mitigation in place:** Target and selector allowlisting are enforced identically for pricing-exempt sessions — only the USD pricing/budget step is skipped, not access control. `addUnpricedSessionKey` takes no `spendingLimit` parameter at all (there's no meaningful budget for a session that's never priced), avoiding a footgun where a caller could pass a nonzero limit that silently does nothing. Auto-expiry cleanup (`_clearSession` on inactivity) still runs in `preCheck` for exempt sessions, just without the pricing step preceding it.  
+**Residual risk:** Low — no funds or spending authority are affected for the Reputation Registry's actual functions (`giveFeedback` and related calls move no value and have no USD cost). The residual risk is architectural: `addUnpricedSessionKey` is a generic escape hatch, not specific to the Reputation Registry — an owner could point it at any contract, at which point that session has **no** spending limit at all (only target + selector allowlisting). This is by design (an explicit, owner-opted-in exemption) but is worth flagging in any review, since it's the one session type with unlimited USD exposure per call.
 
 ---
 
@@ -137,7 +137,8 @@
 
 ## 5. Out of Scope
 
-- Pyth Network / Wormhole guardian-level collusion
+- Chainlink oracle network node-level collusion or manipulation
 - EntryPoint contract vulnerabilities (audited by OpenZeppelin)
-- Uniswap V2 contract vulnerabilities
+- OpenZeppelin's ERC-7579 (`draft-`) contract implementations — not yet graduated out of draft status; tracked as an accepted risk, not re-audited here
+- Uniswap V2 / PancakeSwap V2 contract vulnerabilities
 - Host OS / server compromise

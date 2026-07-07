@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, StdInvariant} from "forge-std/Test.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
+import {SessionHandlerModule} from "../../src/SessionHandlerModule.sol";
 import {ERC20Mock} from "../../src/mocks/ERC20Mock.sol";
 import {SHOracle} from "../../src/SHOracle.sol";
 import {SHRegistry} from "../../src/SHRegistry.sol";
@@ -15,6 +16,11 @@ import {SHHandler} from "./SHHandler.sol";
 /**
  * @title InvariantSH
  * @notice Invariant test suite for SessionHandler.
+ * @dev Session state lives in SessionHandlerModule (installed on sessionHandler as both
+ *      validator and hook), so getSession/isSessionActive/getRemainingBudget/
+ *      isSpendingWithinBudget here are all passthroughs to that module rather than reading
+ *      sessionHandler's own storage directly -- but the assertions are identical, since the
+ *      view semantics are the same.
  *
  * Run with:
  *   forge test --match-contract InvariantSH -vv
@@ -59,7 +65,7 @@ contract InvariantSH is StdInvariant, Test {
         uint256 n = handler.sessionKeyCount();
         for (uint256 i; i < n; i++) {
             address key = handler.sessionKeys(i);
-            SessionHandler.Session memory s = sessionHandler.getSession(key);
+            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
             assertLe(s.spentAmount, s.spendingLimit, "spentAmount > spendingLimit");
         }
     }
@@ -74,7 +80,7 @@ contract InvariantSH is StdInvariant, Test {
         uint256 n = handler.sessionKeyCount();
         for (uint256 i; i < n; i++) {
             address key = handler.sessionKeys(i);
-            SessionHandler.Session memory s = sessionHandler.getSession(key);
+            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
             // spendingLimit == 0 means the session was revoked/deleted — skip the zero struct
             if (s.spendingLimit == 0) continue;
             assertLt(s.validFrom, s.validUntil, "validFrom >= validUntil");
@@ -90,7 +96,7 @@ contract InvariantSH is StdInvariant, Test {
         uint256 n = handler.sessionKeyCount();
         for (uint256 i; i < n; i++) {
             address key = handler.sessionKeys(i);
-            SessionHandler.Session memory s = sessionHandler.getSession(key);
+            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
             if (!s.active) {
                 assertFalse(sessionHandler.isSessionActive(key), "revoked session reported active");
             }
@@ -105,7 +111,7 @@ contract InvariantSH is StdInvariant, Test {
         uint256 n = handler.sessionKeyCount();
         for (uint256 i; i < n; i++) {
             address key = handler.sessionKeys(i);
-            SessionHandler.Session memory s = sessionHandler.getSession(key);
+            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
             uint256 remaining = sessionHandler.getRemainingBudget(key);
 
             if (s.spentAmount >= s.spendingLimit) {
@@ -125,7 +131,7 @@ contract InvariantSH is StdInvariant, Test {
         uint256 n = handler.sessionKeyCount();
         for (uint256 i; i < n; i++) {
             address key = handler.sessionKeys(i);
-            SessionHandler.Session memory s = sessionHandler.getSession(key);
+            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
             if (!s.active) continue;
 
             bool withinBudget = sessionHandler.isSpendingWithinBudget(key, address(0), 0);

@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
+import {SessionHandlerModule} from "../../src/SessionHandlerModule.sol";
 import {ERC20Mock} from "../../src/mocks/ERC20Mock.sol";
 
 /**
@@ -10,6 +11,10 @@ import {ERC20Mock} from "../../src/mocks/ERC20Mock.sol";
  * @notice Fuzzer-facing handler that wraps every mutating action on SessionHandler.
  *         The invariant test targets this contract so Foundry calls its functions
  *         in random order with random inputs.
+ *
+ *         addSessionKey/revokeSessionKey are 6-arg/1-arg calls on SessionHandler (passthroughs to
+ *         SessionHandlerModule), gated by onlyOwner, so a plain vm.prank(owner) is enough to
+ *         authorize them.
  *
  *         Ghost variables (sessionKeys, wasAdded) let invariant checks iterate
  *         over all sessions ever created.
@@ -69,7 +74,7 @@ contract SHHandler is Test {
         keyIndex = bound(keyIndex, 0, sessionKeys.length - 1);
         address key = sessionKeys[keyIndex];
 
-        SessionHandler.Session memory s = sessionHandler.getSession(key);
+        SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
         if (s.spendingLimit == 0) return; // session deleted/never-existed — revokeSessionKey would revert
 
         vm.prank(owner);

@@ -6,7 +6,7 @@ from db import (
     get_token_address,
     get_factory_address,
 )
-from constants import UNISWAP_V2_FACTORY, ETH_SENTINEL
+from constants import UNISWAP_V2_FACTORY, PANCAKE_V2_FACTORY, UBESWAP_V2_FACTORY, ETH_SENTINEL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET
 
 _session_handler_cache: dict[int, Contract] = {}
 _entry_point_cache: dict[int, Contract] = {}
@@ -16,6 +16,11 @@ _factory_cache: dict[int, Contract] = {}
 _sh_factory_cache: dict[int, Contract] = {}
 _pair_cache: dict[tuple[int, str, str], Contract] = {}
 _reputation_registry_cache: dict[int, Contract] = {}
+_session_handler_module_cache: dict[int, Contract] = {}
+
+# ERC-7579 single-call, default-execution-type mode — the only mode SessionHandler's
+# installed SessionHandlerModule validator accepts for session-key UserOps.
+ERC7579_SINGLE_CALL_MODE = b"\x00" * 32
 
 
 
@@ -28,6 +33,7 @@ def invalidate_cache(chat_id: int) -> None:
     _factory_cache.pop(chat_id, None)
     _sh_factory_cache.pop(chat_id, None)
     _reputation_registry_cache.pop(chat_id, None)
+    _session_handler_module_cache.pop(chat_id, None)
     for key in [k for k in _erc20_cache if k[0] == chat_id]:
         del _erc20_cache[key]
     for key in [k for k in _pair_cache if k[0] == chat_id]:
@@ -51,6 +57,26 @@ def load_session_handler(chat_id: int) -> Contract:
     return _session_handler_cache[chat_id]
 
 
+def load_session_handler_module(chat_id: int) -> Contract:
+    """
+    Loads the SessionHandlerModule contract ABI, bound to the address the wallet reports
+    via its public SH_MODULE getter.
+
+    The module (not SessionHandler itself) is where session-key state lives and where
+    SessionAdded/SessionRevoked are emitted, and its address is what session-key UserOps
+    need to encode into the nonce key (see session_key_nonce_key below).
+
+    @param chat_id  The Telegram chat ID of the user.
+    @return         A web3.py Contract instance pointing to the installed SessionHandlerModule.
+    """
+    if chat_id not in _session_handler_module_cache:
+        w3, _, _ = load_network_config(chat_id)
+        abi = get_json("./out/SessionHandlerModule.sol/SessionHandlerModule.json")["abi"]
+        address = load_session_handler(chat_id).functions.SH_MODULE().call()
+        _session_handler_module_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
+    return _session_handler_module_cache[chat_id]
+
+
 def load_entry_point(chat_id: int) -> Contract:
     """
     Loads the EntryPoint contract ABI and binds it to the address stored in the DB.
@@ -60,9 +86,42 @@ def load_entry_point(chat_id: int) -> Contract:
     if chat_id not in _entry_point_cache:
         w3, _, _ = load_network_config(chat_id)
         abi = get_json("./app/artifacts/IEntryPoint.json")["abi"]
+        # entryPoint() (lowercase, a function) — SessionHandler inherits this from OZ's
+        # Account.sol.
         address = load_session_handler(chat_id).functions.ENTRY_POINT().call()
         _entry_point_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _entry_point_cache[chat_id]
+
+
+def pack_execution_calldata(target: str, value: int, data: bytes) -> bytes:
+    """
+    Packs (target, value, data) into the ERC-7579 single-execution calldata expected by
+    SessionHandler.execute(bytes32 mode, bytes executionCalldata).
+
+    Mirrors Solidity's abi.encodePacked(target, value, data): a raw 20-byte address,
+    followed by a raw 32-byte big-endian value, followed by the inner calldata — no ABI
+    offset/length words, unlike a normal abi.encode.
+
+    @param target  Checksummed hex address string (e.g. "0xAbC...").
+    @param value   Native ETH value in wei to forward with the inner call.
+    @param data    ABI-encoded calldata for the inner call.
+    @return        The packed executionCalldata bytes.
+    """
+    return bytes.fromhex(target[2:]) + value.to_bytes(32, "big") + data
+
+
+def session_key_nonce_key(module_address: str) -> int:
+    """
+    Builds the ERC-4337 nonce key that routes UserOp validation to the given validator module.
+
+    SessionHandler (via OZ's AccountERC7579) reads the top 20 bytes of the nonce's 192-bit
+    key as the address of the validator module to dispatch to. Mirrors Solidity's
+    uint192(uint160(module)) << 32 — the low 32 bits are free sub-key space, left as 0 here.
+
+    @param module_address  Checksummed hex address of the installed SessionHandlerModule.
+    @return                The nonce key to pass as EntryPoint.getNonce's second argument.
+    """
+    return int(module_address, 16) << 32
 
 
 def load_ierc20(chat_id: int, token: str, uniswap_pair=False) -> Contract:
@@ -75,7 +134,7 @@ def load_ierc20(chat_id: int, token: str, uniswap_pair=False) -> Contract:
     key = (chat_id, token)
     if key not in _erc20_cache:
         w3, chain_id, _ = load_network_config(chat_id)
-        if token == "weth":
+        if token in ("weth", "wbnb"):
             abi = get_json("./app/artifacts/IWETH.json")["abi"]
         else:
             abi = get_json("./app/artifacts/IERC20Extended.json")["abi"]
@@ -98,7 +157,7 @@ def load_factory(chat_id: int) -> Contract:
     """
     if chat_id not in _sh_factory_cache:
         w3, chain_id, _ = load_network_config(chat_id)
-        abi = get_json("./app/migrate/SHFactory.json")["abi"]
+        abi = get_json("./out/SHFactory.sol/SHFactory.json")["abi"]
         address = get_factory_address(chain_id)
         _sh_factory_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _sh_factory_cache[chat_id]
@@ -129,7 +188,7 @@ def load_iuniswap_router(chat_id: int) -> Contract:
     if chat_id not in _router_cache:
         w3, _, _ = load_network_config(chat_id)
         abi = get_json("./app/artifacts/IUniswapV2Router02.json")["abi"]
-        address = load_session_handler(chat_id).functions.getUniswapRouter().call()
+        address = load_session_handler(chat_id).functions.getRouter().call()
         _router_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _router_cache[chat_id]
 
@@ -139,11 +198,18 @@ def load_iuniswap_factory(chat_id: int) -> Contract:
     Loads the Uniswap V2 Factory interface ABI and binds it to the known mainnet address.
 
     @return  A web3.py Contract instance for the Uniswap V2 Factory.
+
     """
+
     if chat_id not in _factory_cache:
-        w3, _, _ = load_network_config(chat_id)
+        w3, chain_id, _ = load_network_config(chat_id)
         abi = get_json("./app/artifacts/IUniswapV2Factory.json")["abi"]
-        address = UNISWAP_V2_FACTORY
+        if chain_id == CHAIN_ID_MAINNET:
+            address = UNISWAP_V2_FACTORY
+        elif chain_id == CHAIN_ID_BSC:
+            address = PANCAKE_V2_FACTORY
+        elif chain_id == CHAIN_ID_CELO:
+            address = UBESWAP_V2_FACTORY
         _factory_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _factory_cache[chat_id]
 

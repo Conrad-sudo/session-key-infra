@@ -10,6 +10,8 @@ Create a `.env` file in the project root:
 # Signing keys
 ANVIL_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 SEPOLIA_PRIVATE_KEY=your_sepolia_deployer_private_key_here
+BSC_PRIVATE_KEY=your_bsc_deployer_private_key_here
+CELO_PRIVATE_KEY=your_celo_deployer_private_key_here
 
 # Deployer wallet address (used by HelperConfig on live networks)
 SEPOLIA_ACCOUNT=your_deployer_wallet_address_here
@@ -18,10 +20,14 @@ SEPOLIA_ACCOUNT=your_deployer_wallet_address_here
 ANVIL_BUNDLER=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 MAINNET_BUNDLER=your_mainnet_bundler_private_key_here
 SEPOLIA_BUNDLER=your_sepolia_bundler_private_key_here
+BSC_BUNDLER=your_bsc_bundler_private_key_here
+CELO_BUNDLER=your_celo_bundler_private_key_here
 
 # RPC endpoints
 MAINNET_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your_alchemy_key
 SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/your_alchemy_key
+BSC_RPC_URL=https://bnb-mainnet.g.alchemy.com/v2/your_alchemy_key
+CELO_RPC_URL=https://celo-mainnet.g.alchemy.com/v2/your_alchemy_key
 
 # AI / bot credentials
 ANTHROPIC_API_KEY=your_anthropic_api_key_here
@@ -38,17 +44,19 @@ VAULT_SECRET_ID_ACCESSOR=
 ETHERSCAN_API_KEY=your_etherscan_api_key_here
 ```
 
-> `SEPOLIA_ACCOUNT` is the public Ethereum address corresponding to `SEPOLIA_PRIVATE_KEY`. It is used by `HelperConfig.s.sol` as the deployer account on live networks. Load it via `vm.envAddress("SEPOLIA_ACCOUNT")` — do not hardcode it.
+> `SEPOLIA_ACCOUNT` is the public Ethereum address corresponding to `SEPOLIA_PRIVATE_KEY`. It is used by `HelperConfig.s.sol` as the deployer account on live Sepolia. Load it via `vm.envAddress("SEPOLIA_ACCOUNT")` — do not hardcode it. Mainnet/BSC use a separate placeholder key (`MAINNET_DEPLOYER_PK`) hardcoded in `HelperConfig.s.sol` — **replace it with a real funded key before broadcasting a live mainnet or BSC deployment.**
 >
 > `ANVIL_PRIVATE_KEY` and `ANVIL_BUNDLER` are Anvil's default account 0 and account 2 keys. They are public and safe to use locally only.
 >
-> `SEPOLIA_PRIVATE_KEY` and `SEPOLIA_BUNDLER` must be funded with Sepolia ETH before deployment. They can be the same key.
+> `SEPOLIA_PRIVATE_KEY`, `BSC_PRIVATE_KEY`, and their respective `*_BUNDLER` keys must be funded with real Sepolia ETH / BSC BNB before deployment. The deployer and bundler can be the same key.
 >
-> `MAINNET_BUNDLER` and `SEPOLIA_BUNDLER` are only required for their respective network. On fork networks, the bundler is funded programmatically by `prefund()`.
+> `CELO_PRIVATE_KEY` / `CELO_BUNDLER` / `CELO_RPC_URL` are read by the Python app's network routing (`anvil.py`, `deploy_wallet.py`), but Celo has no Solidity deployment path yet (`HelperConfig.s.sol` has no Celo branch) — see [docs/app.md](app.md).
 >
-> On live Sepolia, the Alchemy bundler handles gas — `SEPOLIA_BUNDLER` is not used by `live_network.py`.
+> `MAINNET_BUNDLER`, `SEPOLIA_BUNDLER`, and `BSC_BUNDLER` are only required for their respective **fork** networks (`anvil.py`'s local `handleOps` flow). On fork networks, the bundler is funded programmatically by `prefund()`.
 >
-> `ETHERSCAN_API_KEY` is optional. If not set, `deploy.py` skips contract verification and prints a notice.
+> On live Sepolia/BSC, the Alchemy bundler handles gas — the corresponding `*_BUNDLER` key is not used by `live_network.py`.
+>
+> `ETHERSCAN_API_KEY` is optional. If not set, deployment skips contract verification and prints a notice.
 
 ---
 

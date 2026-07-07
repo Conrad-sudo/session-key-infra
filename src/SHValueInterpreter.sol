@@ -64,19 +64,19 @@ contract SHValueInterpreter {
         view
         returns (uint256 debitValueInUsd, uint256 creditValueInUsd)
     {
-        address uniswapRouter = REGISTRY.uniswapRouter();
+        address uniswapRouter = REGISTRY.router();
         if (uniswapRouter == address(0) && block.chainid != ANVIL_CHAIN_ID && block.chainid != SEPOLIA_CHAIN_ID) {
             revert SHValueInterpreter_ZeroAddressOnRouter();
         }
 
-        SHOracle oracle = SHOracle(payable(REGISTRY.priceOracle()));
+        SHOracle oracle = SHOracle(REGISTRY.priceOracle());
 
         address token;
         uint256 extractedValue;
 
         // swapExactETHForTokens and swapETHForExactTokens forward ETH as `value` with no token input
         // parameter, so their USD cost is fully captured here. No additional interpreter branch needed.
-        if (selector != IWETH.deposit.selector && value > 0) {
+        if (selector != IWETH.deposit.selector) {
             debitValueInUsd += oracle.getUsdValue(address(0), value);
         }
 

@@ -1,12 +1,13 @@
 import os
+import sys
 import time
 from web3 import Web3
+from web3.logs import DISCARD
 from constants import (
     ETH_SENTINEL,
     HEARTBEAT_24H,
-    
+    get_native_wrapped_ticker,
 )
-
 from network_config import load_network_config_by_name, load_network_config
 from db import (
     get_reputation_registry_selectors,
@@ -18,9 +19,37 @@ from db import (
     get_uniswapv2_selectors,
 )
 from anvil import get_or_create_session_key
-from contracts import invalidate_cache, load_factory, load_session_handler, load_ierc20
+from contracts import (
+    invalidate_cache,
+    load_factory,
+    load_session_handler,
+    load_session_handler_module,
+    load_ierc20,
+    pack_execution_calldata,
+    ERC7579_SINGLE_CALL_MODE,
+)
 
 nonce: int
+
+# Maps a chain_name to the env var holding its deployer private key. Fork networks of a
+# real chain (sepolia-fork, bsc-fork) get a dedicated key too, not the Anvil default burner
+# key — forking inherits that chain's real on-chain state, and the well-known Anvil/Hardhat
+# accounts have been EIP-7702-delegated to drainer contracts on real Sepolia/BSC/mainnet (see
+# HelperConfig.s.sol's MAINNET_DEPLOYER_PK comment for the same issue on the Foundry side).
+# Plain "anvil" (no fork) has no real-world state to inherit, so the burner key is fine there.
+LIVE_PRIVATE_KEY_ENV = {
+    "sepolia": "SEPOLIA_PRIVATE_KEY",
+    "bsc": "BSC_PRIVATE_KEY",
+    "celo": "CELO_PRIVATE_KEY",
+    "sepolia-fork": "SEPOLIA_PRIVATE_KEY",
+    "bsc-fork": "BSC_PRIVATE_KEY",
+    "celo-fork": "CELO_PRIVATE_KEY",
+}
+
+
+def _private_key_env(chain_name: str) -> str:
+    """Returns the env var name holding the deployer key for chain_name."""
+    return LIVE_PRIVATE_KEY_ENV.get(chain_name, "ANVIL_PRIVATE_KEY")
 
 
 def _call(contract_fn, w3: Web3, deployer, chain_id: int, nonce: int):
@@ -63,8 +92,9 @@ def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int
     Funds two accounts from the deployer after SessionHandler wallet deployment:
       1. SessionHandler wallet — 10 ETH to cover ERC-4337 prefund and any forwarded
          ETH used for WETH wraps or Uniswap swaps initiated by session keys.
-      2. Bundler (MAINNET_BUNDLER on mainnet-fork, SEPOLIA_BUNDLER on sepolia-fork) —
-         10 ETH to cover the gas cost of bundling ERC-4337 UserOperations on the fork.
+      2. Bundler (MAINNET_BUNDLER on mainnet-fork, SEPOLIA_BUNDLER on sepolia-fork,
+         BSC_BUNDLER on bsc-fork) — 10 ETH to cover the gas cost of bundling ERC-4337
+         UserOperations on the fork.
 
     Args:
         deployer:       Signing account (web3.py LocalAccount) that pays for both transfers.
@@ -93,7 +123,12 @@ def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int
 
     if "fork" in network:
         # 2. Fund the Bundler with 10 ETH to cover the gas costs of bundling UserOperations on this fork.
-        bundler_env = "MAINNET_BUNDLER" if network == "mainnet-fork" else "SEPOLIA_BUNDLER"
+        bundler_env = {
+            "mainnet-fork": "MAINNET_BUNDLER",
+            "sepolia-fork": "SEPOLIA_BUNDLER",
+            "bsc-fork": "BSC_BUNDLER",
+            "celo-fork": "CELO_BUNDLER",
+        }.get(network, "SEPOLIA_BUNDLER")
         bundler = w3.eth.account.from_key(os.getenv(bundler_env))
         nonce += 1
         tx = {
@@ -119,10 +154,12 @@ def deploy_wallet(chat_id: int, chain_name: str):
     on the given chain, then persists the resulting address to wallet.db.
 
     This assumes the shared protocol infrastructure (EntryPoint, SHOracle,
-    SHTreasury/SHRegistry, SHFactory) has already been deployed on chain_name via
-    `forge script script/DeploySHProtocol.s.sol` and synced into the DB via `make db` —
-    this function only deploys the per-user SessionHandler wallet, then calls prefund()
-    to fund the new wallet (and the bundler, on fork networks) with 10 ETH each.
+    SHTreasury/SHRegistry, SHFactory, SessionHandlerModule) has already been deployed on
+    chain_name via `forge script script/DeploySHProtocol.s.sol` and synced into the DB via
+    `make db` — including SHFactory.setSpendingLimitModule(...), without which
+    deployWallet() reverts. This function only deploys the per-user SessionHandler
+    wallet, then calls prefund() to fund the new wallet (and the bundler, on fork networks)
+    with 10 ETH each.
 
     @param chat_id     The Telegram chat ID of the user who will own the new wallet.
     @param chain_name  The network to deploy on (e.g. "anvil", "mainnet-fork", "sepolia-fork", "sepolia").
@@ -133,7 +170,7 @@ def deploy_wallet(chat_id: int, chain_name: str):
     )  # set network in DB before deployment so load_factory can resolve the right address
     w3, chain_id = load_network_config_by_name(chain_name)
 
-    private_key_env = "ANVIL_PRIVATE_KEY" if chain_name != "sepolia" else "SEPOLIA_PRIVATE_KEY"
+    private_key_env = _private_key_env(chain_name)
     deployer = w3.eth.account.from_key(os.getenv(private_key_env))
 
     factory = load_factory(chat_id)
@@ -150,7 +187,7 @@ def deploy_wallet(chat_id: int, chain_name: str):
         )
     )
 
-    logs = factory.events.WalletDeployed().process_receipt(receipt)
+    logs = factory.events.WalletDeployed().process_receipt(receipt,errors=DISCARD)
     if not logs:
         raise RuntimeError(
             "WalletDeployed event not found in receipt — deployWallet() may have reverted silently"
@@ -207,9 +244,10 @@ def add_session(
             "targets, functions, session_ends, and limits must all have the same length"
         )
 
-    private_key_env = "ANVIL_PRIVATE_KEY" if chain_name != "sepolia" else "SEPOLIA_PRIVATE_KEY"
+    private_key_env = _private_key_env(chain_name)
     owner = w3.eth.account.from_key(os.getenv(private_key_env))
     session_handler = load_session_handler(chat_id=chat_id)
+    module = load_session_handler_module(chat_id=chat_id)
     selector_map = {row["name"]: row["selector"] for row in get_erc20_selectors()}
     selector_map.update(
         {row["name"]: row["selector"] for row in get_uniswapv2_selectors()}
@@ -221,11 +259,11 @@ def add_session(
         targets, functions, session_ends, limits
     ):
 
-        if target == "eth":
+        if target in ["eth","bnb"]:
             target_address = ETH_SENTINEL
 
         elif target == "uniswapv2_router":
-            target_address = session_handler.functions.getUniswapRouter().call()
+            target_address = session_handler.functions.getRouter().call()
 
         elif chain_name == "anvil":
             target_address = load_ierc20(chat_id=chat_id, token=target).address
@@ -250,27 +288,49 @@ def add_session(
                 )
             selectors.append(bytes.fromhex(selector_map[func].removeprefix("0x")))
 
-        tx = session_handler.functions.addSessionKey(
-            session_key,
-            target_address,
-            selectors,
-            valid_from,
-            valid_until,
-            spending_limit,
-        ).build_transaction(
-            {
-                "from": owner.address,
-                "nonce": w3.eth.get_transaction_count(owner.address),
-                "chainId": chain_id,
-            }
-        )
+        # SessionHandlerModule rejects spendingLimit == 0 outright via addSessionKey.
+        # reputation_registry sessions are registered with limit 0 (see add_default_session) —
+        # that's not a priced target (SHOracle has no feed for it), so it goes through
+        # addUnpricedSessionKey instead, which skips pricing/budget tracking entirely while
+        # still enforcing target + selector allowlisting.
+        if target == "reputation_registry":
+            tx = session_handler.functions.addUnpricedSessionKey(
+                session_key,
+                target_address,
+                selectors,
+                valid_from,
+                valid_until,
+            ).build_transaction(
+                {
+                    "from": owner.address,
+                    "nonce": w3.eth.get_transaction_count(owner.address),
+                    "chainId": chain_id,
+                }
+            )
+        else:
+            tx = session_handler.functions.addSessionKey(
+                session_key,
+                target_address,
+                selectors,
+                valid_from,
+                valid_until,
+                spending_limit,
+            ).build_transaction(
+                {
+                    "from": owner.address,
+                    "nonce": w3.eth.get_transaction_count(owner.address),
+                    "chainId": chain_id,
+                }
+            )
 
         signed_tx = w3.eth.account.sign_transaction(tx, owner.key)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
         save_session(chat_id, target, spending_limit, valid_until)
 
-        logs = session_handler.events.SessionAdded().process_receipt(receipt)
+        # SessionAdded is emitted by SessionHandlerModule, not SessionHandler —
+        # the wallet's own ABI no longer declares this event at all.
+        logs = module.events.SessionAdded().process_receipt(receipt)
         print(f"Session added! tx: {tx_hash.hex()}, status: {receipt['status']}")
         if logs:
             log = logs[0]
@@ -281,45 +341,54 @@ def add_session(
             print(
                 "Warning: SessionAdded event could not be decoded (stale ABI — run forge build)"
             )
-    if "mainnet" in chain_name:
+    if "mainnet" in chain_name or "bsc" in chain_name or "celo" in chain_name:
         for target in targets:
             if target not in ("uniswapv2_router", "eth"):
                 approve(
                     chat_id, target
-                )  # approve each token for the Uniswap router so it can be swapped within the session limits
+                )  # approve each token for the DEX router so it can be swapped within session limits
 
 
 def approve(chat_id: int, token: str):
     """
     Approves the Uniswap V2 router to spend type(uint256).max of a given token
-    from the SessionHandler by calling execute() as the owner (deployer).
+    from the SessionHandler wallet by calling execute() directly as the owner (deployer).
+
+    This isn't a UserOp — no EntryPoint involved. It's the owner's direct-call escape hatch
+    on execute() (onlyEntryPointOrSelfOrOwner), so the (mode, executionCalldata) packing
+    still applies even though there's no session key or nonce involved here.
 
     This must be called before any swap that spends token_in, since the router
-    uses transferFrom to pull tokens from the SessionHandler.
+    uses transferFrom to pull tokens from the SessionHandler wallet.
 
     @param chat_id  The Telegram chat ID of the user.
     @param token    The ticker symbol of the ERC20 token to approve (e.g. "usdc").
     """
+    if token == "reputation_registry":
+        return
+
     w3, chain_id, chain_name = load_network_config(chat_id)
-    private_key_env = "ANVIL_PRIVATE_KEY" if chain_name != "sepolia" else "SEPOLIA_PRIVATE_KEY"
+    private_key_env = _private_key_env(chain_name)
     deployer = w3.eth.account.from_key(os.getenv(private_key_env))
     session_handler = load_session_handler(chat_id)
-    router_address=session_handler.functions.getUniswapRouter().call()
+    router_address=session_handler.functions.getRouter().call()
+
     erc20 = load_ierc20(chat_id=chat_id, token=token)
 
     approve_data = erc20.encode_abi(
         abi_element_identifier="approve",
         args=[router_address, 2**256 - 1],
     )
+    execution_calldata = pack_execution_calldata(erc20.address, 0, approve_data)
 
     _call(
-        session_handler.functions.execute(erc20.address, 0, approve_data, []),
+        session_handler.functions.execute(ERC7579_SINGLE_CALL_MODE, execution_calldata),
         w3,
         deployer,
         chain_id,
         w3.eth.get_transaction_count(deployer.address),
     )
-    print(f"Approved Uniswap V2 router to spend {token.upper()} from SessionHandler.")
+    print(f"Approved Uniswap V2 router to spend {token.upper()} from SessionHandler wallet.")
 
 
 def add_default_session(chat_id: int):
@@ -333,7 +402,8 @@ def add_default_session(chat_id: int):
 
     @param chat_id  The Telegram chat ID of the user.
     """
-    _,_,chain_name = load_network_config(chat_id)
+    _, chain_id, chain_name = load_network_config(chat_id)
+    native_wrapped = get_native_wrapped_ticker(chain_id)
     erc20_functions = ["transfer", "balanceOf", "approve", "transferFrom", "allowance"]
     weth_functions = erc20_functions + ["deposit", "withdraw"]
     uniswapV2_functions = [
@@ -353,7 +423,7 @@ def add_default_session(chat_id: int):
     if chain_name == "mainnet-fork":
         add_session(
             chat_id=chat_id,
-            targets=["eth", "weth", "usdc", "uniswapv2_router","reputation_registry"],
+            targets=["eth", native_wrapped, "usdc", "uniswapv2_router","reputation_registry"],
             functions=[
                 [],  # empty selector array for native ETH sessions (address(0) target) since there are no function calls, just value transfers
                 weth_functions,
@@ -364,19 +434,59 @@ def add_default_session(chat_id: int):
             session_ends=[50, 50, 50, 50, 50],
             limits=[50000, 50000, 50000, 50000, 0],
         )
-    if "sepolia" in chain_name: 
+    if "sepolia" in chain_name:
         add_session(
             chat_id=chat_id,
-            targets=["eth", "weth", "link","reputation_registry"],
+            targets=["eth", native_wrapped, "link","reputation_registry"],
             functions=[
                 [],  # empty selector array for native ETH sessions (address(0) target) since there are no function calls, just value transfers
                 weth_functions,
                 erc20_functions,
                 reputation_registry_functions
-                
+
             ],
             session_ends=[50, 50, 50, 50],
             limits=[50000, 50000, 50000, 0],
+        )
+    if "bsc" in chain_name:
+        # "eth" remains the native-value sentinel target (resolves to ETH_SENTINEL/address(0)
+        # in add_session) even though the asset moving is BNB — SHOracle prices address(0)
+        # against BNB-USD on chain 56 regardless of the ticker name used to request the session.
+        add_session(
+            chat_id=chat_id,
+            targets=["eth", native_wrapped, "usdc", "uniswapv2_router", "reputation_registry"],
+            functions=[
+                [],  # empty selector array for native BNB sessions (address(0) target) since there are no function calls, just value transfers
+                weth_functions,
+                erc20_functions,
+                uniswapV2_functions,
+                reputation_registry_functions
+            ],
+            session_ends=[50, 50, 50, 50, 50],
+            limits=[50000, 50000, 50000, 50000, 0],
+        )
+    if "celo" in chain_name:
+        # Ubeswap V2 has no WETH() function — CELO is natively an ERC-20, so there is no
+        # wrapping step and the *ETH*-payable router functions are unusable. Only token-to-token
+        # Ubeswap functions are whitelisted. "celo" ERC-20 has no deposit()/withdraw() either.
+        celo_uniswap_functions = [
+            "swapExactTokensForTokens",
+            "swapTokensForExactTokens",
+            "addLiquidity",
+            "removeLiquidity",
+        ]
+        add_session(
+            chat_id=chat_id,
+            targets=["eth", native_wrapped, "usdc", "uniswapv2_router", "reputation_registry"],
+            functions=[
+                [],  # empty selector array for native CELO sessions (address(0) target)
+                erc20_functions,  # CELO ERC-20: no deposit/withdraw since it is natively ERC-20
+                erc20_functions,
+                celo_uniswap_functions,
+                reputation_registry_functions,
+            ],
+            session_ends=[50, 50, 50, 50, 50],
+            limits=[50000, 50000, 50000, 50000, 0],
         )
 
 
@@ -385,17 +495,21 @@ def deploy(chat_id: int, network: str):
     Top-level deployment dispatcher. Deploys a SessionHandler wallet for chat_id via
     SHFactory.deployWallet() on the given network.
 
-    Supported networks: "anvil", "mainnet-fork", "sepolia-fork", "sepolia". Each one
-    must already have the shared protocol infrastructure deployed (see deploy_wallet()).
+    Supported networks: "anvil", "mainnet-fork", "sepolia-fork", "bsc-fork", "sepolia", "bsc".
+    Each one must already have the shared protocol infrastructure deployed (see
+    deploy_wallet()). "sepolia" and "bsc" are live networks — SEPOLIA_PRIVATE_KEY /
+    BSC_PRIVATE_KEY must be set and funded with real ETH/BNB before deploying (see
+    LIVE_PRIVATE_KEY_ENV).
 
-    To target a different network, change the `network` argument in the __main__ block
-    at the bottom of this file before running `make deploy`.
+    To target a different network, pass it as the first CLI argument (e.g.
+    `python3 app/deploy_wallet.py bsc-fork`, or `make deploy-wallet ARGS=bsc-fork`).
+    Defaults to "sepolia-fork" when no argument is given.
 
     @param chat_id  Telegram chat ID — used to key all database records for this user.
     @param network  Target network name (see supported values above).
     @raises ValueError  If network is not one of the supported values.
     """
-    if network in ("anvil", "mainnet-fork", "sepolia-fork", "sepolia"):
+    if network in ("anvil", "mainnet-fork", "sepolia-fork", "bsc-fork", "celo-fork", "sepolia", "bsc", "celo"):
         deploy_wallet(chat_id, network)
     else:
         raise ValueError(f"Unsupported network '{network}'")
@@ -403,5 +517,6 @@ def deploy(chat_id: int, network: str):
 
 if __name__ == "__main__":
     chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
-    deploy(chat_id=chat_id, network="sepolia-fork")
+    network = sys.argv[1] if len(sys.argv) > 1 else "sepolia-fork"
+    deploy(chat_id=chat_id, network=network)
     add_default_session(chat_id=chat_id)

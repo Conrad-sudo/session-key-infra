@@ -2,14 +2,14 @@
 pragma solidity ^0.8.24;
 
 /**
- * @title SHUniswapV2Test
+ * @title SHPancakeswapV2Test
  * @author Conrad Japhet
- * @notice Integration test suite for SessionHandler's Uniswap V2 session-key enforcement.
+ * @notice Integration test suite for SessionHandler's PancakeSwap V2 session-key enforcement.
  *
- * @dev MAINNET FORK REQUIRED — all tests use live mainnet contract addresses (DAI, WETH,
- *      MKR, Uniswap V2 Router/Factory). Run with:
+ * @dev BSC FORK REQUIRED — all tests use live BSC contract addresses (DAI, WBNB,
+ *      LINK, PancakeSwap V2 Router/Factory). Run with:
  *
- *        forge test --match-contract SHUniswapV2Test --fork-url $MAINNET_RPC_URL
+ *        forge test --match-contract SHPancakeswapV2Test --fork-url $BSC_RPC_URL
  *
  *      execute() takes (mode, executionCalldata), the standard ERC-7579 shape. Session-key
  *      state/logic lives in SessionHandlerModule, not on the account. SendPackedUserOp builds
@@ -18,7 +18,7 @@ pragma solidity ^0.8.24;
  *
  *      Tests are split into two categories:
  *
- *      1. Direct tests (no session key) — verify that the underlying Uniswap V2 router and
+ *      1. Direct tests (no session key) — verify that the underlying PancakeSwap V2 router and
  *         pair mechanics work as expected on the fork. These never touch the wallet.
  *
  *      2. Session tests — submit UserOperations through the EntryPoint that call
@@ -26,8 +26,8 @@ pragma solidity ^0.8.24;
  *         parses calldata, prices the operation via SHOracle, and either enforces the
  *         session budget or credits it back (removeLiquidity).
  *
- *      setUp() provides each actor with 10 ETH, 100,000 DAI, and 5 WETH, and pre-approves
- *      the Uniswap V2 router for both tokens. Tests that need LP tokens use the
+ *      setUp() provides each actor with 10 BNB, 100,000 DAI, and 5 WBNB, and pre-approves
+ *      the PancakeSwap V2 router for both tokens. Tests that need LP tokens use the
  *      liquidityAdded(address) modifier.
  */
 
@@ -37,7 +37,7 @@ import {Test, console2} from "forge-std/Test.sol";
 import {IUniswapV2Router02} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 import {IUniswapV2Router01} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol";
 
-import {UNISWAP_V2_FACTORY} from "../../script/Constants.s.sol";
+import {PANCAKE_V2_FACTORY} from "../../script/Constants.s.sol";
 import {IWETH} from "../../src/interfaces/IWETH.sol";
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
@@ -54,7 +54,7 @@ import {IUniswapV2Factory} from "lib/v2-core/contracts/interfaces/IUniswapV2Fact
 import {IUniswapV2Pair} from "lib/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-contract SHUniswapV2Test is Test {
+contract SHPancakeswapV2Test is Test {
     SHOracle oracle;
     SHRegistry feeRegistry;
     HelperConfig.NetworkConfig config;
@@ -65,9 +65,9 @@ contract SHUniswapV2Test is Test {
     /// @dev Starting token balance given to both `user` and `sessionHandler` in setUp.
     uint256 private constant INITIAL_BALANCE = 100000e18;
 
-    IERC20 private dai;
-    IWETH private weth;
-    IERC20 private mkr;
+    IERC20 private usdt;
+    IWETH private bnb;
+    IERC20 private cake;
 
     address user;
     uint256 privateKey;
@@ -75,13 +75,13 @@ contract SHUniswapV2Test is Test {
     /// @dev Simulated bundler; set as both tx.origin and msg.sender when calling handleOps.
     address bundler = makeAddr("bundler");
 
-    IUniswapV2Factory private constant FACTORY = IUniswapV2Factory(UNISWAP_V2_FACTORY);
+    IUniswapV2Factory private constant FACTORY = IUniswapV2Factory(PANCAKE_V2_FACTORY);
     IUniswapV2Router02 private router;
 
     /// @dev Session spending limit used across tests — $50,000 USD with 18 decimals of precision.
     uint256 constant BUDGET = 50000e18;
 
-    /// @dev Unused constant kept for reference; 5 ETH in base units.
+    /// @dev Unused constant kept for reference; 5 BNB in base units.
     uint256 constant ETH_VALUE = 5e18;
 
     /*//////////////////////////////////////////////////////////////
@@ -89,13 +89,13 @@ contract SHUniswapV2Test is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Registers a session key for `user` scoped to the WETH contract.
+     * @dev Registers a session key for `user` scoped to the WBNB contract.
      *      Permits transfer, transferFrom, approve, deposit (wrap), and withdraw (unwrap).
      *      Valid for 1 day from the current block timestamp.
      */
-    modifier wethSessionAdded() {
+    modifier bnbSessionAdded() {
         address sessionKey = user;
-        address target = config.weth;
+        address target = config.wbnb;
         bytes4[] memory sel = new bytes4[](5);
         sel[0] = IERC20.transfer.selector;
         sel[1] = IERC20.transferFrom.selector;
@@ -113,7 +113,7 @@ contract SHUniswapV2Test is Test {
     }
 
     /**
-     * @dev Registers a session key for `user` scoped to the Uniswap V2 router.
+     * @dev Registers a session key for `user` scoped to the PancakeSwap V2 router.
      *      Covers all 6 swap selectors plus addLiquidity, addLiquidityETH,
      *      removeLiquidity, and removeLiquidityETH.
      *      Valid between +1 h and +3 h from the current block. Tests that use this modifier
@@ -145,8 +145,8 @@ contract SHUniswapV2Test is Test {
     }
 
     /**
-     * @dev Adds 8,000 DAI + proportional WETH liquidity to the DAI/WETH Uniswap V2 pool on
-     *      behalf of `user`. The WETH amount is derived from live pool reserves via router.quote()
+     * @dev Adds 8,000 DAI + proportional WBNB liquidity to the DAI/WBNB PancakeSwap V2 pool on
+     *      behalf of `user`. The WBNB amount is derived from live pool reserves via router.quote()
      *      so the deposit is always at the current market ratio.
      *
      *      After adding, the LP token allowance for the router is set to max so subsequent
@@ -156,8 +156,8 @@ contract SHUniswapV2Test is Test {
      *              prank context is used for the router call.
      */
     modifier liquidityAdded(address _user) {
-        address tokenA = config.dai;
-        address tokenB = config.weth;
+        address tokenA = config.usdt;
+        address tokenB = config.wbnb;
         uint256 amountADesired = 8000e18;
         uint256 amountBDesired;
         uint256 amountAMin = 1;
@@ -173,7 +173,12 @@ contract SHUniswapV2Test is Test {
 
         amountBDesired = router.quote(amountADesired, reserveA, reserveB);
 
+        deal(tokenA, _user, INITIAL_BALANCE);
+        deal(tokenB, _user, 100e18);
+
         vm.startPrank(_user);
+        IERC20(tokenA).approve(address(router), type(uint256).max);
+        IERC20(tokenB).approve(address(router), type(uint256).max);
         router.addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin, to, deadline);
         IERC20(pair).approve(address(router), type(uint256).max);
         vm.stopPrank();
@@ -188,10 +193,10 @@ contract SHUniswapV2Test is Test {
     /**
      * @dev Deploys a fresh SessionHandler + EntryPoint + SHOracle via DeploySHProtocol,
      *      then funds both `user` and `sessionHandler` with:
-     *        - 10 ETH (raw, for gas and ETH-value calls)
+     *        - 10 BNB (raw, for gas and BNB-value calls)
      *        - 100,000 DAI (via vm.deal storage override)
-     *        - 5 WETH (wrapped from the ETH balance)
-     *      All router approvals (DAI and WETH) are set to max for both actors so individual
+     *        - 5 WBNB (wrapped from the BNB balance)
+     *      All router approvals (DAI and WBNB) are set to max for both actors so individual
      *      tests do not need to manage allowances.
      */
     function setUp() public {
@@ -207,27 +212,27 @@ contract SHUniswapV2Test is Test {
         sessionHandler = SessionHandler(payable(factory.deployWallet()));
         sendPackedUserOp = new SendPackedUserOp();
 
-        dai = IERC20(config.dai);
-        weth = IWETH(config.weth);
-        mkr = IERC20(config.link);
+        usdt = IERC20(config.usdt);
+        bnb = IWETH(config.wbnb);
+        cake = IERC20(config.cake);
         router = IUniswapV2Router02(config.router);
 
         vm.deal(address(sessionHandler), 10 ether);
         vm.deal(user, 10 ether);
 
-        deal(config.dai, user, INITIAL_BALANCE);
-        deal(config.dai, address(sessionHandler), INITIAL_BALANCE);
+        deal(config.usdt, user, INITIAL_BALANCE);
+        deal(config.usdt, address(sessionHandler), INITIAL_BALANCE);
 
         vm.startPrank(user);
-        weth.deposit{value: 5 ether}();
-        weth.approve(address(router), type(uint256).max);
-        dai.approve(address(router), type(uint256).max);
+        bnb.deposit{value: 5 ether}();
+        bnb.approve(address(router), type(uint256).max);
+        usdt.approve(address(router), type(uint256).max);
         vm.stopPrank();
 
         vm.startPrank(address(sessionHandler));
-        weth.deposit{value: 5 ether}();
-        weth.approve(config.router, type(uint256).max);
-        dai.approve(config.router, type(uint256).max);
+        bnb.deposit{value: 5 ether}();
+        bnb.approve(config.router, type(uint256).max);
+        usdt.approve(config.router, type(uint256).max);
         vm.stopPrank();
     }
 
@@ -248,13 +253,13 @@ contract SHUniswapV2Test is Test {
 
     /**
      * @dev Mocks every configured Chainlink feed to return updatedAt = block.timestamp after a vm.warp.
-     *      Required because real mainnet feeds cannot have updateAnswer called on them — their updatedAt
+     *      Required because real BSC feeds cannot have updateAnswer called on them — their updatedAt
      *      stays at the fork-block value while block.timestamp advances, eventually exceeding the per-feed
      *      heartbeat and triggering SHOracle_StalePrice.
      */
     function _refreshForkFeeds() internal {
         _mockFeedFresh(config.ethUsdPriceFeed);
-        _mockFeedFresh(config.usdcUsdPriceFeed);
+        _mockFeedFresh(config.usdtUsdPriceFeed);
         _mockFeedFresh(config.daiUsdPriceFeed);
         _mockFeedFresh(config.usdtUsdPriceFeed);
         _mockFeedFresh(config.aaveUsdPriceFeed);
@@ -273,6 +278,7 @@ contract SHUniswapV2Test is Test {
         _mockFeedFresh(config.wtaoUsdPriceFeed);
         _mockFeedFresh(config.uniUsdPriceFeed);
         _mockFeedFresh(config.yfiUsdPriceFeed);
+        _mockFeedFresh(config.cakeUsdPriceFeed);
     }
 
     function _mockFeedFresh(address feed) private {
@@ -291,66 +297,66 @@ contract SHUniswapV2Test is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Queries the router for the output amounts of a multi-hop WETH→DAI→MKR swap.
+     * @notice Queries the router for the output amounts of a multi-hop WBNB→DAI→LINK swap.
      * @dev Sanity check that getAmountsOut works on the fork and pool reserves are readable.
      */
     function testGetAmountsOut() public view {
         address[] memory path = new address[](3);
-        path[0] = config.weth;
-        path[1] = config.dai;
-        path[2] = config.link;
+        path[0] = config.usdt;
+        path[1] = config.wbnb;
+        path[2] = config.cake;
 
         uint256 amountIn = 1e18;
         uint256[] memory amounts = router.getAmountsOut(amountIn, path);
 
-        console2.log("WETH: ", amounts[0]);
-        console2.log("DAI: ", amounts[1]);
-        console2.log("MKR: ", amounts[2]);
+        console2.log("USDT: ", amounts[0]);
+        console2.log("WBNB: ", amounts[1]);
+        console2.log("CAKE: ", amounts[2]);
     }
 
     /**
-     * @notice Queries the router for the input amounts required for a multi-hop WETH→DAI→MKR swap.
-     * @dev amountOut is set to 0.001 MKR, well below the pool reserve (~0.044 MKR at fork block).
+     * @notice Queries the router for the input amounts required for a multi-hop WBNB→DAI→LINK swap.
+     * @dev amountOut is set to 0.001 LINK, well below the pool reserve.
      */
     function testGetAmountsIn() public view {
         address[] memory path = new address[](3);
-        path[0] = config.weth;
-        path[1] = config.dai;
-        path[2] = config.link;
+        path[0] = config.usdt;
+        path[1] = config.wbnb;
+        path[2] = config.cake;
 
-        uint256 amountOut = 1e15; // 0.001 MKR — must be less than pool's MKR reserve (~0.044 MKR)
+        uint256 amountOut = 1e15; // 0.001 LINK — must be less than pool's LINK reserve
         uint256[] memory amounts = router.getAmountsIn(amountOut, path);
 
-        console2.log("WETH: ", amounts[0]);
-        console2.log("DAI: ", amounts[1]);
-        console2.log("MKR: ", amounts[2]);
+        console2.log("USDT: ", amounts[0]);
+        console2.log("WBNB ", amounts[1]);
+        console2.log("CAKE: ", amounts[2]);
     }
 
     /**
-     * @notice Wraps ETH to WETH directly via the WETH contract.
+     * @notice Wraps BNB to WBNB directly via the WBNB contract.
      * @dev Verifies the 1:1 conversion and that balanceOf reflects the deposit immediately.
      */
     function testSwapEthForWeth() public {
         uint256 amount = 1 ether;
 
         vm.startPrank(user);
-        uint256 wethBefore = weth.balanceOf(user);
-        IWETH(config.weth).deposit{value: amount}();
-        uint256 wethAfter = weth.balanceOf(user);
+        uint256 bnbBefore = bnb.balanceOf(user);
+        IWETH(config.wbnb).deposit{value: amount}();
+        uint256 bnbAfter = bnb.balanceOf(user);
         vm.stopPrank();
 
-        assertEq(wethAfter - wethBefore, amount);
-        console2.log("WETH received: ", wethAfter - wethBefore);
+        assertEq(bnbAfter - bnbBefore, amount);
+        console2.log("WBNB received: ", bnbAfter - bnbBefore);
     }
 
     /**
-     * @notice Swaps an exact amount of WETH for DAI directly through the router.
+     * @notice Swaps an exact amount of WBNB for DAI directly through the router.
      * @dev Confirms that the received DAI is at least amountOutMin and the user balance updates.
      */
     function testSwapExactTokensForTokens() public {
         address[] memory path = new address[](2);
-        path[0] = config.weth;
-        path[1] = config.dai;
+        path[0] = config.wbnb;
+        path[1] = config.usdt;
 
         uint256 amountIn = 1 ether;
         uint256 amountOutMin = router.getAmountsOut(amountIn, path)[1];
@@ -360,21 +366,21 @@ contract SHUniswapV2Test is Test {
         vm.prank(user);
         uint256[] memory amounts = router.swapExactTokensForTokens(amountIn, amountOutMin, path, to, deadline);
 
-        console2.log("WETH: ", amounts[0]);
-        console2.log("DAI: ", amounts[1]);
+        console2.log("WBNB: ", amounts[0]);
+        console2.log("USDT: ", amounts[1]);
 
-        assertGe(dai.balanceOf(user), amounts[1]);
+        assertGe(usdt.balanceOf(user), amounts[1]);
     }
 
     /**
-     * @notice Swaps WETH for an exact amount of DAI directly through the router.
-     * @dev Confirms that the user receives exactly the requested DAI and that the WETH spent
+     * @notice Swaps WBNB for an exact amount of DAI directly through the router.
+     * @dev Confirms that the user receives exactly the requested DAI and that the WBNB spent
      *      does not exceed amountInMax (1 ether).
      */
     function testSwapTokensForExactTokens() public {
         address[] memory path = new address[](2);
-        path[0] = config.weth;
-        path[1] = config.dai;
+        path[0] = config.wbnb;
+        path[1] = config.usdt;
 
         uint256 amountOut = 1900e18;
         uint256 amountInMax = router.getAmountsIn(amountOut, path)[0];
@@ -384,39 +390,39 @@ contract SHUniswapV2Test is Test {
             amountOut: amountOut, amountInMax: amountInMax, path: path, to: user, deadline: block.timestamp
         });
 
-        console2.log("WETH: ", amounts[0]);
-        console2.log("DAI: ", amounts[1]);
+        console2.log("WBNB: ", amounts[0]);
+        console2.log("USDT: ", amounts[1]);
 
-        assertGe(dai.balanceOf(user), amounts[1]);
+        assertGe(usdt.balanceOf(user), amounts[1]);
     }
 
     /**
-     * @notice The SessionHandler owner can wrap ETH to WETH by calling execute directly.
-     * @dev Verifies that the WETH balance of sessionHandler increases by exactly `value`.
-     *      setUp pre-funds sessionHandler with 5 WETH, so the assertion uses a delta.
+     * @notice The SessionHandler owner can wrap BNB to WBNB by calling execute directly.
+     * @dev Verifies that the WBNB balance of sessionHandler increases by exactly `value`.
+     *      setUp pre-funds sessionHandler with 5 WBNB, so the assertion uses a delta.
      */
     function testOwnerCanSwapEthForWeth() public {
-        address dest = config.weth;
+        address dest = config.wbnb;
         uint256 value = 1 ether;
         bytes memory data = abi.encodeWithSelector(IWETH.deposit.selector);
-        uint256 wethBefore = weth.balanceOf(address(sessionHandler));
+        uint256 bnbBefore = bnb.balanceOf(address(sessionHandler));
 
         vm.startPrank(sessionHandler.owner());
         sessionHandler.execute(bytes32(0), _encodeExecutionCalldata(dest, value, data));
         vm.stopPrank();
 
-        assertEq(weth.balanceOf(address(sessionHandler)) - wethBefore, value);
-        console2.log("WETH received: ", weth.balanceOf(address(sessionHandler)));
+        assertEq(bnb.balanceOf(address(sessionHandler)) - bnbBefore, value);
+        console2.log("WBNB received: ", bnb.balanceOf(address(sessionHandler)));
     }
 
     /**
-     * @notice Adds 8,000 DAI + proportional WETH to the DAI/WETH pool directly as `user`.
+     * @notice Adds 8,000 DAI + proportional WBNB to the DAI/WBNB pool directly as `user`.
      * @dev amountBDesired is computed from live reserves via router.quote() so the deposit
      *      always matches the current pool ratio. Verifies user receives the minted LP tokens.
      */
     function testAddLiquidityOnly() public {
-        address tokenA = config.dai;
-        address tokenB = config.weth;
+        address tokenA = config.usdt;
+        address tokenB = config.wbnb;
         uint256 amountADesired = 8000e18;
         uint256 amountBDesired;
         uint256 amountAMin = 1;
@@ -434,25 +440,30 @@ contract SHUniswapV2Test is Test {
 
         console2.log("AMOUNT DESIRED: ", amountBDesired);
 
+        deal(tokenA, user, INITIAL_BALANCE);
+        deal(tokenB, user, 100e18);
+
         vm.startPrank(user);
+        IERC20(tokenA).approve(address(router), type(uint256).max);
+        IERC20(tokenB).approve(address(router), type(uint256).max);
         (uint256 amountA, uint256 amountB, uint256 liquidity) =
             router.addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin, to, deadline);
         vm.stopPrank();
 
-        console2.log("DAI :  ", amountA);
-        console2.log("WETH:   ", amountB);
+        console2.log("USDT:  ", amountA);
+        console2.log("WBNB:   ", amountB);
         console2.log("LIQUIDITY:  ", liquidity);
 
         assertEq(IERC20(pair).balanceOf(user), liquidity);
     }
 
     /**
-     * @notice Adds 2,500 DAI + proportional ETH to the DAI/WETH pool directly as `user`.
-     * @dev Uses addLiquidityETH which accepts raw ETH and wraps it internally. The ETH amount
+     * @notice Adds 2,500 DAI + proportional BNB to the DAI/WBNB pool directly as `user`.
+     * @dev Uses addLiquidityETH which accepts raw BNB and wraps it internally. The BNB amount
      *      is derived from reserves via router.quote(). Verifies user receives LP tokens.
      */
     function testAddLiquidityETHOnly() public {
-        address token = config.dai;
+        address token = config.usdt;
         uint256 amountEthDesired;
         uint256 amountTokenDesired = 2500e18;
         uint256 amountTokenMin = 1;
@@ -460,8 +471,8 @@ contract SHUniswapV2Test is Test {
         address to = user;
         uint256 deadline = block.timestamp + 30 minutes;
 
-        address pair = FACTORY.getPair(token, config.weth);
-        // Get reserves in token0/token1 order and map to token/WETH order.
+        address pair = FACTORY.getPair(token, config.wbnb);
+        // Get reserves in token0/token1 order and map to token/WBNB order.
         (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
         address token0 = IUniswapV2Pair(pair).token0();
         (uint256 reserveA, uint256 reserveB) = token0 == token ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
@@ -474,22 +485,22 @@ contract SHUniswapV2Test is Test {
         );
         vm.stopPrank();
 
-        console2.log("DAI :  ", amountToken);
-        console2.log("ETH:   ", amountEth);
+        console2.log("USDT:  ", amountToken);
+        console2.log("BNB:   ", amountEth);
         console2.log("LIQUIDITY:  ", liquidity);
 
         assertEq(IERC20(pair).balanceOf(user), liquidity);
     }
 
     /**
-     * @notice Removes all of `user`'s DAI/WETH LP directly through the router.
+     * @notice Removes all of `user`'s DAI/WBNB LP directly through the router.
      * @dev Uses the proportional share formula (liquidity * reserve / totalSupply) to derive
      *      expected token amounts. Verifies the LP balance is zeroed and both token balances
      *      increase by the expected amounts.
      */
     function testRemoveLiquidityOnly() public liquidityAdded(user) {
-        address tokenA = config.dai;
-        address tokenB = config.weth;
+        address tokenA = config.usdt;
+        address tokenB = config.wbnb;
         address pair = FACTORY.getPair(tokenA, tokenB);
         uint256 liquidity = IERC20(pair).balanceOf(user);
         console2.log("LIQUIDITY TO REMOVE: ", liquidity);
@@ -515,8 +526,8 @@ contract SHUniswapV2Test is Test {
         uint256 balanceAfterA = IERC20(tokenA).balanceOf(user);
         uint256 balanceAfterB = IERC20(tokenB).balanceOf(user);
 
-        console2.log("DAI :  ", amountA);
-        console2.log("WETH:   ", amountB);
+        console2.log("USDT:  ", amountA);
+        console2.log("WBNB:   ", amountB);
 
         assertEq(IERC20(pair).balanceOf(user), 0);
         assertEq(expectedA, amountA);
@@ -526,33 +537,35 @@ contract SHUniswapV2Test is Test {
     }
 
     /**
-     * @notice Removes all of `user`'s DAI/WETH LP directly through removeLiquidityETH.
-     * @dev removeLiquidityETH unwraps the WETH share to raw ETH before transferring to `to`.
-     *      Verifies the LP balance is zeroed and that both the DAI and ETH balances of `user`
+     * @notice Removes all of `user`'s DAI/WBNB LP directly through removeLiquidityETH.
+     * @dev removeLiquidityETH unwraps the WBNB share to raw BNB before transferring to `to`.
+     *      Verifies the LP balance is zeroed and that both the DAI and BNB balances of `user`
      *      increase by the expected amounts.
      */
     function testRemoveLiquidityETH() public liquidityAdded(user) {
-        address token = config.dai;
-        address pair = FACTORY.getPair(token, config.weth);
+        address token = config.usdt;
+        address pair = FACTORY.getPair(token, config.wbnb);
         uint256 liquidity = IERC20(pair).balanceOf(user);
 
         uint256 amountTokenMin = 1;
         uint256 amountEthMin = 1;
-        address to = user;
+        // Use a fresh address as recipient so BNB balance tracking is clean —
+        // the `user` address resolves to a forwarder contract on BSC mainnet.
+        address to = makeAddr("bnb_recipient");
         uint256 deadline = block.timestamp + 30 minutes;
 
-        uint256 balanceBeforeToken = IERC20(token).balanceOf(user);
-        uint256 balanceBeforeEth = address(user).balance;
+        uint256 balanceBeforeToken = IERC20(token).balanceOf(to);
+        uint256 balanceBeforeEth = to.balance;
 
         vm.startPrank(user);
         (uint256 amountToken, uint256 amountEth) =
             router.removeLiquidityETH(token, liquidity, amountTokenMin, amountEthMin, to, deadline);
         vm.stopPrank();
-        uint256 balanceAfterToken = IERC20(token).balanceOf(user);
-        uint256 balanceAfterEth = user.balance;
+        uint256 balanceAfterToken = IERC20(token).balanceOf(to);
+        uint256 balanceAfterEth = to.balance;
 
-        console2.log("DAI :  ", amountToken);
-        console2.log("ETH:   ", amountEth);
+        console2.log("USDT:  ", amountToken);
+        console2.log("BNB:   ", amountEth);
 
         assertEq(IERC20(pair).balanceOf(user), 0);
         assertEq(balanceAfterToken - balanceBeforeToken, amountToken);
@@ -560,22 +573,22 @@ contract SHUniswapV2Test is Test {
     }
 
     /**
-     * @notice Creates a new Uniswap V2 pair for an ERC20Mock token paired with WETH.
+     * @notice Creates a new PancakeSwap V2 pair for an ERC20Mock token paired with WBNB.
      * @dev Verifies that the factory stores token0 and token1 in ascending address order.
      */
     function testCreatePair() public {
         ERC20Mock token = new ERC20Mock("TestCoin", "TC", 18);
 
-        address pair = FACTORY.createPair(config.weth, address(token));
+        address pair = FACTORY.createPair(config.wbnb, address(token));
 
         address token0 = IUniswapV2Pair(pair).token0();
         address token1 = IUniswapV2Pair(pair).token1();
 
-        if (address(token) < config.weth) {
+        if (address(token) < config.wbnb) {
             assertEq(token0, address(token));
-            assertEq(token1, config.weth);
+            assertEq(token1, config.wbnb);
         } else {
-            assertEq(token0, config.weth);
+            assertEq(token0, config.wbnb);
             assertEq(token1, address(token));
         }
     }
@@ -585,15 +598,15 @@ contract SHUniswapV2Test is Test {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Session key can wrap ETH to WETH through SessionHandler via a UserOperation.
-     * @dev The WETH session (wethSessionAdded) permits the deposit selector on the WETH contract.
-     *      Budget is charged against the USD value of 1 ETH as priced by the oracle.
-     *      setUp already provides sessionHandler with 5 WETH, so the assertion uses a delta.
+     * @notice Session key can wrap BNB to WBNB through SessionHandler via a UserOperation.
+     * @dev The BNB session (bnbSessionAdded) permits the deposit selector on the WBNB contract.
+     *      Budget is charged against the USD value of 1 BNB as priced by the oracle.
+     *      setUp already provides sessionHandler with 5 WBNB, so the assertion uses a delta.
      */
-    function testSwapEthForWethWithSession() public wethSessionAdded {
-        address dest = config.weth;
+    function testSwapEthForWethWithSession() public bnbSessionAdded {
+        address dest = config.wbnb;
         uint256 value = 1 ether;
-        uint256 wethBefore = weth.balanceOf(address(sessionHandler));
+        uint256 bnbBefore = bnb.balanceOf(address(sessionHandler));
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
         bytes memory data = abi.encodeWithSelector(IWETH.deposit.selector);
@@ -609,20 +622,20 @@ contract SHUniswapV2Test is Test {
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
 
-        assertEq(weth.balanceOf(address(sessionHandler)) - wethBefore, value);
+        assertEq(bnb.balanceOf(address(sessionHandler)) - bnbBefore, value);
     }
 
     /**
      * @notice Session key can execute swapTokensForExactTokens through SessionHandler.
-     * @dev Buys exactly 1,900 DAI by spending up to 1 WETH. setUp provides sessionHandler with
-     *      5 WETH and max router approval, so no extra setup is needed. Budget is charged against
-     *      the USD value of the WETH spent (tokenIn amount), not the DAI received.
+     * @dev Buys exactly 1,900 DAI by spending up to 1 WBNB. setUp provides sessionHandler with
+     *      5 WBNB and max router approval, so no extra setup is needed. Budget is charged against
+     *      the USD value of the WBNB spent (tokenIn amount), not the DAI received.
      */
     function testSwapTokensForExactTokensWithSession() public routerSessionAdded {
         address dest = config.router;
         address[] memory path = new address[](2);
-        path[0] = config.weth;
-        path[1] = config.dai;
+        path[0] = config.wbnb;
+        path[1] = config.usdt;
 
         uint256 amountOut = 1900e18;
         uint256 amountInMax = router.getAmountsIn(amountOut, path)[0];
@@ -645,22 +658,22 @@ contract SHUniswapV2Test is Test {
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
 
-        assertEq(dai.balanceOf(address(sessionHandler)), INITIAL_BALANCE + amountOut);
+        assertEq(usdt.balanceOf(address(sessionHandler)), INITIAL_BALANCE + amountOut);
         assertLt(sessionHandler.getRemainingBudget(user), BUDGET);
     }
 
     /**
      * @notice Session key can execute swapExactTokensForTokens through SessionHandler.
-     * @dev Sells exactly 1 WETH for at least 1,900 DAI. setUp provides sessionHandler with
-     *      5 WETH and max router approval. Budget is charged against the USD value of the 1 WETH
+     * @dev Sells exactly 1 WBNB for at least 1,900 DAI. setUp provides sessionHandler with
+     *      5 WBNB and max router approval. Budget is charged against the USD value of the 1 WBNB
      *      sold (tokenIn), as extracted by SessionHandlerModule.
      *      deadline must be set beyond the vm.warp(+1.1 hours) applied before handleOps.
      */
     function testSwapExactTokensForTokensWithSession() public routerSessionAdded {
         address dest = config.router;
         address[] memory path = new address[](2);
-        path[0] = config.weth;
-        path[1] = config.dai;
+        path[0] = config.wbnb;
+        path[1] = config.usdt;
 
         uint256 amountIn = 1 ether;
         uint256 amountOutMin = router.getAmountsOut(amountIn, path)[1];
@@ -683,22 +696,22 @@ contract SHUniswapV2Test is Test {
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
 
-        assertGe(dai.balanceOf(address(sessionHandler)), 1900e18);
+        assertGe(usdt.balanceOf(address(sessionHandler)), 1900e18);
         assert(sessionHandler.getRemainingBudget(user) < BUDGET);
     }
 
     /**
      * @notice Session key can execute swapExactETHForTokens through SessionHandler.
-     * @dev Forwards 1 ETH as `value` directly to the router. The router wraps it internally,
-     *      so no prior WETH deposit or ERC20 approval is needed. The ETH value is priced via the
+     * @dev Forwards 1 BNB as `value` directly to the router. The router wraps it internally,
+     *      so no prior WBNB deposit or ERC20 approval is needed. The BNB value is priced via the
      *      oracle and charged against the session budget.
      */
     function testSwapExactETHForTokensWithSession() public routerSessionAdded {
         address dest = config.router;
         uint256 value = 1 ether;
         address[] memory path = new address[](2);
-        path[0] = config.weth;
-        path[1] = config.dai;
+        path[0] = config.wbnb;
+        path[1] = config.usdt;
 
         uint256 amountOutMin = router.getAmountsOut(value, path)[1];
         uint256 deadline = block.timestamp + 2 hours;
@@ -719,27 +732,27 @@ contract SHUniswapV2Test is Test {
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
 
-        assertGe(dai.balanceOf(address(sessionHandler)), amountOutMin);
+        assertGe(usdt.balanceOf(address(sessionHandler)), amountOutMin);
         assertEq(sessionHandler.getRemainingBudget(user), BUDGET - oracle.getUsdValue(address(0), value));
     }
 
     /**
      * @notice Session key can execute swapETHForExactTokens through SessionHandler.
-     * @dev Buys exactly 1,900 DAI with ETH. The required ETH input is computed via
+     * @dev Buys exactly 1,900 DAI with BNB. The required BNB input is computed via
      *      router.getAmountsIn() so the forwarded value is tight. SessionHandlerModule
-     *      charges the full `value` forwarded (not the actual WETH spent by Uniswap), since
-     *      the ETH refund comes back after execution but the budget is already decremented
+     *      charges the full `value` forwarded (not the actual WBNB spent by PancakeSwap), since
+     *      the BNB refund comes back after execution but the budget is already decremented
      *      during preCheck.
      */
     function testSwapEthForExactTokensWithSession() public routerSessionAdded {
         address dest = config.router;
 
         address[] memory path = new address[](2);
-        path[0] = config.weth;
-        path[1] = config.dai;
+        path[0] = config.wbnb;
+        path[1] = config.usdt;
         uint256 amountOut = 1900e18;
         uint256[] memory amounts = router.getAmountsIn(amountOut, path);
-        console2.log("WETH AMOUNT IN  ******************: ", amounts[0]);
+        console2.log("WBNB AMOUNT IN  ******************: ", amounts[0]);
         uint256 value = amounts[0];
 
         uint256 deadline = block.timestamp + 2 hours;
@@ -755,7 +768,7 @@ contract SHUniswapV2Test is Test {
         packedUserOp[0] = userOp;
 
         vm.prank(address(sessionHandler));
-        weth.approve(address(router), type(uint256).max);
+        bnb.approve(address(router), type(uint256).max);
 
         vm.warp(block.timestamp + 1.1 hours);
         _refreshForkFeeds();
@@ -763,24 +776,24 @@ contract SHUniswapV2Test is Test {
         IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
         vm.stopPrank();
 
-        assertGe(dai.balanceOf(address(sessionHandler)), 1900e18);
+        assertGe(usdt.balanceOf(address(sessionHandler)), 1900e18);
         assertEq(sessionHandler.getRemainingBudget(user), BUDGET - oracle.getUsdValue(address(0), value));
     }
 
     /**
      * @notice Session key can execute swapTokensForExactETH through SessionHandler.
-     * @dev Sells DAI to receive exactly 0.5 ETH. The owner first acquires DAI for
-     *      sessionHandler by swapping 2 WETH→DAI and approving the router to spend DAI,
+     * @dev Sells DAI to receive exactly 0.5 BNB. The owner first acquires DAI for
+     *      sessionHandler by swapping 2 WBNB→DAI and approving the router to spend DAI,
      *      both via direct execute() calls (no UserOp). Budget is charged against the USD value
-     *      of the ETH output (amountOut), as extracted by SessionHandlerModule. Assertion uses a
-     *      small tolerance because Uniswap may return slightly more ETH than requested before
+     *      of the BNB output (amountOut), as extracted by SessionHandlerModule. Assertion uses a
+     *      small tolerance because PancakeSwap may return slightly more BNB than requested before
      *      unwrapping.
      */
     function testSwapTokensForExactETHWithSession() public routerSessionAdded {
-        // Owner pre-funds sessionHandler with DAI by swapping WETH → DAI.
+        // Owner pre-funds sessionHandler with DAI by swapping WBNB → DAI.
         address[] memory buyPath = new address[](2);
-        buyPath[0] = config.weth;
-        buyPath[1] = config.dai;
+        buyPath[0] = config.wbnb;
+        buyPath[1] = config.usdt;
 
         vm.startPrank(sessionHandler.owner());
         sessionHandler.execute(
@@ -801,15 +814,15 @@ contract SHUniswapV2Test is Test {
         sessionHandler.execute(
             bytes32(0),
             _encodeExecutionCalldata(
-                config.dai, 0, abi.encodeWithSelector(IERC20.approve.selector, config.router, type(uint256).max)
+                config.usdt, 0, abi.encodeWithSelector(IERC20.approve.selector, config.router, type(uint256).max)
             )
         );
         vm.stopPrank();
 
         address dest = config.router;
         address[] memory path = new address[](2);
-        path[0] = config.dai;
-        path[1] = config.weth;
+        path[0] = config.usdt;
+        path[1] = config.wbnb;
 
         uint256 amountOut = 0.5 ether;
         uint256 spentAMount = oracle.getUsdValue(address(0), amountOut);
@@ -841,16 +854,16 @@ contract SHUniswapV2Test is Test {
 
     /**
      * @notice Session key can execute swapExactTokensForETH through SessionHandler.
-     * @dev Sells exactly 1,000 DAI for at least 0.3 ETH. The owner first swaps 2 WETH→DAI to
+     * @dev Sells exactly 1,000 DAI for at least 0.3 BNB. The owner first swaps 2 WBNB→DAI to
      *      ensure sessionHandler holds enough DAI, then approves the router for DAI. Budget is
      *      charged against the USD value of the DAI sold (tokenIn), as extracted by
-     *      SessionHandlerModule. Assertion uses a small tolerance for the ETH balance.
+     *      SessionHandlerModule. Assertion uses a small tolerance for the BNB balance.
      */
     function testSwapExactTokensForETHWithSession() public routerSessionAdded {
-        // Owner pre-funds sessionHandler with DAI by swapping WETH → DAI.
+        // Owner pre-funds sessionHandler with DAI by swapping WBNB → DAI.
         address[] memory buyPath = new address[](2);
-        buyPath[0] = config.weth;
-        buyPath[1] = config.dai;
+        buyPath[0] = config.wbnb;
+        buyPath[1] = config.usdt;
 
         vm.startPrank(sessionHandler.owner());
         sessionHandler.execute(
@@ -871,15 +884,15 @@ contract SHUniswapV2Test is Test {
         sessionHandler.execute(
             bytes32(0),
             _encodeExecutionCalldata(
-                config.dai, 0, abi.encodeWithSelector(IERC20.approve.selector, config.router, type(uint256).max)
+                config.usdt, 0, abi.encodeWithSelector(IERC20.approve.selector, config.router, type(uint256).max)
             )
         );
         vm.stopPrank();
 
         address dest = config.router;
         address[] memory path = new address[](2);
-        path[0] = config.dai;
-        path[1] = config.weth;
+        path[0] = config.usdt;
+        path[1] = config.wbnb;
 
         uint256 amountIn = 1000e18;
         uint256 amountOutMin = 0.3 ether;
@@ -905,18 +918,18 @@ contract SHUniswapV2Test is Test {
         vm.stopPrank();
 
         assertGe(address(sessionHandler).balance, ethBefore + amountOutMin - 0.01 ether);
-        assertEq(sessionHandler.getRemainingBudget(user), BUDGET - oracle.getUsdValue(config.dai, amountIn));
+        assertEq(sessionHandler.getRemainingBudget(user), BUDGET - oracle.getUsdValue(config.usdt, amountIn));
     }
 
     /**
      * @notice Session key is rejected when the USD value of an addLiquidity call exceeds BUDGET.
-     * @dev Attempts to add 86,500 DAI + proportional WETH (~$173,000 total) against a session
+     * @dev Attempts to add 86,500 DAI + proportional WBNB (~$173,000 total) against a session
      *      with BUDGET = $50,000. preCheck reverts with SessionHandlerModule_SpendingLimitExceeded,
      *      which the EntryPoint catches as a failed execution (handleOps does not revert overall).
      */
     function testAddLiquidityFailsWhenSessionOverBudget() public routerSessionAdded {
-        address tokenA = config.dai;
-        address tokenB = config.weth;
+        address tokenA = config.usdt;
+        address tokenB = config.wbnb;
         uint256 amountADesired = 86500e18;
         uint256 amountBDesired;
         uint256 amountAMin = 1;
@@ -964,13 +977,13 @@ contract SHUniswapV2Test is Test {
 
     /**
      * @notice Session key can execute addLiquidity through SessionHandler.
-     * @dev Adds 2,500 DAI + proportional WETH (~$5,000 total, within BUDGET = $50,000).
+     * @dev Adds 2,500 DAI + proportional WBNB (~$5,000 total, within BUDGET = $50,000).
      *      amountBDesired is computed from live reserves via router.quote(). Budget is charged
      *      against the combined USD value of both tokens deposited.
      */
     function testAddLiquidityWithSession() public routerSessionAdded {
-        address tokenA = config.dai;
-        address tokenB = config.weth;
+        address tokenA = config.usdt;
+        address tokenB = config.wbnb;
         uint256 valueInUsd;
         uint256 amountADesired = 2500e18;
         uint256 amountBDesired;
@@ -1019,15 +1032,15 @@ contract SHUniswapV2Test is Test {
 
     /**
      * @notice Session key can execute addLiquidityETH through SessionHandler.
-     * @dev Adds 2,500 DAI + proportional raw ETH via addLiquidityETH. The ETH amount is derived
+     * @dev Adds 2,500 DAI + proportional raw BNB via addLiquidityETH. The BNB amount is derived
      *      from live reserves via router.quote() and forwarded as the UserOp's value field.
-     *      Budget is charged against the combined USD value of the DAI and the ETH forwarded,
-     *      as extracted by SessionHandlerModule (ETH leg from the UserOp value field, token
+     *      Budget is charged against the combined USD value of the DAI and the BNB forwarded,
+     *      as extracted by SessionHandlerModule (BNB leg from the UserOp value field, token
      *      leg from calldata).
      */
     function testAddLiquidityETHWithSession() public routerSessionAdded {
         uint256 valueInUsd;
-        address token = config.dai;
+        address token = config.usdt;
         uint256 amountEthDesired;
         uint256 amountTokenDesired = 2500e18;
         uint256 amountTokenMin = 1;
@@ -1037,15 +1050,15 @@ contract SHUniswapV2Test is Test {
         uint256 deadline = block.timestamp + 1.2 hours;
         address dest = config.router;
 
-        address pair = FACTORY.getPair(token, config.weth);
-        // Get reserves in token0/token1 order and map to token/WETH order.
+        address pair = FACTORY.getPair(token, config.wbnb);
+        // Get reserves in token0/token1 order and map to token/WBNB order.
         (uint112 r0, uint112 r1,) = IUniswapV2Pair(pair).getReserves();
         address token0 = IUniswapV2Pair(pair).token0();
         (uint256 reserveA, uint256 reserveB) = token0 == token ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
         amountEthDesired = router.quote(amountTokenDesired, reserveA, reserveB);
 
         valueInUsd += oracle.getUsdValue(token, amountTokenDesired);
-        valueInUsd += oracle.getUsdValue(config.weth, amountEthDesired);
+        valueInUsd += oracle.getUsdValue(config.wbnb, amountEthDesired);
 
         PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
 
@@ -1081,7 +1094,7 @@ contract SHUniswapV2Test is Test {
 
     /**
      * @notice Session key can execute removeLiquidity through SessionHandler.
-     * @dev The liquidityAdded(sessionHandler) modifier seeds the pool with 8,000 DAI + WETH on
+     * @dev The liquidityAdded(sessionHandler) modifier seeds the pool with 8,000 DAI + WBNB on
      *      behalf of sessionHandler. Expected return amounts are calculated from live reserves
      *      using the proportional share formula: amount = liquidity * reserve / totalSupply.
      *      removeLiquidity credits back the session budget rather than charging it — spentAmount
@@ -1090,8 +1103,8 @@ contract SHUniswapV2Test is Test {
      *      this session has no prior spend and the credit floors at 0.
      */
     function testRemoveLiquidityWithSession() public routerSessionAdded liquidityAdded(address(sessionHandler)) {
-        address tokenA = config.dai;
-        address tokenB = config.weth;
+        address tokenA = config.usdt;
+        address tokenB = config.wbnb;
         address pair = FACTORY.getPair(tokenA, tokenB);
         uint256 liquidity = IERC20(pair).balanceOf(address(sessionHandler));
         console2.log("LIQUIDITY TO REMOVE: ", liquidity);
@@ -1130,8 +1143,8 @@ contract SHUniswapV2Test is Test {
 
         uint256 balanceAfterA = IERC20(tokenA).balanceOf(to);
         uint256 balanceAfterB = IERC20(tokenB).balanceOf(to);
-        console2.log("DAI :  ", balanceAfterA);
-        console2.log("WETH:   ", balanceAfterB);
+        console2.log("USDT:  ", balanceAfterA);
+        console2.log("WBNB:   ", balanceAfterB);
 
         assertEq(IERC20(pair).balanceOf(to), 0);
         assertEq(balanceAfterA, balanceBeforeA + expectedA);
@@ -1141,12 +1154,12 @@ contract SHUniswapV2Test is Test {
 
     /**
      * @notice Session key can execute removeLiquidityETH through SessionHandler.
-     * @dev The liquidityAdded(sessionHandler) modifier seeds the pool with 8,000 DAI + WETH on
+     * @dev The liquidityAdded(sessionHandler) modifier seeds the pool with 8,000 DAI + WBNB on
      *      behalf of sessionHandler. removeLiquidityETH burns the LP tokens, returns the DAI
-     *      share as an ERC20 transfer, and unwraps the WETH share to raw ETH sent to `to`.
-     *      The ETH balance assertion is omitted because the EntryPoint deducts the full prefund
-     *      from sessionHandler's raw ETH balance upfront; any unused gas is refunded to the
-     *      EntryPoint deposit ledger (not to the ETH balance), making a clean delta assertion
+     *      share as an ERC20 transfer, and unwraps the WBNB share to raw BNB sent to `to`.
+     *      The BNB balance assertion is omitted because the EntryPoint deducts the full prefund
+     *      from sessionHandler's raw BNB balance upfront; any unused gas is refunded to the
+     *      EntryPoint deposit ledger (not to the BNB balance), making a clean delta assertion
      *      impractical without mocking the EntryPoint gas accounting.
      */
     function testRemoveLiquidityETHWithSession()
@@ -1154,8 +1167,8 @@ contract SHUniswapV2Test is Test {
         routerSessionAdded
         liquidityAdded(address(sessionHandler))
     {
-        address token = config.dai;
-        address pair = FACTORY.getPair(token, config.weth);
+        address token = config.usdt;
+        address pair = FACTORY.getPair(token, config.wbnb);
         uint256 liquidity = IERC20(pair).balanceOf(address(sessionHandler));
 
         address to = address(sessionHandler);
@@ -1189,8 +1202,8 @@ contract SHUniswapV2Test is Test {
         vm.stopPrank();
         uint256 balanceAfterToken = IERC20(token).balanceOf(to);
 
-        console2.log("DAI :  ", amountToken);
-        console2.log("ETH:   ", amountEth);
+        console2.log("USDT:  ", amountToken);
+        console2.log("BNB:   ", amountEth);
 
         assertEq(IERC20(pair).balanceOf(address(sessionHandler)), 0);
         assertEq(balanceAfterToken - balanceBeforeToken, amountToken);

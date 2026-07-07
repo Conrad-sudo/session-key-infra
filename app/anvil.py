@@ -7,8 +7,12 @@ from network_config import load_network_config
 from contracts import (
     load_session_handler,
     load_entry_point,
+    load_session_handler_module,
+    pack_execution_calldata,
+    session_key_nonce_key,
+    ERC7579_SINGLE_CALL_MODE,
 )
-from constants import CHAIN_ID_ANVIL, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA
+from constants import CHAIN_ID_ANVIL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA
 import db
 from vault_signer import encrypt_key, decrypt_key
 
@@ -58,6 +62,7 @@ def create_unsigned_user_op(
     entry_point: Contract,
     nonce: int,
     calldata: str,
+    beneficiary: str,
 ) -> tuple[tuple, int, int]:
     """
     Constructs an unsigned ERC-4337 PackedUserOperation tuple.
@@ -72,12 +77,16 @@ def create_unsigned_user_op(
     @param entry_point     Bound EntryPoint contract.
     @param nonce           The sender's current nonce from the EntryPoint.
     @param calldata        Hex-encoded SessionHandler.execute() calldata (0x-prefixed).
+    @param beneficiary     Address the dummy handleOps probe credits gas compensation to.
+                           Must be the same address the real handleOps call will use — the
+                           EntryPoint's final _compensate() step does a plain ETH send to it,
+                           which reverts (AA91) against any address with code that lacks a
+                           payable receive/fallback (e.g. an EIP-7702-delegated EOA).
     @return                A tuple of (unsigned PackedUserOperation, outer_gas, gas_price) where
                            outer_gas is 2x the estimated inner gas so the EntryPoint AA95 check
                            passes, and gas_price is the snapshot used to build gas_fees — must be
                            reused on the outer tx so the EntryPoint prefund check is consistent.
     """
-    owner_address = session_handler.functions.owner().call()
     w3, _, _ = load_network_config(chat_id)
 
     # Use modest placeholder limits for the dummy op so the EntryPoint's prefund
@@ -107,7 +116,7 @@ def create_unsigned_user_op(
             "to": entry_point.address,
             "data": entry_point.encode_abi(
                 abi_element_identifier="handleOps",
-                args=[[signed_dummy_op], owner_address],
+                args=[[signed_dummy_op], beneficiary],
             ),
         }
     )
@@ -176,14 +185,16 @@ def create_signed_user_op(
 
 
 def send_user_op_as_session(
-    chat_id: int, key_ciphertext: str, target: str, value: int, data: bytes, price_update_data: list[str] = []
+    chat_id: int, key_ciphertext: str, target: str, value: int, data: bytes
 ):
     """
     Orchestrates the full ERC-4337 UserOperation flow for a session key holder.
 
-    Encodes SessionHandler.execute() as the UserOp calldata, builds an unsigned
-    PackedUserOperation, signs it with the session key via EIP-191, and submits
-    it to the EntryPoint via handleOps(). The bundler key from the environment
+    Packs (target, value, data) into ERC-7579 executionCalldata and encodes
+    SessionHandler.execute(mode, executionCalldata) as the UserOp calldata, fetches a
+    nonce keyed to the installed SessionHandlerModule (so the account routes validation to
+    it), builds an unsigned PackedUserOperation, signs it with the session key via EIP-191,
+    and submits it to the EntryPoint via handleOps(). The bundler key from the environment
     signs and sends the outer transaction.
 
     @param chat_id        The Telegram chat ID of the user.
@@ -191,9 +202,6 @@ def send_user_op_as_session(
     @param target         The contract address SessionHandler will call (e.g. USDC).
     @param value          The ETH value in wei to forward with the inner call.
     @param data           ABI-encoded inner calldata to execute on the target.
-    @param price_update_data Pyth update payload(s) from fetch_price_update_data(), or
-                          [] to skip the refresh (SessionHandler forwards this to
-                          SHOracle.updatePrices before computing USD values).
     @return               A tuple of (tx_hash, receipt).
     """
 
@@ -204,16 +212,25 @@ def send_user_op_as_session(
         bundler = w3.eth.account.from_key(os.getenv("MAINNET_BUNDLER"))
     elif chain_id == CHAIN_ID_SEPOLIA:
         bundler = w3.eth.account.from_key(os.getenv("SEPOLIA_BUNDLER"))
+    elif chain_id == CHAIN_ID_BSC:
+        bundler = w3.eth.account.from_key(os.getenv("BSC_BUNDLER"))
+    elif chain_id == CHAIN_ID_CELO:
+        bundler = w3.eth.account.from_key(os.getenv("CELO_BUNDLER"))
     else:
         raise ValueError(f"No bundler configured for chain_id {chain_id}")
     session_handler = load_session_handler(chat_id=chat_id)
+    module = load_session_handler_module(chat_id=chat_id)
 
+    execution_calldata = pack_execution_calldata(target, value, data)
     calldata = session_handler.encode_abi(
-        abi_element_identifier="execute", args=[target, value, data, price_update_data]
+        abi_element_identifier="execute",
+        args=[ERC7579_SINGLE_CALL_MODE, execution_calldata],
     )
 
     entry_point = load_entry_point(chat_id=chat_id)
-    nonce = entry_point.functions.getNonce(session_handler.address, 0).call()
+    nonce = entry_point.functions.getNonce(
+        session_handler.address, session_key_nonce_key(module.address)
+    ).call()
 
     print("\n[1/3] Creating transaction  ...")
     user_op, gas_limit, gas_price = create_unsigned_user_op(
@@ -223,6 +240,7 @@ def send_user_op_as_session(
         entry_point=entry_point,
         nonce=nonce,
         calldata=calldata,
+        beneficiary=bundler.address,
     )
     print("[2/3] Signing transaction   ...")
     user_op_signed = create_signed_user_op(

@@ -12,6 +12,8 @@ import {SessionHandler} from "./SessionHandler.sol";
 
 contract SHFactory is Ownable, Pausable {
     error SHFactory_FundTransferFailed();
+    /// @dev Thrown by deployWallet when no SessionHandlerModule has been configured yet.
+    error SHFactory_SpendingLimitModuleNotSet();
 
     /// @notice The SHRegistry address that deployed SessionHandlers read protocol configuration from.
     address private immutable REGISTRY;
@@ -24,10 +26,17 @@ contract SHFactory is Ownable, Pausable {
 
     /// @notice Total number of wallets deployed. Doubles as the next walletId to assign.
     uint256 public totalWallets;
-    /// @notice Maps each sequential walletId to its deployed SessionHandler address.
+    /// @notice Maps each sequential walletId to its deployed wallet address.
     mapping(uint256 => address) public wallets;
 
+    /// @notice SessionHandlerModule module address installed on every SessionHandler deployed here.
+    /// @dev Settable rather than immutable, consistent with how SHRegistry's own dependent addresses
+    ///      (priceOracle, callValueInterpreter, router) are owner-updatable without redeployment.
+    ///      deployWallet reverts while this is unset.
+    address public spendingLimitModule;
+
     event WalletDeployed(address indexed walletAddress, address indexed owner, uint256 indexed walletId);
+    event SpendingLimitModuleUpdated(address indexed oldModule, address indexed newModule);
 
     /**
      * @param _entryPoint         The canonical ERC-4337 EntryPoint address.
@@ -55,10 +64,26 @@ contract SHFactory is Ownable, Pausable {
         _unpause();
     }
 
+    /// @notice Sets the SessionHandlerModule module installed on every wallet deployed from
+    ///         this point on. Only callable by the owner.
+    /// @param newModule The deployed SessionHandlerModule address. May be address(0) to pause
+    ///                  deployWallet without pausing the whole factory.
+    function setSpendingLimitModule(address newModule) external onlyOwner {
+        address old = spendingLimitModule;
+        spendingLimitModule = newModule;
+        emit SpendingLimitModuleUpdated(old, newModule);
+    }
+
+    /// @notice Deploys a SessionHandler (ERC-7579 account) with spendingLimitModule installed as
+    ///         both its validator and hook. Reverts if spendingLimitModule hasn't been set.
     function deployWallet() external payable whenNotPaused returns (address) {
+        address module = spendingLimitModule;
+        if (module == address(0)) revert SHFactory_SpendingLimitModuleNotSet();
+
         uint256 walletId = totalWallets;
-        SessionHandler sessionHandler =
-            new SessionHandler(msg.sender, ENTRY_POINT, REPUTATION_REGISTRY, IDENTITY_REGISTRY, REGISTRY, walletId);
+        SessionHandler sessionHandler = new SessionHandler(
+            msg.sender, ENTRY_POINT, REPUTATION_REGISTRY, IDENTITY_REGISTRY, REGISTRY, walletId, module
+        );
 
         wallets[walletId] = address(sessionHandler);
         totalWallets = walletId + 1;

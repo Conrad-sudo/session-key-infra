@@ -7,13 +7,14 @@ import {SHTreasury} from "../src/SHTreasury.sol";
 import {SHFactory} from "../src/SHFactory.sol";
 import {SHValueInterpreter} from "../src/SHValueInterpreter.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
-
+import {SessionHandlerModule} from "../src/SessionHandlerModule.sol";
+import "./Constants.s.sol";
 /**
  * @title DeploySHProtocol
  * @notice Deployment script for the SessionHandler protocol's shared infrastructure
  * @dev Retrieves network configuration from HelperConfig and deploys the SHOracle,
- *      SHTreasury (which deploys its own SHRegistry), and SHFactory. Individual
- *      SessionHandler wallets are deployed later via SHFactory.deployWallet().
+ *      SHTreasury (which deploys its own SHRegistry), SessionHandlerModule, and SHFactory.
+ *      Individual SessionHandler wallets are deployed later via SHFactory.deployWallet().
  *
  *      Deployment is broadcast as config.account so that account becomes the
  *      Ownable owner of SHTreasury and SHFactory.
@@ -48,71 +49,106 @@ contract DeploySHProtocol is Script {
         HelperConfig helperConfig = new HelperConfig();
         config = helperConfig.getConfig();
 
-        // Broadcast as config.account so it becomes the Ownable owner of SHTreasury and SHFactory
-        vm.startBroadcast(config.account);
-
         // Build parallel token/feed arrays for SHOracle.
         // address(0) registers native ETH. Pairs with a zero feed are skipped inside the constructor,
-        // so it is safe to pass a zero feed entry for tokens unavailable on the current network.
+        // so it is safe to pass address(0) feed entries for tokens unavailable on the current network.
         address[] memory tokens = new address[](20);
-        bytes32[] memory priceFeeds = new bytes32[](20);
+        address[] memory priceFeeds = new address[](20);
+        uint256[] memory heartbeats = new uint256[](20);
         tokens[0] = address(0);
+        
+        if (block.chainid== BSC_CHAIN_ID){
+        priceFeeds[0] = config.bnbUsdPriceFeed;
+        heartbeats[0] = config.bnbHeartbeat;
+        }
+        else if (block.chainid== MAINNET_CHAIN_ID||block.chainid== SEPOLIA_CHAIN_ID||block.chainid== LOCAL_CHAIN_ID){
         priceFeeds[0] = config.ethUsdPriceFeed;
+        heartbeats[0] = config.ethHeartbeat;
+
+        }
+        
         tokens[1] = config.usdc;
         priceFeeds[1] = config.usdcUsdPriceFeed;
+        heartbeats[1] = config.usdcHeartbeat;
         tokens[2] = config.dai;
         priceFeeds[2] = config.daiUsdPriceFeed;
+        heartbeats[2] = config.daiHeartbeat;
         tokens[3] = config.aave;
         priceFeeds[3] = config.aaveUsdPriceFeed;
+        heartbeats[3] = config.aaveHeartbeat;
         tokens[4] = config.link;
         priceFeeds[4] = config.linkUsdPriceFeed;
+        heartbeats[4] = config.linkHeartbeat;
         tokens[5] = config.oneinch;
         priceFeeds[5] = config.oneinchUsdPriceFeed;
+        heartbeats[5] = config.oneinchHeartbeat;
         tokens[6] = config.ape;
         priceFeeds[6] = config.apeUsdPriceFeed;
+        heartbeats[6] = config.apeHeartbeat;
         tokens[7] = config.arb;
         priceFeeds[7] = config.arbUsdPriceFeed;
-        tokens[8] = config.bnb;
+        heartbeats[7] = config.arbHeartbeat;
+        tokens[8] = config.wbnb;
         priceFeeds[8] = config.bnbUsdPriceFeed;
+        heartbeats[8] = config.bnbHeartbeat;
         tokens[9] = config.wbtc;
         priceFeeds[9] = config.btcUsdPriceFeed;
+        heartbeats[9] = config.btcHeartbeat;
         tokens[10] = config.comp;
         priceFeeds[10] = config.compUsdPriceFeed;
+        heartbeats[10] = config.compHeartbeat;
         tokens[11] = config.crv;
         priceFeeds[11] = config.crvUsdPriceFeed;
+        heartbeats[11] = config.crvHeartbeat;
         tokens[12] = config.ens;
         priceFeeds[12] = config.ensUsdPriceFeed;
+        heartbeats[12] = config.ensHeartbeat;
         tokens[13] = config.sand;
         priceFeeds[13] = config.sandUsdPriceFeed;
+        heartbeats[13] = config.sandHeartbeat;
         tokens[14] = config.sushi;
         priceFeeds[14] = config.sushiUsdPriceFeed;
+        heartbeats[14] = config.sushiHeartbeat;
         tokens[15] = config.wtao;
         priceFeeds[15] = config.wtaoUsdPriceFeed;
+        heartbeats[15] = config.wtaoHeartbeat;
         tokens[16] = config.uni;
         priceFeeds[16] = config.uniUsdPriceFeed;
+        heartbeats[16] = config.uniHeartbeat;
         tokens[17] = config.yfi;
         priceFeeds[17] = config.yfiUsdPriceFeed;
+        heartbeats[17] = config.yfiHeartbeat;
         tokens[18] = config.weth;
         priceFeeds[18] = config.ethUsdPriceFeed;
+        heartbeats[18] = config.ethHeartbeat;
         tokens[19] = config.usdt;
         priceFeeds[19] = config.usdtUsdPriceFeed;
+        heartbeats[19] = config.usdtHeartbeat;
 
+        vm.deal(config.account, 100 ether); // Fund the deployer account with 10 ETH for deployment costs
+
+        // Broadcast as config.account so it becomes the Ownable owner of SHTreasury and SHFactory
+        vm.startBroadcast(config.account);
+        
         //deploy price oracle
-        oracle = new SHOracle(config.pyth, tokens, priceFeeds, config.heartbeat);
+        oracle = new SHOracle(tokens, priceFeeds, heartbeats);
         //register the agent
         uint256 agentId = IIdentityRegistry(config.identityRegistry).register(AGENT_URI);
 
         // SHTreasury deploys the SHRegistry in its constructor.
-        treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId, config.uniswapRouter);
+        treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId, config.router);
 
         // deploy value interpreter and wire it into the registry
         SHValueInterpreter interpreter = new SHValueInterpreter(treasury.REGISTRY());
         treasury.setCallValueInterpreter(address(interpreter));
 
+        // deploy the ERC-7579 spending-limit module, wired to the same registry
+        SessionHandlerModule module = new SessionHandlerModule(treasury.REGISTRY());
+
         //deploy factory
         factory =
             new SHFactory(config.entryPoint, treasury.REGISTRY(), config.reputationRegistry, config.identityRegistry);
-
+        factory.setSpendingLimitModule(address(module));
         vm.stopBroadcast();
     }
 }
