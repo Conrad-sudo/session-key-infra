@@ -7,6 +7,15 @@ from db import (
     get_factory_address,
 )
 from constants import UNISWAP_V2_FACTORY, PANCAKE_V2_FACTORY, UBESWAP_V2_FACTORY, ETH_SENTINEL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET
+from abi import (
+    ientry_point,
+    iweth,
+    ierc20_extended,
+    iuniswap_v2_router02,
+    iuniswap_v2_factory,
+    ireputation_registry,
+    iuniswap_v2_pair,
+)
 
 _session_handler_cache: dict[int, Contract] = {}
 _entry_point_cache: dict[int, Contract] = {}
@@ -85,7 +94,7 @@ def load_entry_point(chat_id: int) -> Contract:
     """
     if chat_id not in _entry_point_cache:
         w3, _, _ = load_network_config(chat_id)
-        abi = get_json("./app/artifacts/IEntryPoint.json")["abi"]
+        abi = ientry_point
         # entryPoint() (lowercase, a function) — SessionHandler inherits this from OZ's
         # Account.sol.
         address = load_session_handler(chat_id).functions.ENTRY_POINT().call()
@@ -135,9 +144,9 @@ def load_ierc20(chat_id: int, token: str, uniswap_pair=False) -> Contract:
     if key not in _erc20_cache:
         w3, chain_id, _ = load_network_config(chat_id)
         if token in ("weth", "wbnb"):
-            abi = get_json("./app/artifacts/IWETH.json")["abi"]
+            abi = iweth
         else:
-            abi = get_json("./app/artifacts/IERC20Extended.json")["abi"]
+            abi = ierc20_extended
         if uniswap_pair:
             address = token
         else:
@@ -187,7 +196,7 @@ def load_iuniswap_router(chat_id: int) -> Contract:
     """
     if chat_id not in _router_cache:
         w3, _, _ = load_network_config(chat_id)
-        abi = get_json("./app/artifacts/IUniswapV2Router02.json")["abi"]
+        abi = iuniswap_v2_router02
         address = load_session_handler(chat_id).functions.getRouter().call()
         _router_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _router_cache[chat_id]
@@ -203,7 +212,7 @@ def load_iuniswap_factory(chat_id: int) -> Contract:
 
     if chat_id not in _factory_cache:
         w3, chain_id, _ = load_network_config(chat_id)
-        abi = get_json("./app/artifacts/IUniswapV2Factory.json")["abi"]
+        abi = iuniswap_v2_factory
         if chain_id == CHAIN_ID_MAINNET:
             address = UNISWAP_V2_FACTORY
         elif chain_id == CHAIN_ID_BSC:
@@ -222,7 +231,7 @@ def load_reputation_registry(chat_id: int) -> Contract:
     if chat_id not in _reputation_registry_cache:
         w3, _, _ = load_network_config(chat_id)
        
-        abi = get_json("./app/artifacts/IReputationRegistry.json")["abi"]
+        abi = ireputation_registry
         address = load_session_handler(chat_id).functions.REPUTATION_REGISTRY().call()
         _reputation_registry_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _reputation_registry_cache[chat_id]
@@ -248,6 +257,6 @@ def load_iuniswap_pair(chat_id: int, token_a: str, token_b: str) -> Contract:
             raise ValueError(
                 f"No Uniswap V2 pool exists for {token_a.upper()}/{token_b.upper()}."
             )
-        abi = get_json("./app/artifacts/IUniswapV2Pair.json")["abi"]
+        abi = iuniswap_v2_pair
         _pair_cache[key] = w3.eth.contract(address=address, abi=abi)
     return _pair_cache[key]

@@ -208,16 +208,10 @@ def send_user_op_as_session(
     w3, chain_id, _ = load_network_config(chat_id)
     if chain_id == CHAIN_ID_ANVIL:
         bundler = w3.eth.account.from_key(os.getenv("ANVIL_BUNDLER"))
-    elif chain_id == CHAIN_ID_MAINNET:
-        bundler = w3.eth.account.from_key(os.getenv("MAINNET_BUNDLER"))
-    elif chain_id == CHAIN_ID_SEPOLIA:
-        bundler = w3.eth.account.from_key(os.getenv("SEPOLIA_BUNDLER"))
-    elif chain_id == CHAIN_ID_BSC:
-        bundler = w3.eth.account.from_key(os.getenv("BSC_BUNDLER"))
-    elif chain_id == CHAIN_ID_CELO:
-        bundler = w3.eth.account.from_key(os.getenv("CELO_BUNDLER"))
     else:
-        raise ValueError(f"No bundler configured for chain_id {chain_id}")
+        bundler = w3.eth.account.from_key(os.getenv("FORK_DEPLOYER_PK"))
+    
+   
     session_handler = load_session_handler(chat_id=chat_id)
     module = load_session_handler_module(chat_id=chat_id)
 

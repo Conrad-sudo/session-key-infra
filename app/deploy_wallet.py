@@ -43,9 +43,9 @@ LIVE_PRIVATE_KEY_ENV = {
     "sepolia": "SEPOLIA_PRIVATE_KEY",
     "bsc": "BSC_PRIVATE_KEY",
     "celo": "CELO_PRIVATE_KEY",
-    "sepolia-fork": "SEPOLIA_PRIVATE_KEY",
-    "bsc-fork": "BSC_PRIVATE_KEY",
-    "celo-fork": "CELO_PRIVATE_KEY",
+    "sepolia-fork": "FORK_DEPLOYER_PK",
+    "bsc-fork": "FORK_DEPLOYER_PK",
+    "celo-fork": "FORK_DEPLOYER_PK",
 }
 
 
@@ -516,8 +516,8 @@ def deploy(chat_id: int, network: str):
 
 if __name__ == "__main__":
     chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
-    #save_contact(chat_id=chat_id,name="tim",address="0x9f4d8D3f66C47c75b95325f01861d1643825Bffc")
-    #network = sys.argv[1] if len(sys.argv) > 1 else "sepolia-fork"
-    #deploy(chat_id=chat_id, network=network)
-    #add_default_session(chat_id=chat_id)
+    save_contact(chat_id=chat_id,name="tim",address="0x9f4d8D3f66C47c75b95325f01861d1643825Bffc")
+    network = sys.argv[1] if len(sys.argv) > 1 else "sepolia-fork"
+    deploy(chat_id=chat_id, network=network)
+    add_default_session(chat_id=chat_id)
     approve(chat_id=chat_id, token="wbnb")
