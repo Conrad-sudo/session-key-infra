@@ -2349,7 +2349,7 @@ def get_agent_reputation(chat_id: int) -> dict:
     """
     print("Running get_agent_reputation")
     agent_id, count, summary_value, summary_value_decimals = load_session_handler(chat_id).functions.getAgentReputation().call()
-    average_score = round(summary_value / (10 ** summary_value_decimals) / count, 2) if count > 0 else 0
+    average_score = round(summary_value / (10 ** summary_value_decimals), 2) if count > 0 else 0
     return {
         "token_id": agent_id,
         "average_score": average_score,
@@ -2417,6 +2417,7 @@ def get_tools(job_queue=None):
         get_recurring_transfers,
         # Blockchain tools
         get_eth_balance,
+        get_native_asset,
         send_eth,
         get_session_keys,
         check_session_validity,

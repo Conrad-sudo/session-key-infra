@@ -23,6 +23,8 @@ address constant ENTRYPOINT_V07 = 0x0000000071727De22E5E9d8BAf0edAc6f37da032;
 address constant MNT_REPUTATION_REGISTRY = 0x8004BAa17C55a88189AE136b182e5fdA19dE9b63;
 address constant MNT_IDENTITY_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
 
+
+
 // ─── Testnet Agent Registries ─────────────────────────────────────────────────
 address constant TESTNET_REPUTATION_REGISTRY = 0x8004B663056A597Dffe9eCcC1965A193B7388713;
 address constant TESTNET_IDENTITY_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A494BD9e;
@@ -31,9 +33,13 @@ address constant TESTNET_IDENTITY_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A
                         ROUTERS
 //////////////////////////////////////////////////////////////*/
 
-// ─── Uniswap ──────────────────────────────────────────────────────────────────
-address constant UNISWAP_V2_ROUTER_02 = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
-address constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+// ─── Mainnet Uniswap ──────────────────────────────────────────────────────────────────
+address constant MNT_UNISWAP_V2_ROUTER_02 = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+address constant MNT_UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+
+// ─── Sepolia Uniswap ──────────────────────────────────────────────────────────────────
+address constant SPO_UNISWAP_V2_ROUTER_02 = 0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3;
+address constant SPO_UNISWAP_V2_FACTORY = 0xF62c03E08ada871A0bEb309762E260a7a6a880E6;
 
 // ─── PancakeSwap ──────────────────────────────────────────────────────────────
 address constant PANCAKE_V2_ROUTER_02 = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
@@ -95,18 +101,18 @@ address constant MNT_KNC_USD_PRICE_FEED = 0xf8fF43E991A81e6eC886a3D281A2C6cC19aE
 //////////////////////////////////////////////////////////////*/
 
 // ─── Sepolia Tokens ───────────────────────────────────────────────────────────
-address constant SEPOLIA_USDC = 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
-address constant SEPOLIA_WETH = 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
-address constant SEPOLIA_DAI = 0x68194a729C2450ad26072b3D33ADaCbcef39D574;
-address constant SEPOLIA_LINK = 0x779877A7B0D9E8603169DdbD7836e478b4624789; // Chainlink faucet token
-address constant SEPOLIA_WBTC = 0x29f2D40B0605204364af54EC677bD022dA425d03; // Aave V3 testnet token
+address constant SPO_USDC = 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
+address constant SPO_WETH = 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
+address constant SPO_DAI = 0x68194a729C2450ad26072b3D33ADaCbcef39D574;
+address constant SPO_LINK = 0x779877A7B0D9E8603169DdbD7836e478b4624789; // Chainlink faucet token
+address constant SPO_WBTC = 0x29f2D40B0605204364af54EC677bD022dA425d03; // Aave V3 testnet token
 
 // ─── Sepolia Price Feeds ──────────────────────────────────────────────────────
-address constant SEPOLIA_ETH_USD_PRICE_FEED = 0x694AA1769357215DE4FAC081bf1f309aDC325306;
-address constant SEPOLIA_USDC_USD_PRICE_FEED = 0xA2F78ab2355fe2f984D808B5CeE7FD0A93D5270E;
-address constant SEPOLIA_DAI_USD_PRICE_FEED = 0x14866185B1962B63C3Ea9E03Bc1da838bab34C19;
-address constant SEPOLIA_LINK_USD_PRICE_FEED = 0xc59E3633BAAC79493d908e63626716e204A45EdF;
-address constant SEPOLIA_BTC_USD_PRICE_FEED = 0x1b44F3514812d835EB1BDB0acB33d3fA3351Ee43;
+address constant SPO_ETH_USD_PRICE_FEED = 0x694AA1769357215DE4FAC081bf1f309aDC325306;
+address constant SPO_USDC_USD_PRICE_FEED = 0xA2F78ab2355fe2f984D808B5CeE7FD0A93D5270E;
+address constant SPO_DAI_USD_PRICE_FEED = 0x14866185B1962B63C3Ea9E03Bc1da838bab34C19;
+address constant SPO_LINK_USD_PRICE_FEED = 0xc59E3633BAAC79493d908e63626716e204A45EdF;
+address constant SPO_BTC_USD_PRICE_FEED = 0x1b44F3514812d835EB1BDB0acB33d3fA3351Ee43;
 
 /*//////////////////////////////////////////////////////////////
                   BSC (BINANCE SMART CHAIN)
@@ -207,3 +213,10 @@ int256 constant USDT_USD_PRICE = 1e8;
 uint256 constant HEARTBEAT_1H = 1 hours;
 
 uint256 constant HEARTBEAT_24H = 24 hours;
+
+/// @dev Sepolia's Chainlink nodes update noticeably less often than mainnet's — observed gaps
+///      of ~16-17h on the USDC/DAI feeds in practice (ETH/LINK/BTC typically stay under 1h).
+///      This is an accepted characteristic of testnet oracles, not a real staleness risk (no
+///      real economic value at stake), so Sepolia heartbeats use this wider window instead of
+///      HEARTBEAT_24H, which cuts it too close to the observed worst case.
+uint256 constant HEARTBEAT_72H = 72 hours;

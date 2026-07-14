@@ -205,13 +205,14 @@ def send_user_op_as_session(
     @return               A tuple of (tx_hash, receipt).
     """
 
+    # FORK_DEPLOYER_PK is shared across every fork network (mainnet-fork/sepolia-fork/bsc-fork/
+    # celo-fork) — deploy_wallet.py's prefund() funds this same key, so it always has gas here.
     w3, chain_id, _ = load_network_config(chat_id)
     if chain_id == CHAIN_ID_ANVIL:
         bundler = w3.eth.account.from_key(os.getenv("ANVIL_BUNDLER"))
     else:
         bundler = w3.eth.account.from_key(os.getenv("FORK_DEPLOYER_PK"))
-    
-   
+
     session_handler = load_session_handler(chat_id=chat_id)
     module = load_session_handler_module(chat_id=chat_id)
 

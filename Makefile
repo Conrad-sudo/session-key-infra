@@ -1,6 +1,6 @@
 -include .env
 
-.PHONY: all test clean deploy help install snapshot format anvil bot db agent vault
+.PHONY: all test clean deploy install snapshot anvil bot db agent vault setup
 
 
 
@@ -39,9 +39,11 @@ snapshot:
 unit-test:
 	forge test --match-path test/unit/SHProtocolTest.t.sol -vvvv
 
-uniswap-test:
+mainnet-uniswap-test:
 	forge test --match-path test/fork/SHUniswapV2Test.t.sol --fork-url $(MAINNET_RPC_URL) -vvvv
 
+sepolia-uniswap-test:
+	forge test --match-path test/fork/SHSepoliaUniswapV2Test.t.sol --fork-url $(SEPOLIA_RPC_URL) -vvvv
 pancakeswap-test:
 	forge test --match-path test/fork/SHPancakeswapV2Test.t.sol --fork-url $(BSC_RPC_URL) -vvvv
 
@@ -70,15 +72,25 @@ celo-fork:
 
 # ── Funding Wallets────────────────────────────────────────────────────────────────────
 
+# anvil_setBalance is a local-fork-only cheat RPC, so this always targets LOCAL_RPC_URL
+# regardless of which network ARGS names — only the funded address depends on ARGS.
+# sepolia(-fork) funds the real SEPOLIA_ACCOUNT deployer; every other network (mainnet,
+# bsc, celo, and their -fork variants) funds the shared FORK_DEPLOYER_ADDRESS.
+FUND_ADDRESS := $(FORK_DEPLOYER_ADDRESS)
 
-fund-mainnet:
-	cast rpc anvil_setBalance $(SEPOLIA_ACCOUNT) $(100_ETH) --rpc-url $(LOCAL_RPC_URL)
-fund-bsc:
-	cast rpc anvil_setBalance $(FORK_DEPLOYER_ADDRESS) $(100_ETH) --rpc-url $(LOCAL_RPC_URL)
-fund-sepolia:
-	cast rpc anvil_setBalance $(SEPOLIA_ACCOUNT) $(100_ETH) --rpc-url $(LOCAL_RPC_URL)
-fund-celo:
-	cast rpc anvil_setBalance $(FORK_DEPLOYER_ADDRESS) $(100_ETH) --rpc-url $(LOCAL_RPC_URL)
+ifeq ($(findstring sepolia,$(ARGS)),sepolia)
+	FUND_ADDRESS := $(SEPOLIA_ACCOUNT)
+endif
+
+# Live networks (bare "sepolia"/"bsc", not their -fork variants) have no local Anvil node
+# to send anvil_setBalance to — skip rather than fail, so `make setup ARGS="sepolia"` etc.
+# can safely include this step for every network without special-casing it elsewhere.
+fund:
+	@if echo "$(ARGS)" | grep -qE '^(sepolia|bsc)$$'; then \
+		echo "Skipping fund — '$(ARGS)' is a live network with no local Anvil node to fund on."; \
+	else \
+		cast rpc anvil_setBalance $(FUND_ADDRESS) $(100_ETH) --rpc-url $(LOCAL_RPC_URL); \
+	fi
 
 
 
@@ -118,7 +130,7 @@ else ifeq ($(findstring sepolia,$(ARGS)),sepolia)
 endif
 
 
-deploy-protocol:
+deploy:
 	forge script script/DeploySHProtocol.s.sol $(NETWORK_ARGS)
 
 
@@ -137,4 +149,14 @@ bot:
 
 agent:
 	.venv/bin/python3 app/smart_wallet_agent.py
+
+
+# ── Combined workflows ──────────────────────────────────────────────────────────
+
+# Runs deploy -> db -> deploy-wallet -> agent in sequence (stops if any step fails).
+# Assumes Vault is already running and configured (`make vault`) — not part of this
+# chain since, once started, Vault persists across redeploys and doesn't need to be
+# re-run every time. Pass the same ARGS you'd give `deploy`/`deploy-wallet` individually,
+# e.g. `make setup ARGS="sepolia-fork"` — both steps read the same $(ARGS).
+setup: deploy fund db deploy-wallet agent
 

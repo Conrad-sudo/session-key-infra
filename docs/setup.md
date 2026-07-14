@@ -25,11 +25,22 @@ Every network (Anvil, Ethereum mainnet fork, Sepolia fork, live Sepolia, BSC for
 
    > **Watch for stale addresses.** Every re-run of `forge script script/DeploySHProtocol.s.sol --broadcast` on the same chain overwrites that chain's `run-latest.json` with a fresh set of addresses (new nonces → different addresses for every contract, including `SHFactory`). If you deploy again without re-running `make db`, the DB keeps pointing at the old (now-wrong) addresses — this can fail in a confusing way, since the old address might still have *some* contract's bytecode at it (e.g. a previous deployment's `SessionHandlerModule`), producing an empty-revert rather than an obvious "no code" error.
 
-5. **Deploy your wallet** — `make deploy-wallet`. Calls `SHFactory.deployWallet()` to create a per-user `SessionHandler` (with `SessionHandlerModule` auto-installed as both validator and hook), funds it with 10 ETH (and the bundler, on forks), and registers a default set of session keys.
+5. **Deploy your wallet** — `make deploy-wallet ARGS="<network>"`. Calls `SHFactory.deployWallet()` to create a per-user `SessionHandler` (with `SessionHandlerModule` auto-installed as both validator and hook), funds it with 10 ETH (and the bundler, on forks), and registers a default set of session keys.
 
-   > **Before running this**, open [app/deploy_wallet.py](../app/deploy_wallet.py) and check the `network` argument passed to `deploy()` in the `__main__` block at the bottom of the file. It must exactly match the network you started in step 1 and deployed to in step 2 (`"anvil"`, `"mainnet-fork"`, `"sepolia-fork"`, `"sepolia"`, `"bsc-fork"`, or `"bsc"`). If it doesn't match, the script will look up the wrong factory address (or none at all) and fail.
+   > **`ARGS` here must exactly match** the network you started in step 1 and deployed to in step 2 (`"anvil"`, `"mainnet-fork"`, `"sepolia-fork"`, `"sepolia"`, `"bsc-fork"`, or `"bsc"`) — `deploy_wallet.py`'s `deploy()` dispatcher passes it straight through to `network`. If it doesn't match, the script will look up the wrong factory address (or none at all) and fail. Omitting `ARGS` defaults to `"anvil"`, matching `make deploy`'s own no-`ARGS` default.
 
 6. **Start talking to it** — `make bot` (Telegram) or `make agent` (interactive CLI).
+
+> **Shortcut — `make setup ARGS="<network>"`.** Runs steps 2, 4, 5, and 6 (deploy → fund → db → deploy-wallet → agent) in one command, stopping if any step fails, then drops straight into the interactive CLI agent at the end. `fund` here is a balance top-up via `anvil_setBalance` (see the Makefile's "Funding Wallets" section) — it automatically skips itself on live networks (`sepolia`/`bsc`), where there's no local Anvil node to fund, so this chain is safe to use for all six networks without special-casing. Steps 1 (start the network) and 3 (Vault) are *not* part of this chain — start the network first (skip this for live deployments), and make sure Vault is already running and configured (it persists across redeploys, so you don't need to re-run `make vault` every time). The same `ARGS` value is passed through to `deploy`, `fund`, and `deploy-wallet` internally, so it must be one of the network names listed in step 5 above.
+>
+> **The full local setup in two commands** (once Vault is configured):
+>
+> ```bash
+> make <network>-fork    # or `make anvil` for plain local Anvil — see step 1 above
+> make setup ARGS="<network>"
+> ```
+>
+> e.g. `make sepolia-fork` followed by `make setup ARGS="sepolia-fork"`. For a live deployment (no local node to start), just run `make setup ARGS="sepolia"` (or `"bsc"`) on its own.
 
 > **Celo is not yet supported end-to-end.** The Python app layer has scaffolding for it (token list, chain ID, Ubeswap V2 factory address), but `HelperConfig.s.sol` has no Celo chain ID branch, so step 2 (`make deploy ARGS="celo-fork"` or similar) cannot succeed on Celo until that's added on the Solidity side. See [docs/app.md](app.md) for what's already wired up.
 
@@ -72,13 +83,22 @@ make db
 
 **Step 5 — Deploy your wallet and register session keys:**
 
-> Open [app/deploy_wallet.py](../app/deploy_wallet.py) and confirm the network in the `__main__` block is `"anvil"`, then run:
-
 ```bash
 make deploy-wallet
 ```
 
+(No `ARGS` needed — `deploy_wallet.py` defaults to `"anvil"` when none is given, matching `make deploy`'s own default. Pass `ARGS="anvil"` explicitly if you'd rather not rely on the default.)
+
 Must be re-run (along with steps 1, 2, and 4) whenever Anvil is restarted — chain state, including the deployed protocol, is wiped on restart.
+
+> **Shortcut — full setup in two commands** (once Vault, step 3, is configured):
+>
+> ```bash
+> make anvil
+> make setup
+> ```
+>
+> Runs steps 2, 4, and 5 above plus a balance top-up (`fund`), finishing with the interactive CLI agent below (not the Telegram bot in step 6). No `ARGS` needed for either command — both default to plain Anvil. See [The Setup Sequence](#the-setup-sequence) above.
 
 **Step 6 — Start the Telegram bot:**
 
@@ -140,10 +160,8 @@ make db
 
 **Step 5 — Deploy your wallet:**
 
-> Open [app/deploy_wallet.py](../app/deploy_wallet.py) and set the network to `"mainnet-fork"`, then run:
-
 ```bash
-make deploy-wallet
+make deploy-wallet ARGS="mainnet-fork"
 ```
 
 **Step 6 — Start:**
@@ -154,6 +172,15 @@ make agent    # Interactive CLI
 ```
 
 > Re-run steps 1, 2, and 4 after any Anvil restart, and re-run `make vault` after any Vault container restart — fork state is wiped on restart.
+
+> **Shortcut — full setup in two commands** (once Vault, step 3, is configured):
+>
+> ```bash
+> make mainnet-fork
+> make setup ARGS="mainnet-fork"
+> ```
+>
+> Runs steps 2, 4, and 5 above plus a balance top-up (`fund`), finishing with `make agent` (not `make bot`) from step 6. See [The Setup Sequence](#the-setup-sequence) above.
 
 ---
 
@@ -196,10 +223,8 @@ make db
 
 **Step 5 — Deploy your wallet:**
 
-> Open [app/deploy_wallet.py](../app/deploy_wallet.py) and set the network to `"sepolia-fork"`, then run:
-
 ```bash
-make deploy-wallet
+make deploy-wallet ARGS="sepolia-fork"
 ```
 
 **Step 6 — Start:**
@@ -209,7 +234,16 @@ make bot
 make agent
 ```
 
-> Uniswap V2 tools are unavailable on Sepolia fork — the router is not deployed on Sepolia. Only ETH, WETH, LINK, and Reputation Registry sessions are registered by default.
+> Uniswap V2 is officially deployed on Sepolia. ETH, WETH, LINK, Uniswap V2 Router, and Reputation Registry sessions are all registered by default — see [docs/app.md](app.md#deploy_walletpy) for the exact selector sets.
+
+> **Shortcut — full setup in two commands** (once Vault, step 3, is configured):
+>
+> ```bash
+> make sepolia-fork
+> make setup ARGS="sepolia-fork"
+> ```
+>
+> Runs steps 2, 4, and 5 above plus a balance top-up (`fund`), finishing with `make agent` (not `make bot`) from step 6. See [The Setup Sequence](#the-setup-sequence) above.
 
 ---
 
@@ -229,7 +263,7 @@ make bsc-fork
 make deploy ARGS="bsc-fork"
 ```
 
-`ARGS="bsc-fork"` signs with `MAINNET_DEPLOYER_PK` (the placeholder deployer key baked into `HelperConfig.s.sol`) and broadcasts with `--legacy --skip-simulation` — BSC's fee-history data and this fork's `baseFeePerGas: 0` blocks both confuse Forge's default gas estimation, so the Makefile routes around it (see the comment above the `bsc-fork` branch in `Makefile` for the full explanation). If the deployer needs a balance bump on the fork first, `make fund-bsc` sets it directly via `anvil_setBalance`.
+`ARGS="bsc-fork"` signs with `MAINNET_DEPLOYER_PK` (the placeholder deployer key baked into `HelperConfig.s.sol`) and broadcasts with `--legacy --skip-simulation` — BSC's fee-history data and this fork's `baseFeePerGas: 0` blocks both confuse Forge's default gas estimation, so the Makefile routes around it (see the comment above the `bsc-fork` branch in `Makefile` for the full explanation). If the deployer needs a balance bump on the fork first, `make fund ARGS="bsc-fork"` sets it directly via `anvil_setBalance`.
 
 **Step 3 — Start and configure Vault:**
 
@@ -252,10 +286,8 @@ make db
 
 **Step 5 — Deploy your wallet:**
 
-> Open [app/deploy_wallet.py](../app/deploy_wallet.py) and set the network to `"bsc-fork"`, then run:
-
 ```bash
-make deploy-wallet
+make deploy-wallet ARGS="bsc-fork"
 ```
 
 Registers ETH-sentinel (native BNB), WBNB, USDC, PancakeSwap V2 Router, and Reputation Registry sessions by default — see [docs/app.md](app.md#deploy_walletpy) for the exact selector sets.
@@ -266,6 +298,15 @@ Registers ETH-sentinel (native BNB), WBNB, USDC, PancakeSwap V2 Router, and Repu
 make bot
 make agent
 ```
+
+> **Shortcut — full setup in two commands** (once Vault, step 3, is configured):
+>
+> ```bash
+> make bsc-fork
+> make setup ARGS="bsc-fork"
+> ```
+>
+> Runs steps 2, 4, and 5 above plus a balance top-up (`fund`), finishing with `make agent` (not `make bot`) from step 6. See [The Setup Sequence](#the-setup-sequence) above.
 
 ---
 
@@ -304,15 +345,13 @@ make db
 
 **Step 4 — Deploy your wallet:**
 
-> Open [app/deploy_wallet.py](../app/deploy_wallet.py) and set the network to `"sepolia"`, then run:
-
 ```bash
-make deploy-wallet
+make deploy-wallet ARGS="sepolia"
 ```
 
-On Sepolia, `live_network.py` submits UserOps through the Alchemy bundler — no `SEPOLIA_BUNDLER` key is used. If `ETHERSCAN_API_KEY` is set, both `SHOracle` and `SessionHandler` are automatically verified on Etherscan after deployment.
+On Sepolia, `live_network.py` submits UserOps through the Alchemy bundler — no local bundler key is used. If `ETHERSCAN_API_KEY` is set, both `SHOracle` and `SessionHandler` are automatically verified on Etherscan after deployment.
 
-> Uniswap V2 is not deployed on Sepolia. Swap, liquidity, and quote tools are unavailable — any attempt will fail because no `uniswapv2_router` session key is registered.
+> Uniswap V2 is officially deployed on Sepolia, so swap, liquidity, and quote tools are available here too — a `uniswapv2_router` session key is registered by default alongside ETH, WETH, LINK, and Reputation Registry.
 
 **Step 5 — Start:**
 
@@ -320,6 +359,14 @@ On Sepolia, `live_network.py` submits UserOps through the Alchemy bundler — no
 make bot
 make agent
 ```
+
+> **Shortcut — full setup in one command** (once Vault, step 2, is configured):
+>
+> ```bash
+> make setup ARGS="sepolia"
+> ```
+>
+> Since there's no local node to start for a live deployment, this alone covers steps 1, 3, and 4 above, finishing with `make agent` (not `make bot`) from step 5. The chain's `fund` step (a local-fork-only balance top-up) automatically no-ops on live networks, so it's safe to include here. **This broadcasts a real transaction to live Sepolia** — make sure that's what you intend before running it.
 
 ### Deployed Contracts (Sepolia)
 
@@ -367,13 +414,11 @@ make db
 
 **Step 4 — Deploy your wallet:**
 
-> Open [app/deploy_wallet.py](../app/deploy_wallet.py) and set the network to `"bsc"`, then run:
-
 ```bash
-make deploy-wallet
+make deploy-wallet ARGS="bsc"
 ```
 
-On live BSC, `live_network.py` submits UserOps through the Alchemy bundler — no `BSC_BUNDLER` key is used for that path (it's only needed for the `bsc-fork` local-`handleOps` flow in `anvil.py`).
+On live BSC, `live_network.py` submits UserOps through the Alchemy bundler — no local bundler key is used for that path (`FORK_DEPLOYER_PK` is only used for the `bsc-fork` local-`handleOps` flow in `anvil.py`).
 
 **Step 5 — Start:**
 
@@ -381,3 +426,11 @@ On live BSC, `live_network.py` submits UserOps through the Alchemy bundler — n
 make bot
 make agent
 ```
+
+> **Shortcut — full setup in one command** (once Vault, step 2, is configured):
+>
+> ```bash
+> make setup ARGS="bsc"
+> ```
+>
+> Since there's no local node to start for a live deployment, this alone covers steps 1, 3, and 4 above, finishing with `make agent` (not `make bot`) from step 5. The chain's `fund` step (a local-fork-only balance top-up) automatically no-ops on live networks, so it's safe to include here. **This broadcasts a real transaction to live BSC** — make sure that's what you intend before running it. Also note the `make deploy` gap flagged in step 1 above: confirm `NETWORK_ARGS` actually resolves to a funded BSC broadcast before relying on this shortcut for a live BSC deploy.

@@ -22,7 +22,5 @@
     "url": "https://github.com/Conrad-sudo/sh-protocol/issues"
   },
   "homepage": "https://github.com/Conrad-sudo/sh-protocol#readme",
-  "dependencies": {
-    "@pythnetwork/pyth-sdk-solidity": "^4.3.1"
-  }
+  "dependencies": {}
 }

@@ -6,7 +6,7 @@ from db import (
     get_token_address,
     get_factory_address,
 )
-from constants import UNISWAP_V2_FACTORY, PANCAKE_V2_FACTORY, UBESWAP_V2_FACTORY, ETH_SENTINEL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET
+from constants import UNISWAP_V2_FACTORY, SEPOLIA_UNISWAP_V2_FACTORY, PANCAKE_V2_FACTORY, UBESWAP_V2_FACTORY, ETH_SENTINEL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA
 from abi import (
     ientry_point,
     iweth,
@@ -204,10 +204,13 @@ def load_iuniswap_router(chat_id: int) -> Contract:
 
 def load_iuniswap_factory(chat_id: int) -> Contract:
     """
-    Loads the Uniswap V2 Factory interface ABI and binds it to the known mainnet address.
+    Loads the Uniswap/PancakeSwap/Ubeswap V2 Factory interface ABI, bound to the known
+    factory address for the user's current network (Uniswap V2 on mainnet/Sepolia,
+    PancakeSwap V2 on BSC, Ubeswap V2 on Celo).
 
-    @return  A web3.py Contract instance for the Uniswap V2 Factory.
-
+    @return  A web3.py Contract instance for the V2 Factory.
+    @raises ValueError  If the user's current chain_id has no known V2 factory address
+                        (e.g. Anvil, which has no default Uniswap V2 deployment).
     """
 
     if chat_id not in _factory_cache:
@@ -215,10 +218,14 @@ def load_iuniswap_factory(chat_id: int) -> Contract:
         abi = iuniswap_v2_factory
         if chain_id == CHAIN_ID_MAINNET:
             address = UNISWAP_V2_FACTORY
+        elif chain_id == CHAIN_ID_SEPOLIA:
+            address = SEPOLIA_UNISWAP_V2_FACTORY
         elif chain_id == CHAIN_ID_BSC:
             address = PANCAKE_V2_FACTORY
         elif chain_id == CHAIN_ID_CELO:
             address = UBESWAP_V2_FACTORY
+        else:
+            raise ValueError(f"No Uniswap V2-compatible factory configured for chain_id {chain_id}")
         _factory_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
     return _factory_cache[chat_id]
 

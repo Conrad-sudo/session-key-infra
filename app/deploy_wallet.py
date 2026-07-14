@@ -34,15 +34,18 @@ from contracts import (
 nonce: int
 
 # Maps a chain_name to the env var holding its deployer private key. Fork networks of a
-# real chain (sepolia-fork, bsc-fork) get a dedicated key too, not the Anvil default burner
-# key — forking inherits that chain's real on-chain state, and the well-known Anvil/Hardhat
-# accounts have been EIP-7702-delegated to drainer contracts on real Sepolia/BSC/mainnet (see
-# HelperConfig.s.sol's MAINNET_DEPLOYER_PK comment for the same issue on the Foundry side).
-# Plain "anvil" (no fork) has no real-world state to inherit, so the burner key is fine there.
+# real chain (mainnet-fork, sepolia-fork, bsc-fork, celo-fork) get a dedicated key too, not the
+# Anvil default burner key — forking inherits that chain's real on-chain state, and the
+# well-known Anvil/Hardhat accounts have been EIP-7702-delegated to drainer contracts on real
+# Sepolia/BSC/mainnet (see HelperConfig.s.sol's MAINNET_DEPLOYER_PK comment for the same issue
+# on the Foundry side). Plain "anvil" (no fork) has no real-world state to inherit, so the
+# burner key is fine there — it's the only chain name allowed to fall through to the
+# ANVIL_PRIVATE_KEY default in _private_key_env below.
 LIVE_PRIVATE_KEY_ENV = {
     "sepolia": "SEPOLIA_PRIVATE_KEY",
     "bsc": "BSC_PRIVATE_KEY",
     "celo": "CELO_PRIVATE_KEY",
+    "mainnet-fork": "FORK_DEPLOYER_PK",
     "sepolia-fork": "FORK_DEPLOYER_PK",
     "bsc-fork": "FORK_DEPLOYER_PK",
     "celo-fork": "FORK_DEPLOYER_PK",
@@ -94,9 +97,13 @@ def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int
     Funds two accounts from the deployer after SessionHandler wallet deployment:
       1. SessionHandler wallet — 10 ETH to cover ERC-4337 prefund and any forwarded
          ETH used for WETH wraps or Uniswap swaps initiated by session keys.
-      2. Bundler (MAINNET_BUNDLER on mainnet-fork, SEPOLIA_BUNDLER on sepolia-fork,
-         BSC_BUNDLER on bsc-fork) — 10 ETH to cover the gas cost of bundling ERC-4337
-         UserOperations on the fork.
+      2. Bundler (FORK_DEPLOYER_PK, shared across every fork network) — 10 ETH to cover
+         the gas cost of bundling ERC-4337 UserOperations on the fork. This is the same
+         key anvil.py uses at runtime to sign the outer handleOps transaction, so the
+         account that gets funded here is always the one that actually pays gas later.
+         Skipped when the deployer is already that same key (e.g. sepolia-fork/bsc-fork/
+         celo-fork, where _private_key_env also resolves to FORK_DEPLOYER_PK) — funding
+         an account from itself would just burn gas on a no-op transfer.
 
     Args:
         deployer:       Signing account (web3.py LocalAccount) that pays for both transfers.
@@ -124,14 +131,13 @@ def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int
     print(f"SessionHandler wallet funded with 10 ETH for {network} deployments.")
 
     if "fork" in network:
-        # 2. Fund the Bundler with 10 ETH to cover the gas costs of bundling UserOperations on this fork.
-        bundler_env = {
-            "mainnet-fork": "MAINNET_BUNDLER",
-            "sepolia-fork": "SEPOLIA_BUNDLER",
-            "bsc-fork": "BSC_BUNDLER",
-            "celo-fork": "CELO_BUNDLER",
-        }.get(network, "SEPOLIA_BUNDLER")
-        bundler = w3.eth.account.from_key(os.getenv(bundler_env))
+        # 2. Fund the Bundler with 10 ETH to cover the gas costs of bundling UserOperations on
+        #    this fork. FORK_DEPLOYER_PK is shared across every fork network — it's the same key
+        #    anvil.py resolves at runtime for any non-Anvil chain, so funding and usage stay in sync.
+        bundler = w3.eth.account.from_key(os.getenv("FORK_DEPLOYER_PK"))
+        if bundler.address == deployer.address:
+            print(f"Bundler {bundler.address} is the same as the deployer — already funded, skipping.")
+            return
         nonce += 1
         tx = {
             "from": deployer.address,
@@ -343,7 +349,7 @@ def add_session(
             print(
                 "Warning: SessionAdded event could not be decoded (stale ABI — run forge build)"
             )
-    if "mainnet" in chain_name or "bsc" in chain_name or "celo" in chain_name:
+    if "mainnet" in chain_name or "sepolia" in chain_name or "bsc" in chain_name or "celo" in chain_name:
         for target in targets:
             if target not in ("uniswapv2_router", "eth"):
                 approve(
@@ -436,16 +442,17 @@ def add_default_session(chat_id: int):
     if "sepolia" in chain_name:
         add_session(
             chat_id=chat_id,
-            targets=["eth", native_wrapped, "link","reputation_registry"],
+            targets=["eth", native_wrapped, "link", "uniswapv2_router", "reputation_registry"],
             functions=[
                 [],  # empty selector array for native ETH sessions (address(0) target) since there are no function calls, just value transfers
                 weth_functions,
                 erc20_functions,
+                uniswapV2_functions,
                 reputation_registry_functions
 
             ],
-            session_ends=[50, 50, 50, 50],
-            limits=[50000, 50000, 50000, 0],
+            session_ends=[50, 50, 50, 50, 50],
+            limits=[50000, 50000, 50000, 50000, 0],
         )
     if "bsc" in chain_name:
         # "eth" remains the native-value sentinel target (resolves to ETH_SENTINEL/address(0)
@@ -502,7 +509,8 @@ def deploy(chat_id: int, network: str):
 
     To target a different network, pass it as the first CLI argument (e.g.
     `python3 app/deploy_wallet.py bsc-fork`, or `make deploy-wallet ARGS=bsc-fork`).
-    Defaults to "sepolia-fork" when no argument is given.
+    Defaults to "anvil" when no argument is given, matching `make deploy`'s own
+    no-ARGS default (plain local Anvil) — see the Makefile's `NETWORK_ARGS`.
 
     @param chat_id  Telegram chat ID — used to key all database records for this user.
     @param network  Target network name (see supported values above).
@@ -517,7 +525,7 @@ def deploy(chat_id: int, network: str):
 if __name__ == "__main__":
     chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
     save_contact(chat_id=chat_id,name="tim",address="0x9f4d8D3f66C47c75b95325f01861d1643825Bffc")
-    network = sys.argv[1] if len(sys.argv) > 1 else "sepolia-fork"
+    network = sys.argv[1] if len(sys.argv) > 1 else "anvil"
     deploy(chat_id=chat_id, network=network)
     add_default_session(chat_id=chat_id)
     approve(chat_id=chat_id, token="wbnb")

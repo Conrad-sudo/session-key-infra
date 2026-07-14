@@ -35,7 +35,6 @@ app/
     │   ├── ERC20_Selectors.json       ← ERC20 function name → selector
     │   └── ReputationRegistry_Selectors.json ← ERC-8004 function name → selector
     ├── contracts/
-    │   ├── SHFactory.json             ← SHFactory ABI (for deployWallet())
     │   └── UniswapV2_Selectors.json   ← Uniswap/PancakeSwap V2 function name → selector
     ├── tokens/
     │   ├── Mainnet_Tokens.json        ← Token ticker → mainnet address
@@ -81,6 +80,7 @@ CHAIN_ID_CELO       = 42220
 WEI_PER_ETH         = 10**18
 ETH_SENTINEL        = "0x0000000000000000000000000000000000000000"
 UNISWAP_V2_FACTORY  = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+SEPOLIA_UNISWAP_V2_FACTORY = "0xF62c03E08ada871A0bEb309762E260a7a6a880E6"
 PANCAKE_V2_FACTORY  = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 UBESWAP_V2_FACTORY  = "0x62d5b84bE28a183aBB507E125B384122D2C25fAE"
 HEARTBEAT_1H        = 3_600
@@ -210,7 +210,7 @@ def load_session_handler_module(chat_id: int) -> Contract   # reads the module's
 def load_entry_point(chat_id: int) -> Contract               # reads the EntryPoint address off SessionHandler.ENTRY_POINT()
 def load_ierc20(chat_id: int, token: str, uniswap_pair: bool = False) -> Contract  # uses IWETH ABI for "weth"/"wbnb"
 def load_iuniswap_router(chat_id: int) -> Contract
-def load_iuniswap_factory(chat_id: int) -> Contract           # resolves UNISWAP_V2_FACTORY / PANCAKE_V2_FACTORY / UBESWAP_V2_FACTORY by chain_id
+def load_iuniswap_factory(chat_id: int) -> Contract           # resolves UNISWAP_V2_FACTORY / SEPOLIA_UNISWAP_V2_FACTORY / PANCAKE_V2_FACTORY / UBESWAP_V2_FACTORY by chain_id
 def load_iuniswap_pair(chat_id: int, token_a: str, token_b: str) -> Contract
 def load_factory(chat_id: int) -> Contract                    # SHFactory — used by deploy_wallet.py
 def load_reputation_registry(chat_id: int) -> Contract
@@ -264,7 +264,7 @@ def get_or_create_session_key(chat_id: int, target_address: str) -> tuple[str, s
 2. Fetch a nonce from `EntryPoint.getNonce()` keyed to the installed `SessionHandlerModule` via `session_key_nonce_key()`, so the account routes validation to it.
 3. Build a signed dummy op, estimate gas via `eth_estimateGas`, then construct the real op with a 20% buffer and live gas price.
 4. Decrypt session key from Vault transiently, sign with EIP-191, wipe.
-5. Submit via `EntryPoint.handleOps([userOp], bundler.address)`, where `bundler` is resolved per chain (`ANVIL_BUNDLER`, `MAINNET_BUNDLER`, `SEPOLIA_BUNDLER`, `BSC_BUNDLER`, or `CELO_BUNDLER`).
+5. Submit via `EntryPoint.handleOps([userOp], bundler.address)`, where `bundler` is `ANVIL_BUNDLER` on plain `anvil`, or the shared `FORK_DEPLOYER_PK` on every other (fork) network — the same key `deploy_wallet.py`'s `prefund()` funds, so it always has gas.
 6. On revert: replay via `eth_call` to extract the revert reason.
 
 **Gas constants:**
@@ -358,13 +358,14 @@ Fork networks of a real chain get their real network's key (not the well-known A
 | Uniswap V2 Router | all 6 swap functions + `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, `removeLiquidityETH` |
 | Reputation Registry | `giveFeedback` |
 
-**sepolia / sepolia-fork** (4 sessions):
+**sepolia / sepolia-fork** (5 sessions — Uniswap V2 is officially deployed on Sepolia):
 
 | Target | Selectors |
 |---|---|
 | `address(0)` (ETH) | None — value transfers only |
 | WETH | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance`, `deposit`, `withdraw` |
 | LINK | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance` |
+| Uniswap V2 Router | all 6 swap functions + `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, `removeLiquidityETH` |
 | Reputation Registry | `giveFeedback` |
 
 **bsc / bsc-fork** (5 sessions, mirrors mainnet-fork with WBNB/BNB in place of WETH/ETH):

@@ -7,11 +7,11 @@
 | `make build` | Compile contracts |
 | `make test` | Run Forge test suite |
 | `make unit-test` | Run unit tests (`test/unit/SHProtocolTest.t.sol`) |
-| `make uniswap-test` | Run Uniswap V2 fork tests against `MAINNET_RPC_URL` |
+| `make mainnet-uniswap-test` | Run Uniswap V2 fork tests against `MAINNET_RPC_URL` |
+| `make sepolia-uniswap-test` | Run Uniswap V2 fork tests against `SEPOLIA_RPC_URL` (`test/fork/SHSepoliaUniswapV2Test.t.sol`) |
 | `make pancakeswap-test` | Run PancakeSwap V2 fork tests against `BSC_RPC_URL` |
-| `make sepolia-test` | Run Sepolia fork tests against `SEPOLIA_RPC_URL` |
+| `make sepolia-test` | Run Sepolia fork tests against `SEPOLIA_RPC_URL` (`test/fork/SHSepoliaTest.t.sol` — ETH/ERC20/reputation, not Uniswap) |
 | `make snapshot` | Generate gas snapshot |
-| `make format` | Format Solidity sources |
 | `make clean` | Remove build artifacts |
 | `make install` | Install Forge dependencies |
 | `make update` | Update Forge dependencies |
@@ -20,13 +20,14 @@
 | `make sepolia-fork` | Start a Sepolia fork at the latest block |
 | `make bsc-fork` | Start a BSC fork at the latest block |
 | `make celo-fork` | Start a Celo fork at the latest block (no Solidity deployment path yet — see [docs/app.md](app.md)) |
-| `make fund-sepolia` / `fund-bsc` / `fund-celo` | Set a large ETH/BNB/CELO balance on the deployer address via `anvil_setBalance` (fork networks only) |
+| `make fund ARGS=<network>` | Set a large ETH/BNB/CELO balance on the deployer address via `anvil_setBalance`. Funds `SEPOLIA_ACCOUNT` when `ARGS` contains `sepolia`, `FORK_DEPLOYER_ADDRESS` otherwise (mainnet/bsc/celo and their `-fork` variants) — except bare `ARGS="sepolia"`/`"bsc"` (live networks), where it safely no-ops instead of failing, since there's no local Anvil node to fund |
 | `make deploy [ARGS="sepolia-fork"]` | Deploy `DeploySHProtocol.s.sol` — `ARGS` selects the signer/broadcast target (see `docs/setup.md`) |
 | `make vault` | Configure Vault and refresh `.env` credentials |
 | `make db` | Initialise SQLite database and run migrations |
 | `make deploy-wallet [ARGS=<network>]` | Deploy a per-user `SessionHandler` and register session keys |
 | `make agent` | Start the agent in interactive CLI mode |
 | `make bot` | Start the Telegram bot |
+| `make setup ARGS=<network>` | Runs `deploy` → `fund` → `db` → `deploy-wallet` → `agent` in sequence for `<network>`, stopping on first failure. Assumes Vault is already running and configured (`make vault`) — not part of this chain since it persists across redeploys. Safe for all six networks (live `sepolia`/`bsc` included — `fund` no-ops on those). See `docs/setup.md`'s "Shortcut" callouts |
 
 > **`make ubeswap-test` is currently broken.** It points at `test/fork/SHUbeswapV2Test.t.sol`, which doesn't exist yet (Celo has no Solidity deployment path — see above).
 
@@ -66,6 +67,7 @@ sh-protocol/
 │   │   └── SessionHandlerModuleHarness.sol
 │   ├── fork/
 │   │   ├── SHUniswapV2Test.t.sol
+│   │   ├── SHSepoliaUniswapV2Test.t.sol
 │   │   ├── SHPancakeswapV2Test.t.sol
 │   │   └── SHSepoliaTest.t.sol
 │   └── invariant/
@@ -102,7 +104,6 @@ sh-protocol/
 │       │   ├── ERC20_Selectors.json
 │       │   └── ReputationRegistry_Selectors.json
 │       ├── contracts/
-│       │   ├── SHFactory.json
 │       │   └── UniswapV2_Selectors.json
 │       ├── tokens/
 │       │   ├── Mainnet_Tokens.json

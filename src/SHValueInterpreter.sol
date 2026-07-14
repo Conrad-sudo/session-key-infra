@@ -28,9 +28,7 @@ contract SHValueInterpreter {
     /// @dev Anvil's default chainId. The zero-router guard is skipped on this chain since
     ///      Uniswap V2 has no local deployment there.
     uint256 private constant ANVIL_CHAIN_ID = 31337;
-    /// @dev Sepolia's chainId. The zero-router guard is skipped here too — no official
-    ///      Uniswap V2 deployment exists on Sepolia.
-    uint256 private constant SEPOLIA_CHAIN_ID = 11155111;
+   
 
     error SHValueInterpreter_ZeroAddressOnRouter();
 
@@ -60,7 +58,7 @@ contract SHValueInterpreter {
         returns (uint256 debitValueInUsd, uint256 creditValueInUsd)
     {
         address uniswapRouter = REGISTRY.router();
-        if (uniswapRouter == address(0) && block.chainid != ANVIL_CHAIN_ID && block.chainid != SEPOLIA_CHAIN_ID) {
+        if (uniswapRouter == address(0) && block.chainid != ANVIL_CHAIN_ID ) {
             revert SHValueInterpreter_ZeroAddressOnRouter();
         }
 
@@ -71,7 +69,11 @@ contract SHValueInterpreter {
 
         // swapExactETHForTokens and swapETHForExactTokens forward ETH as `value` with no token input
         // parameter, so their USD cost is fully captured here. No additional interpreter branch needed.
-        if (selector != IWETH.deposit.selector) {
+        // The value > 0 guard matters because this branch is also reached with value == 0 for plain
+        // token calls (ERC20 transfer/approve, token-only swaps) -- without it, every such call would
+        // needlessly price address(0) and require the native-asset feed to be fresh, even though no
+        // native asset is being sent.
+        if (value > 0 && selector != IWETH.deposit.selector) {
             debitValueInUsd += oracle.getUsdValue(address(0), value);
         }
 

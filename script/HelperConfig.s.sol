@@ -281,19 +281,19 @@ contract HelperConfig is Script {
             identityRegistry: TESTNET_IDENTITY_REGISTRY,
             reputationRegistry: TESTNET_REPUTATION_REGISTRY,
             // Stablecoins
-            usdc: SEPOLIA_USDC,
-            weth: SEPOLIA_WETH,
-            router: address(0), // No official UniswapV2 deployment on Sepolia
-            dai: SEPOLIA_DAI,
+            usdc: SPO_USDC,
+            weth: SPO_WETH,
+            router: SPO_UNISWAP_V2_ROUTER_02,
+            dai: SPO_DAI,
             usdt: address(0),
             // ERC-20 tokens — address(0) where no official Sepolia deployment exists
             aave: address(0),
-            link: SEPOLIA_LINK,
+            link: SPO_LINK,
             oneinch: address(0), // No official Sepolia deployment
             ape: address(0), // No official Sepolia deployment
             arb: address(0), // No official Sepolia deployment
             wbnb: address(0), // No official Sepolia deployment
-            wbtc: SEPOLIA_WBTC,
+            wbtc: SPO_WBTC,
             comp: address(0), // No official Sepolia deployment
             crv: address(0), // No official Sepolia deployment
             ens: address(0), // No official Sepolia deployment
@@ -307,17 +307,17 @@ contract HelperConfig is Script {
             knc: address(0), // No official Sepolia deployment
             cake: address(0), // No official Sepolia deployment
             // Chainlink price feeds — only ETH, USDC, DAI, LINK, BTC have feeds on Sepolia
-            ethUsdPriceFeed: SEPOLIA_ETH_USD_PRICE_FEED,
-            usdcUsdPriceFeed: SEPOLIA_USDC_USD_PRICE_FEED,
-            daiUsdPriceFeed: SEPOLIA_DAI_USD_PRICE_FEED,
+            ethUsdPriceFeed: SPO_ETH_USD_PRICE_FEED,
+            usdcUsdPriceFeed: SPO_USDC_USD_PRICE_FEED,
+            daiUsdPriceFeed: SPO_DAI_USD_PRICE_FEED,
             usdtUsdPriceFeed: address(0), // No USDT/USD feed on Sepolia
             aaveUsdPriceFeed: address(0),
-            linkUsdPriceFeed: SEPOLIA_LINK_USD_PRICE_FEED,
+            linkUsdPriceFeed: SPO_LINK_USD_PRICE_FEED,
             oneinchUsdPriceFeed: address(0),
             apeUsdPriceFeed: address(0),
             arbUsdPriceFeed: address(0),
             bnbUsdPriceFeed: address(0),
-            btcUsdPriceFeed: SEPOLIA_BTC_USD_PRICE_FEED,
+            btcUsdPriceFeed: SPO_BTC_USD_PRICE_FEED,
             compUsdPriceFeed: address(0),
             crvUsdPriceFeed: address(0),
             ensUsdPriceFeed: address(0),
@@ -330,30 +330,34 @@ contract HelperConfig is Script {
             imxUsdPriceFeed: address(0),
             kncUsdPriceFeed: address(0),
             cakeUsdPriceFeed: address(0),
-            // Heartbeats — use 1 hour for all Sepolia feeds (conservative default for testnet)
-            ethHeartbeat: HEARTBEAT_1H,
-            usdcHeartbeat: HEARTBEAT_1H,
-            daiHeartbeat: HEARTBEAT_1H,
-            usdtHeartbeat: HEARTBEAT_1H,
-            aaveHeartbeat: HEARTBEAT_1H,
-            linkHeartbeat: HEARTBEAT_1H,
-            oneinchHeartbeat: HEARTBEAT_1H,
-            apeHeartbeat: HEARTBEAT_1H,
-            arbHeartbeat: HEARTBEAT_1H,
-            bnbHeartbeat: HEARTBEAT_1H,
-            btcHeartbeat: HEARTBEAT_1H,
-            compHeartbeat: HEARTBEAT_1H,
-            crvHeartbeat: HEARTBEAT_1H,
-            ensHeartbeat: HEARTBEAT_1H,
-            sandHeartbeat: HEARTBEAT_1H,
-            sushiHeartbeat: HEARTBEAT_1H,
-            wtaoHeartbeat: HEARTBEAT_1H,
-            uniHeartbeat: HEARTBEAT_1H,
-            yfiHeartbeat: HEARTBEAT_1H,
-            wavaxHeartbeat: HEARTBEAT_1H,
-            imxHeartbeat: HEARTBEAT_1H,
-            kncHeartbeat: HEARTBEAT_1H,
-            cakeHeartbeat: HEARTBEAT_1H
+            // Heartbeats — Sepolia's Chainlink nodes update noticeably less often than mainnet's
+            // (observed gaps of ~16-17h on USDC/DAI in practice, vs ETH/LINK/BTC which typically
+            // stay under 1h) — see HEARTBEAT_72H's doc comment in Constants.s.sol. Using one
+            // wide window uniformly across all Sepolia feeds rather than tuning per-feed, since
+            // this is an accepted testnet-oracle characteristic, not a real staleness risk.
+            ethHeartbeat: HEARTBEAT_72H,
+            usdcHeartbeat: HEARTBEAT_72H,
+            daiHeartbeat: HEARTBEAT_72H,
+            usdtHeartbeat: HEARTBEAT_72H,
+            aaveHeartbeat: HEARTBEAT_72H,
+            linkHeartbeat: HEARTBEAT_72H,
+            oneinchHeartbeat: HEARTBEAT_72H,
+            apeHeartbeat: HEARTBEAT_72H,
+            arbHeartbeat: HEARTBEAT_72H,
+            bnbHeartbeat: HEARTBEAT_72H,
+            btcHeartbeat: HEARTBEAT_72H,
+            compHeartbeat: HEARTBEAT_72H,
+            crvHeartbeat: HEARTBEAT_72H,
+            ensHeartbeat: HEARTBEAT_72H,
+            sandHeartbeat: HEARTBEAT_72H,
+            sushiHeartbeat: HEARTBEAT_72H,
+            wtaoHeartbeat: HEARTBEAT_72H,
+            uniHeartbeat: HEARTBEAT_72H,
+            yfiHeartbeat: HEARTBEAT_72H,
+            wavaxHeartbeat: HEARTBEAT_72H,
+            imxHeartbeat: HEARTBEAT_72H,
+            kncHeartbeat: HEARTBEAT_72H,
+            cakeHeartbeat: HEARTBEAT_72H
         });
     }
 
@@ -364,14 +368,14 @@ contract HelperConfig is Script {
      *      Ensure sepoliaAccount is funded before broadcasting on any live network.
      * @return config NetworkConfig for Ethereum mainnet and compatible chains
      */
-    function getMainnetConfig() internal view returns (NetworkConfig memory) {
+    function getMainnetConfig() internal pure returns (NetworkConfig memory) {
         return NetworkConfig({
             entryPoint: ENTRYPOINT_V07,
             account: vm.addr(MAINNET_DEPLOYER_PK),
             identityRegistry: MNT_IDENTITY_REGISTRY,
             reputationRegistry: MNT_REPUTATION_REGISTRY,
             //swap for the deployer account on mainnet and ensure it's funded before broadcasting
-            router: UNISWAP_V2_ROUTER_02,
+            router: MNT_UNISWAP_V2_ROUTER_02,
             // Stablecoins
             usdc: MNT_USDC,
             dai: MNT_DAI,
@@ -454,7 +458,7 @@ contract HelperConfig is Script {
      *      (APE, ARB, ENS, SAND, wTAO, IMX) are set to address(0).
      * @return config NetworkConfig for BSC mainnet
      */
-    function getBscConfig() internal view returns (NetworkConfig memory) {
+    function getBscConfig() internal pure returns (NetworkConfig memory) {
         return NetworkConfig({
             entryPoint: ENTRYPOINT_V07,
             account: vm.addr(MAINNET_DEPLOYER_PK),

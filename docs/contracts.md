@@ -37,8 +37,9 @@ test/
 │   └── SessionHandlerModuleHarness.sol ← Test harness exposing SessionHandlerModule's internal functions
 ├── fork/
 │   ├── SHUniswapV2Test.t.sol   ← Uniswap V2 integration tests (Ethereum mainnet fork)
+│   ├── SHSepoliaUniswapV2Test.t.sol ← Uniswap V2 integration tests (Sepolia fork)
 │   ├── SHPancakeswapV2Test.t.sol ← PancakeSwap V2 integration tests (BSC fork)
-│   └── SHSepoliaTest.t.sol     ← SessionHandler integration tests (Sepolia fork)
+│   └── SHSepoliaTest.t.sol     ← SessionHandler integration tests (Sepolia fork; ETH/ERC20/reputation, not Uniswap)
 └── invariant/
     ├── InvariantSH.t.sol  ← Stateful invariant tests
     └── SHHandler.sol      ← Action handler for fuzzing
@@ -156,7 +157,7 @@ event SpendingLimitModuleUpdated(address indexed oldModule, address indexed newM
 
 `SHValueInterpreter` decodes session-key calldata and converts the involved token amounts to USD. It's called by `SessionHandlerModule.preCheck()` — the ERC-7579 Hook entrypoint — to compute the debit or credit value of each session-key operation before the spending limit is enforced.
 
-Extracting this logic into a standalone contract allows the oracle and router addresses to be updated in `SHRegistry` without redeploying any user wallets or the module itself. The interpreter reads both from `SHRegistry` at call time. The router check is DEX-agnostic — whichever router `SHRegistry.router()` currently points at (Uniswap V2 on mainnet, PancakeSwap V2 on BSC) is treated identically, since both expose the same `IUniswapV2Router01`/`02` ABI.
+Extracting this logic into a standalone contract allows the oracle and router addresses to be updated in `SHRegistry` without redeploying any user wallets or the module itself. The interpreter reads both from `SHRegistry` at call time. The router check is DEX-agnostic — whichever router `SHRegistry.router()` currently points at (Uniswap V2 on mainnet and Sepolia, PancakeSwap V2 on BSC) is treated identically, since both expose the same `IUniswapV2Router01`/`02` ABI.
 
 **Supported operations:**
 
@@ -169,7 +170,7 @@ Extracting this logic into a standalone contract allows the oracle and router ad
 | `removeLiquidity` / `removeLiquidityETH` | returns a `creditValueInUsd` (budget credit, not debit) |
 | WETH/WBNB `deposit` | native-asset component excluded (deposit just wraps — no net spend) |
 
-The `value > 0` guard on the native-asset branch matters because `computeUsdValue` is also reachable with `value == 0` for plain token calls — without it, every such call would needlessly price `address(0)` for zero value. On chains without an official router deployment (Anvil, Sepolia), the zero-router guard is skipped so tests and testnet sessions can still exercise ERC-20 transfers.
+The `value > 0` guard on the native-asset branch matters because `computeUsdValue` is also reachable with `value == 0` for plain token calls — without it, every such call would needlessly price `address(0)` for zero value. The zero-router revert is skipped on Anvil (no official router deployment there) so tests can still exercise ERC-20 transfers without a router configured; Sepolia is also still listed in that exemption in code, but it's moot in practice now that Sepolia has an officially deployed Uniswap V2 router wired into `HelperConfig`, so `SHRegistry.router()` is never actually zero there.
 
 ```solidity
 constructor(address registry);  // SHRegistry address
@@ -370,7 +371,7 @@ The project integrates the **ERC-8004** standard for on-chain agent identity and
 | Network | Chain ID | EntryPoint | Router |
 |---|---|---|---|
 | Ethereum Mainnet | 1 | `ENTRYPOINT_V07` (canonical) | Uniswap V2 |
-| Ethereum Sepolia | 11155111 | `ENTRYPOINT_V07` (canonical) | none (`address(0)`) |
+| Ethereum Sepolia | 11155111 | `ENTRYPOINT_V07` (canonical) | Uniswap V2 |
 | BSC (Binance Smart Chain) | 56 | `ENTRYPOINT_V07` (canonical) | PancakeSwap V2 |
 | Anvil (local) | 31337 | Freshly deployed, cached per session | none (`address(0)`) |
 
@@ -378,7 +379,7 @@ The project integrates the **ERC-8004** standard for on-chain agent identity and
 
 For Anvil, `HelperConfig` deploys a fresh `EntryPoint`, `MockV3Aggregator` price feeds seeded with approximate real-world prices for every registered token (ETH at $1000, USDC at $0.998, etc. — see `Constants.s.sol`), `MockIdentityRegistry`, and `MockReputationRegistry`, then caches the result for the rest of the session. All Anvil feed heartbeats are `HEARTBEAT_1H`.
 
-For Sepolia, only ETH, USDC, DAI, LINK, and BTC have real Chainlink feeds — everything else resolves to `address(0)` and is silently skipped by `SHOracle`'s constructor. Sepolia heartbeats are conservatively set to `HEARTBEAT_1H` across the board rather than matching each feed's real mainnet heartbeat.
+For Sepolia, only ETH, USDC, DAI, LINK, and BTC have real Chainlink feeds — everything else resolves to `address(0)` and is silently skipped by `SHOracle`'s constructor. Sepolia heartbeats use `HEARTBEAT_72H` across the board rather than matching each feed's real mainnet heartbeat — Sepolia's Chainlink nodes update noticeably less often than mainnet's (observed gaps of ~16-17h on the USDC/DAI feeds in practice; ETH/LINK/BTC typically stay under 1h), so a tighter window like `HEARTBEAT_1H` or even `HEARTBEAT_24H` produces spurious `SHOracle_StalePrice` reverts against a live fork. This is an accepted characteristic of testnet oracles, not a real staleness risk, since there's no real economic value at stake on Sepolia.
 
 For Mainnet and BSC, heartbeats are sourced per-feed from Chainlink's own published reference data (mostly `HEARTBEAT_1H` or `HEARTBEAT_24H`, with BSC's CAKE/USD feed getting a `HEARTBEAT_1H` safety buffer over its real ~1-minute heartbeat).
 
@@ -461,6 +462,8 @@ function generateSignedUserOp(
 
 **`test/fork/SHPancakeswapV2Test.t.sol`** — a near-identical suite against a live BSC fork, exercising the same operations against PancakeSwap V2 (DAI/WBNB/PancakeSwap V2 Router/Factory), confirming `SHValueInterpreter`'s router handling is genuinely DEX-agnostic.
 
+**`test/fork/SHSepoliaUniswapV2Test.t.sol`** — a near-identical suite (23 tests) against a live Sepolia fork, exercising the same six swap functions plus liquidity operations against Sepolia's officially deployed Uniswap V2 Router/Factory (`SPO_UNISWAP_V2_ROUTER_02`/`SPO_UNISWAP_V2_FACTORY` in `Constants.s.sol`). Uses USDC/WETH/LINK — the three tokens with both an official Sepolia deployment and a live Chainlink feed — rather than mainnet's DAI/WETH/MKR. Absolute swap/liquidity amounts are sized against actual Sepolia pool reserves (checked at the time this suite was written; WETH/USDC is by far the deepest of the three pairs) rather than mainnet's much deeper liquidity, and several assertions compare against a router-computed quote rather than a hardcoded expected amount, since testnet pool ratios drift independently of the real Chainlink-priced USD budget accounting.
+
 **`test/fork/SHSepoliaTest.t.sol`** — integration tests against a live Sepolia fork.
 
 | Test | Description |
@@ -506,12 +509,15 @@ make unit-test
 forge test --match-path test/invariant/InvariantSH.t.sol
 
 # Fork test — Uniswap V2 (Ethereum mainnet fork)
-make uniswap-test
+make mainnet-uniswap-test
+
+# Fork test — Uniswap V2 (Sepolia fork)
+make sepolia-uniswap-test
 
 # Fork test — PancakeSwap V2 (BSC fork)
 make pancakeswap-test
 
-# Fork test — Sepolia
+# Fork test — Sepolia (ETH/ERC20/reputation, not Uniswap)
 make sepolia-test
 
 # Deploy shared protocol infrastructure
