@@ -784,8 +784,8 @@ contract SHPancakeswapV2Test is Test {
      * @notice Session key can execute swapTokensForExactETH through SessionHandler.
      * @dev Sells DAI to receive exactly 0.5 BNB. The owner first acquires DAI for
      *      sessionHandler by swapping 2 WBNB→DAI and approving the router to spend DAI,
-     *      both via direct execute() calls (no UserOp). Budget is charged against the USD value
-     *      of the BNB output (amountOut), as extracted by SessionHandlerModule. Assertion uses a
+     *      both via direct execute() calls (no UserOp). Budget is charged against the USD value of
+     *      the USDT input at the amountInMax ceiling (path[0]), not the BNB output. Assertion uses a
      *      small tolerance because PancakeSwap may return slightly more BNB than requested before
      *      unwrapping.
      */
@@ -825,8 +825,10 @@ contract SHPancakeswapV2Test is Test {
         path[1] = config.wbnb;
 
         uint256 amountOut = 0.5 ether;
-        uint256 spentAMount = oracle.getUsdValue(address(0), amountOut);
         uint256 amountInMax = 2000e18;
+        // Exact-output swap: budget is charged against the input token (path[0] = USDT) at the
+        // amountInMax ceiling, not the BNB received. See SHValueInterpreter exact-output pricing.
+        uint256 spentAMount = oracle.getUsdValue(config.usdt, amountInMax);
         uint256 deadline = block.timestamp + 2 hours;
         address to = address(sessionHandler);
 

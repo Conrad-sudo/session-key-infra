@@ -27,6 +27,10 @@ contract SHOracle {
     /// @dev Reverts when a Chainlink price feed has not been updated within its configured heartbeat
     error SHOracle_StalePrice();
 
+    /// @dev Reverts when a Chainlink feed reports a non-positive price (0 or negative). This signals a
+    ///      feed malfunction, not a real quote, and must be rejected before the cast to uint256.
+    error SHOracle_InvalidPrice();
+
     /// @dev Reverts when the tokens and priceFeeds constructor arrays have different lengths
     error SHOracle_ArrayLengthMismatch();
 
@@ -141,6 +145,9 @@ contract SHOracle {
         if (block.timestamp - updatedAt > sHeartbeat[priceFeed]) {
             revert SHOracle_StalePrice();
         }
+        // A non-positive price is a feed malfunction, not a real quote; reject it before the cast
+        // below would turn a negative value into an enormous uint that wildly mis-prices the call.
+        if (price <= 0) revert SHOracle_InvalidPrice();
 
         // forge-lint: disable-next-line(unsafe-typecast)
         return uint256(price);

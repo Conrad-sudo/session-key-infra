@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {SessionHandler} from "./SessionHandler.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 contract SHFactory is Ownable, Pausable {
     error SHFactory_FundTransferFailed();
@@ -19,8 +20,10 @@ contract SHFactory is Ownable, Pausable {
     /// @notice The ERC-8004 Identity Registry baked into every deployed SessionHandler.
     address private immutable IDENTITY_REGISTRY;
 
+    address public immutable IMPLEMENTATION;
+
     /// @notice Total number of wallets deployed. Doubles as the next walletId to assign.
-    uint256 public totalWallets;
+    uint256 public totalWallets=1;
     /// @notice Maps each sequential walletId to its deployed wallet address.
     mapping(uint256 => address) public wallets;
 
@@ -40,13 +43,17 @@ contract SHFactory is Ownable, Pausable {
      * @param _reputationRegistry The Reputation Registry address.
      * @param _identityRegistry   The ERC-8004 Identity Registry address.
      */
-    constructor(address _entryPoint, address _feeRegistry, address _reputationRegistry, address _identityRegistry)
+    constructor(address _entryPoint, address _feeRegistry, address _reputationRegistry, address _identityRegistry,address _module)
         Ownable(msg.sender)
     {
         ENTRY_POINT = _entryPoint;
         REGISTRY = _feeRegistry;
         REPUTATION_REGISTRY = _reputationRegistry;
         IDENTITY_REGISTRY = _identityRegistry;
+        spendingLimitModule = _module;
+        IMPLEMENTATION = address(new SessionHandler());
+
+
     }
 
     /// @notice Pauses the contract, disabling execute(). Only callable by the owner.
@@ -70,26 +77,26 @@ contract SHFactory is Ownable, Pausable {
     }
 
     /// @notice Deploys a SessionHandler (ERC-7579 account) with spendingLimitModule installed as
-    ///         both its validator and hook. Reverts if spendingLimitModule hasn't been set.
+    ///         both its validator and hook. Reverts if module hasn't been set.
     function deployWallet() external payable whenNotPaused returns (address) {
-        address module = spendingLimitModule;
-        if (module == address(0)) revert SHFactory_SpendingLimitModuleNotSet();
+        if (spendingLimitModule == address(0)) revert SHFactory_SpendingLimitModuleNotSet();
 
         uint256 walletId = totalWallets;
-        SessionHandler sessionHandler = new SessionHandler(
-            msg.sender, ENTRY_POINT, REPUTATION_REGISTRY, IDENTITY_REGISTRY, REGISTRY, walletId, module
+        address walletInstance = Clones.clone(IMPLEMENTATION);
+        SessionHandler(payable(walletInstance)).initialize(
+            msg.sender, ENTRY_POINT, REPUTATION_REGISTRY, IDENTITY_REGISTRY, REGISTRY, walletId, spendingLimitModule
         );
 
-        wallets[walletId] = address(sessionHandler);
+        wallets[walletId] = walletInstance;
         totalWallets = walletId + 1;
 
-        (bool success,) = payable(address(sessionHandler)).call{value: msg.value}("");
+        (bool success,) = payable(walletInstance).call{value: msg.value}("");
         if (!success) {
             revert SHFactory_FundTransferFailed();
         }
 
-        emit WalletDeployed(address(sessionHandler), msg.sender, walletId);
-        return address(sessionHandler);
+        emit WalletDeployed(walletInstance, msg.sender, walletId);
+        return walletInstance;
     }
 }
 

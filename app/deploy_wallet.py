@@ -19,7 +19,7 @@ from db import (
     get_uniswapv2_selectors,
     save_contact
 )
-from anvil import get_or_create_session_key
+from userop import get_or_create_session_key
 from contracts import (
     invalidate_cache,
     load_factory,

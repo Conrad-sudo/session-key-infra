@@ -18,6 +18,7 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 import {SHRegistry} from "./SHRegistry.sol";
 import {SHValueInterpreter} from "./SHValueInterpreter.sol";
 import {SHOracle} from "./SHOracle.sol";
+import {IUniswapV2Router01} from "lib/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol";
 
 /**
  * @title SessionHandlerModule
@@ -275,7 +276,7 @@ contract SessionHandlerModule is IERC7579Validator, IERC7579Hook {
             if (session.target != address(0) || !_isSessionUsable(account, signer)) {
                 return _packValidationData(true, session.validFrom, session.validUntil);
             }
-            _setPendingSession(account, signer);
+            _setPendingSession(account, keccak256(userOp.callData), signer);
             return _packValidationData(false, session.validFrom, session.validUntil);
         }
 
@@ -289,7 +290,24 @@ contract SessionHandlerModule is IERC7579Validator, IERC7579Hook {
             return _packValidationData(true, session.validFrom, session.validUntil);
         }
 
-        _setPendingSession(account, signer);
+        // Router swaps and liquidity ops must return their proceeds to the account itself.
+        // Without this, a session key could send swap output (or removeLiquidity assets) to an
+        // attacker; worse, removeLiquidity credits the budget back on the assumption the assets
+        // return to the wallet, so a foreign `to` turns that credit into an unbounded drain loop.
+        // Pure calldata check -- no storage or external calls, so it is validation-phase safe.
+        (bool isRouterCall, uint256 toSlot) = _routerRecipientSlot(selector);
+        if (isRouterCall) {
+            uint256 toEnd = 4 + (toSlot + 1) * 32;
+            if (callData.length < toEnd) {
+                return _packValidationData(true, session.validFrom, session.validUntil);
+            }
+            address to = address(uint160(uint256(bytes32(callData[toEnd - 32:toEnd]))));
+            if (to != account) {
+                return _packValidationData(true, session.validFrom, session.validUntil);
+            }
+        }
+
+        _setPendingSession(account, keccak256(userOp.callData), signer);
         return _packValidationData(false, session.validFrom, session.validUntil);
     }
 
@@ -306,7 +324,7 @@ contract SessionHandlerModule is IERC7579Validator, IERC7579Hook {
      */
     function preCheck(address, uint256, bytes calldata msgData) external returns (bytes memory) {
         address account = msg.sender;
-        address sessionKey = _consumePendingSession(account);
+        address sessionKey = _consumePendingSession(account, keccak256(msgData));
         if (sessionKey == address(0)) return "";
 
         // Pricing-exempt sessions never touch SHValueInterpreter/SHOracle -- target and selector
@@ -380,34 +398,70 @@ contract SessionHandlerModule is IERC7579Validator, IERC7579Hook {
         isExecute = true;
     }
 
-    /// @dev Transient storage is scoped per contract address, so keying by `account` (this contract's own
-    ///      msg.sender in both validateUserOp and preCheck) keeps concurrent UserOps from different
-    ///      accounts in the same bundled transaction from clobbering each other. Auto-clears at tx end.
-    function _setPendingSession(address account, address sessionKey) internal {
-        bytes32 slot = keccak256(abi.encode("SessionHandlerModule.pendingSession", account));
+    /**
+     * @dev For router swap/liquidity selectors, returns the calldata head-slot index of the `to`
+     *      recipient argument, so the caller can require it equals the account. `to` sits at a fixed
+     *      head slot even when `path` is dynamic: ABI encoding stores the path offset in the head and
+     *      the path data in the tail, so the slot positions never shift. Returns found = false for any
+     *      non-router selector, which skips the recipient check.
+     */
+    function _routerRecipientSlot(bytes4 selector) internal pure returns (bool found, uint256 slot) {
+        if (
+            selector == IUniswapV2Router01.swapExactTokensForTokens.selector
+                || selector == IUniswapV2Router01.swapTokensForExactTokens.selector
+                || selector == IUniswapV2Router01.swapExactTokensForETH.selector
+                || selector == IUniswapV2Router01.swapTokensForExactETH.selector
+        ) return (true, 3);
+        if (
+            selector == IUniswapV2Router01.swapExactETHForTokens.selector
+                || selector == IUniswapV2Router01.swapETHForExactTokens.selector
+        ) return (true, 2);
+        if (selector == IUniswapV2Router01.addLiquidity.selector) return (true, 6);
+        if (selector == IUniswapV2Router01.addLiquidityETH.selector) return (true, 4);
+        if (selector == IUniswapV2Router01.removeLiquidity.selector) return (true, 5);
+        if (selector == IUniswapV2Router01.removeLiquidityETH.selector) return (true, 4);
+        return (false, 0);
+    }
+
+    /// @dev Transient storage is scoped per contract address, so keying by `account` (this contract's
+    ///      own msg.sender in validateUserOp/preCheck) isolates concurrent UserOps from *different*
+    ///      accounts. The key also mixes in `callHash` -- keccak256 of the execute() calldata -- so two
+    ///      ops for the SAME account in one bundle land in distinct slots and cannot clobber each other.
+    ///      This matters because the EntryPoint validates every op before executing any: with an
+    ///      account-only key, the second op's write would overwrite the first's before the first
+    ///      executes, letting a priced op run against another op's (possibly pricing-exempt) session.
+    ///      Both validateUserOp and preCheck see the same execute() calldata, so both recompute the same
+    ///      callHash. Auto-clears at tx end.
+    function _pendingSlot(address account, bytes32 callHash) internal pure returns (bytes32) {
+        return keccak256(abi.encode("SessionHandlerModule.pendingSession", account, callHash));
+    }
+
+    function _setPendingSession(address account, bytes32 callHash, address sessionKey) internal {
+        bytes32 slot = _pendingSlot(account, callHash);
         assembly {
             tstore(slot, sessionKey)
         }
     }
 
-    function _consumePendingSession(address account) internal view returns (address sessionKey) {
-        bytes32 slot = keccak256(abi.encode("SessionHandlerModule.pendingSession", account));
+    function _consumePendingSession(address account, bytes32 callHash) internal view returns (address sessionKey) {
+        bytes32 slot = _pendingSlot(account, callHash);
         assembly {
             sessionKey := tload(slot)
         }
     }
 
     /**
-     * @notice Returns the session key flagged as pending for `account` during this transaction's
-     *         validateUserOp, or address(0) if the in-flight execution wasn't authorized by a
-     *         session key (e.g. an owner-initiated call).
+     * @notice Returns the session key flagged as pending for `account` and `callHash` (keccak256 of the
+     *         execute() calldata) during this transaction's validateUserOp, or address(0) if the
+     *         in-flight execution wasn't authorized by a session key (e.g. an owner-initiated call).
      * @dev Read-only wrapper around the same transient slot preCheck reads. Lets an account (e.g.
      *      SessionHandler) tell, from inside its own execute(), whether this particular call was
      *      driven by a session key -- useful for session-key-only behavior like fee charging that
-     *      doesn't belong inside a reusable spending-limit module.
+     *      doesn't belong inside a reusable spending-limit module. The caller passes keccak256(msg.data)
+     *      so the lookup targets this exact execution.
      */
-    function pendingSessionKey(address account) external view returns (address) {
-        return _consumePendingSession(account);
+    function pendingSessionKey(address account, bytes32 callHash) external view returns (address) {
+        return _consumePendingSession(account, callHash);
     }
 
     function _packValidationData(bool sigFailed, uint48 validFrom, uint48 validUntil)

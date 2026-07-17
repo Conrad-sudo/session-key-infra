@@ -17,10 +17,8 @@ from db import (
    
 )
 from network_config import load_network_config
-from anvil import (
-    send_user_op_as_session as _send_user_op_as_session,
-    get_or_create_session_key,
-)
+from anvil import send_user_op_as_session as _send_user_op_as_session
+from userop import get_or_create_session_key
 
 from live_network import send_live_user_op_as_session as _send_live_user_op_as_session
 
@@ -84,6 +82,32 @@ BPS_DENOMINATOR = 10_000
 DEFAULT_SLIPPAGE_BPS = 50  # 0.5%
 SWAP_DEADLINE_SECS = 600  # 10 minutes
 SECONDS_PER_HOUR = 3_600
+
+
+def _submit_router_call(chat_id, session_key_ciphertext, router, fn_name, args, value=0):
+    """Encode a Uniswap/PancakeSwap V2 router call and submit it as a session-key UserOp.
+
+    Shared by every swap and liquidity @tool so the encode + submit + status-check boilerplate
+    lives in one place; each tool still builds its own quote, slippage bounds, and args list.
+    Returns (tx_hash, receipt); raises ToolException if the UserOp did not succeed.
+
+    @param router  Bound router Contract (its .address is the UserOp target).
+    @param fn_name Router function name for load_calldata (e.g. "swapExactTokensForTokens").
+    @param args    Positional args for that router function, in ABI order.
+    @param value   Native wei to forward (0 for token-in calls; the ETH/BNB amount for
+                   ETH-funded swaps and addLiquidityETH).
+    """
+    data = load_calldata(instance=router, fn_name=fn_name, args=args)
+    tx_hash, receipt = send_user_op_as_session(
+        chat_id=chat_id,
+        key_ciphertext=session_key_ciphertext,
+        target=router.address,
+        value=value,
+        data=data,
+    )
+    if receipt["status"] != 1:
+        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
+    return tx_hash, receipt
 
 """
  /*//////////////////////////////////////////////////////////////
@@ -363,7 +387,9 @@ def get_session_keys(chat_id: int, token: str) -> tuple[str, str]:
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        token: The token ticker symbol the session key is scoped to (e.g. "usdc").
+        token: The session target. A token ticker (e.g. "usdc") for ERC20 operations,
+               "uniswapv2_router" for any swap or liquidity operation, "eth" for native
+               ETH/BNB transfers, or "reputation_registry" for posting ERC-8004 feedback.
 
     Returns:
         A tuple of (session_key_address, session_key_ciphertext). Pass the ciphertext
@@ -471,7 +497,8 @@ def get_price(chat_id: int, token: str) -> float:
     Retrieves the current USD price of a token by querying the registered SHOracle.
 
     Use this tool when the user asks what a token is currently worth, or when you need
-    to estimate the USD value of an amount before sending it.
+    to estimate the USD value of an amount before sending it. NEVER use this to estimate
+    swap output quantities — use get_quote_in or get_quote_out, which query live pool reserves.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
@@ -530,7 +557,9 @@ def preflight_check(
     Args:
         chat_id: The Telegram chat ID of the user making the request.
         token: The token ticker to check (e.g. "usdc"). For Uniswap swaps, pass the token
-               being sold (exact-in) or acquired (exact-out) as the USD proxy.
+               being sold (exact-in) or acquired (exact-out) as the USD proxy. Pass "eth" for a
+               native ETH/BNB send — the budget check is skipped (the native asset is not an
+               ERC20) and usd_value reflects the native amount at the current price.
         amount: The proposed amount in whole token units (e.g. 100 for 100 USDC).
         is_uniswap: Set to True for Uniswap swaps so the router session key is used for
                     the budget check. Defaults to False.
@@ -811,7 +840,9 @@ def transferFrom_erc20(
                                 for this token. Obtain by calling get_session_keys(token).
         token: The token ticker symbol to transfer (e.g. "usdc").
         sender: The name of the contact who is the sender of the tokens (e.g. "Sandy"). Must be a saved contact.
-        recipient: The name of the contact who is the recipient of the tokens (e.g. "Alex"). Must be a saved contact.
+        recipient: The name of the contact who is the recipient of the tokens (e.g. "Alex"). Must be a
+                   saved contact. Exception: if the user names themselves or the wallet as the
+                   recipient (e.g. "to me", "to my wallet"), pass the literal string "me".
         amount: The amount of tokens to transfer in whole units (e.g. 100 for 100 USDC).
 
     Returns: A string summarizing the transaction result, including the transaction hash and status.
@@ -1352,28 +1383,14 @@ def swap_ETH_for_exact_tokens(
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
     to = load_session_handler(chat_id).address
 
-    data = load_calldata(
-        instance=router,
-        fn_name="swapETHForExactTokens",
-        args=[
-            quote["amount_out_base"],
-            quote["path"],
-            to,
-            deadline,
-        ],
-    )
-    target = router.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "swapETHForExactTokens",
+        [quote["amount_out_base"], quote["path"], to, deadline],
         value=value,
-        data=data,
     )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1426,10 +1443,12 @@ def swap_exact_tokens_for_tokens(
     )
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
 
-    data = load_calldata(
-        instance=router,
-        fn_name="swapExactTokensForTokens",
-        args=[
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "swapExactTokensForTokens",
+        [
             quote["amount_in_base"],
             amount_out_min,
             quote["path"],
@@ -1437,18 +1456,6 @@ def swap_exact_tokens_for_tokens(
             deadline,
         ],
     )
-    target = router.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1502,10 +1509,12 @@ def swap_tokens_for_exact_tokens(
     )
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
 
-    data = load_calldata(
-        instance=router,
-        fn_name="swapTokensForExactTokens",
-        args=[
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "swapTokensForExactTokens",
+        [
             quote["amount_out_base"],
             amount_in_max,
             quote["path"],
@@ -1513,16 +1522,6 @@ def swap_tokens_for_exact_tokens(
             deadline,
         ],
     )
-    target = router.address
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1582,30 +1581,13 @@ def swap_exact_tokens_for_ETH(
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
     to = load_session_handler(chat_id).address
 
-    data = load_calldata(
-        instance=router,
-        fn_name="swapExactTokensForETH",
-        args=[
-            quote["amount_in_base"],
-            amount_out_min,
-            quote["path"],
-            to,
-            deadline,
-        ],
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "swapExactTokensForETH",
+        [quote["amount_in_base"], amount_out_min, quote["path"], to, deadline],
     )
-
-    target = router.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1667,30 +1649,13 @@ def swap_tokens_for_exact_ETH(
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
     to = load_session_handler(chat_id).address
 
-    data = load_calldata(
-        instance=router,
-        fn_name="swapTokensForExactETH",
-        args=[
-            quote["amount_out_base"],
-            amount_in_max,
-            quote["path"],
-            to,
-            deadline,
-        ],
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "swapTokensForExactETH",
+        [quote["amount_out_base"], amount_in_max, quote["path"], to, deadline],
     )
-
-    target = router.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1751,29 +1716,14 @@ def swap_exact_ETH_for_tokens(
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
     to = load_session_handler(chat_id).address
 
-    data = load_calldata(
-        instance=router,
-        fn_name="swapExactETHForTokens",
-        args=[
-            amount_out_min,
-            quote["path"],
-            to,
-            deadline,
-        ],
-    )
-
-    target = router.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "swapExactETHForTokens",
+        [amount_out_min, quote["path"], to, deadline],
         value=quote["amount_in_base"],
-        data=data,
     )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1840,10 +1790,12 @@ def add_liquidity(
     )
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
 
-    data = load_calldata(
-        instance=router,
-        fn_name="addLiquidity",
-        args=[
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "addLiquidity",
+        [
             quote["token_a_address"],
             quote["token_b_address"],
             quote["amount_a_base"],
@@ -1854,17 +1806,6 @@ def add_liquidity(
             deadline,
         ],
     )
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=router.address,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1933,10 +1874,12 @@ def add_liquidity_eth(
     )
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
 
-    data = load_calldata(
-        instance=router,
-        fn_name="addLiquidityETH",
-        args=[
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "addLiquidityETH",
+        [
             quote["token_a_address"],
             quote["amount_a_base"],
             amount_token_min,
@@ -1944,18 +1887,8 @@ def add_liquidity_eth(
             load_session_handler(chat_id).address,
             deadline,
         ],
-    )
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=router.address,
         value=quote["amount_b_desired_base"],
-        data=data,
     )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -2022,10 +1955,12 @@ def remove_liquidity(
     )
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
 
-    data = load_calldata(
-        instance=router,
-        fn_name="removeLiquidity",
-        args=[
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "removeLiquidity",
+        [
             lp["token_a_address"],
             lp["token_b_address"],
             lp["liquidity"],
@@ -2035,17 +1970,6 @@ def remove_liquidity(
             deadline,
         ],
     )
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=router.address,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"Min {token_a.upper()} returned: {amount_a_min / 10**lp['decimals_a']:.6f}, "
@@ -2113,10 +2037,12 @@ def remove_liquidity_eth(
     )
     deadline = int(time.time()) + SWAP_DEADLINE_SECS
 
-    data = load_calldata(
-        instance=router,
-        fn_name="removeLiquidityETH",
-        args=[
+    tx_hash, receipt = _submit_router_call(
+        chat_id,
+        session_key_ciphertext,
+        router,
+        "removeLiquidityETH",
+        [
             lp["token_a_address"],
             lp["liquidity"],
             amount_token_min,
@@ -2125,17 +2051,6 @@ def remove_liquidity_eth(
             deadline,
         ],
     )
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=router.address,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"Min {token.upper()} returned: {amount_token_min / 10**lp['decimals_a']:.6f}, "
@@ -2366,8 +2281,9 @@ def post_reputation_feedback(
 
     Call this when the user wants to rate the agent after an interaction. The score must
     be between 0 and 100. Tags are comma-separated descriptors (e.g. "reliable,fast").
-    Always retrieve the session key by calling get_session_keys("reputation_registry")
-    before calling this tool.
+    This is an irreversible on-chain write — always confirm the score and tags with the user
+    before calling. Always retrieve the session key by calling
+    get_session_keys("reputation_registry") before calling this tool.
 
     Args:
         chat_id: The Telegram chat ID of the user.

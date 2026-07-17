@@ -145,10 +145,14 @@ contract DeploySHProtocol is Script {
         // deploy the ERC-7579 spending-limit module, wired to the same registry
         SessionHandlerModule module = new SessionHandlerModule(treasury.REGISTRY());
 
-        //deploy factory
-        factory =
-            new SHFactory(config.entryPoint, treasury.REGISTRY(), config.reputationRegistry, config.identityRegistry);
-        factory.setSpendingLimitModule(address(module));
+        //deploy factory (module set via constructor; deploys the SessionHandler implementation internally)
+        factory = new SHFactory(
+            config.entryPoint,
+            treasury.REGISTRY(),
+            config.reputationRegistry,
+            config.identityRegistry,
+            address(module)
+        );
         vm.stopBroadcast();
     }
 }

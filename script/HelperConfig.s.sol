@@ -214,13 +214,22 @@ contract HelperConfig is Script {
     /// @notice Default pre-funded account on a local Anvil node (account index 0)
     address public constant ANVIL_BURNER_WALLET = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
 
-    /// @dev Placeholder private key for the mainnet/fork deployer account.
-    ///      MUST NOT be ANVIL_BURNER_WALLET's key (0xac0974...) — that key is public and the
-    ///      corresponding address has been hijacked on real mainnet via an EIP-7702 delegation
-    ///      that sweeps any received ERC-721 to an attacker address, which breaks mainnet-fork
-    ///      tests that register an NFT to config.account. Replace with a real funded key before
-    ///      broadcasting an actual mainnet deployment.
-    uint256 private constant MAINNET_DEPLOYER_PK = uint256(keccak256("session-handler-mainnet-deployer"));
+    /// @dev Deterministic placeholder used ONLY to derive a stable deployer address for local
+    ///      mainnet/BSC fork tests. Its key comes from a public string, so the key itself is public —
+    ///      it is never a signing key for a real deploy. It also must not be ANVIL_BURNER_WALLET's key
+    ///      (0xac0974...): that address is hijacked on real mainnet via an EIP-7702 delegation that
+    ///      sweeps any received ERC-721 to an attacker, which breaks mainnet-fork tests that register
+    ///      an NFT to config.account. Real mainnet/BSC deploys resolve the deployer from
+    ///      MAINNET_DEPLOYER_ADDRESS instead — see _mainnetDeployer.
+    uint256 private constant PLACEHOLDER_DEPLOYER_PK = uint256(keccak256("session-handler-mainnet-deployer"));
+
+    /// @notice Resolves the mainnet/BSC deployer/owner address. A real deploy must export
+    ///         MAINNET_DEPLOYER_ADDRESS (the funded operator address, matching the key passed via
+    ///         --account/--private-key); fork tests fall back to a deterministic placeholder address
+    ///         with no real funds at stake, so a public placeholder key can never move real value.
+    function _mainnetDeployer() internal view returns (address) {
+        return vm.envOr("MAINNET_DEPLOYER_ADDRESS", vm.addr(PLACEHOLDER_DEPLOYER_PK));
+    }
 
     /**
      * @dev Cached Anvil network config. Populated on first call to getOrCreateAnvilConfig.
@@ -249,8 +258,8 @@ contract HelperConfig is Script {
     /**
      * @notice Resolves and returns the NetworkConfig for a given chain ID
      * @dev Dispatches to the appropriate chain-specific config getter.
-     *      Falls back to mainnet config for unrecognised chain IDs rather than reverting,
-     *      allowing deployment to any EVM chain that shares the canonical EntryPoint address.
+     *      Reverts with HelperConfig__InvalidChainId for unrecognised chain IDs rather than silently
+     *      returning mainnet's token/feed/registry addresses, which would be wrong for that chain.
      * @param chainId The EVM chain ID to resolve configuration for
      * @return config NetworkConfig for the specified chain
      */
@@ -264,7 +273,7 @@ contract HelperConfig is Script {
         } else if (chainId == BSC_CHAIN_ID) {
             return getBscConfig();
         } else {
-            return getMainnetConfig();
+            revert HelperConfig__InvalidChainId();
         }
     }
 
@@ -368,10 +377,10 @@ contract HelperConfig is Script {
      *      Ensure sepoliaAccount is funded before broadcasting on any live network.
      * @return config NetworkConfig for Ethereum mainnet and compatible chains
      */
-    function getMainnetConfig() internal pure returns (NetworkConfig memory) {
+    function getMainnetConfig() internal view returns (NetworkConfig memory) {
         return NetworkConfig({
             entryPoint: ENTRYPOINT_V07,
-            account: vm.addr(MAINNET_DEPLOYER_PK),
+            account: _mainnetDeployer(),
             identityRegistry: MNT_IDENTITY_REGISTRY,
             reputationRegistry: MNT_REPUTATION_REGISTRY,
             //swap for the deployer account on mainnet and ensure it's funded before broadcasting
@@ -458,10 +467,10 @@ contract HelperConfig is Script {
      *      (APE, ARB, ENS, SAND, wTAO, IMX) are set to address(0).
      * @return config NetworkConfig for BSC mainnet
      */
-    function getBscConfig() internal pure returns (NetworkConfig memory) {
+    function getBscConfig() internal view returns (NetworkConfig memory) {
         return NetworkConfig({
             entryPoint: ENTRYPOINT_V07,
-            account: vm.addr(MAINNET_DEPLOYER_PK),
+            account: _mainnetDeployer(),
             identityRegistry: MNT_IDENTITY_REGISTRY,
             reputationRegistry: MNT_REPUTATION_REGISTRY,
             router: PANCAKE_V2_ROUTER_02,

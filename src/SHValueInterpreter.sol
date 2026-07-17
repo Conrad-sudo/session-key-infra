@@ -77,47 +77,47 @@ contract SHValueInterpreter {
             debitValueInUsd += oracle.getUsdValue(address(0), value);
         }
 
+        // Only transfer/transferFrom move tokens out, so only those are priced. Other allowlisted
+        // calls to a non-router target (e.g. approve, which grants an allowance but moves nothing)
+        // cost $0 and must NOT touch the oracle: a getUsdValue(dest, 0) there is a wasted read that
+        // also reverts whenever dest's feed is stale or unregistered, blocking a harmless approve.
         if (data.length >= 68 && dest != uniswapRouter) {
             if (selector == IERC20.transfer.selector) {
                 assembly {
                     extractedValue := mload(add(data, 68))
                 }
-            }
-            if (selector == IERC20.transferFrom.selector) {
+                debitValueInUsd += oracle.getUsdValue(dest, extractedValue);
+            } else if (selector == IERC20.transferFrom.selector) {
                 assembly {
                     extractedValue := mload(add(data, 100))
                 }
+                debitValueInUsd += oracle.getUsdValue(dest, extractedValue);
             }
-            debitValueInUsd += oracle.getUsdValue(dest, extractedValue);
         }
 
         if (data.length >= 68 && dest == uniswapRouter) {
-            if (selector == IUniswapV2Router01.swapTokensForExactETH.selector) {
-                assembly {
-                    extractedValue := mload(add(data, 36))
-                }
-                debitValueInUsd += oracle.getUsdValue(address(0), extractedValue);
-            } else if (
+            if (
                 selector == IUniswapV2Router01.swapExactTokensForTokens.selector
-                    || selector == IUniswapV2Router01.swapTokensForExactTokens.selector
                     || selector == IUniswapV2Router01.swapExactTokensForETH.selector
+                    || selector == IUniswapV2Router01.swapTokensForExactTokens.selector
+                    || selector == IUniswapV2Router01.swapTokensForExactETH.selector
             ) {
+                // Always price the INPUT token (path[0]) by the most that can leave the wallet.
+                // Exact-input swaps carry that amount in param 0 (amountIn); exact-output swaps
+                // carry the ceiling in param 1 (amountInMax). Pricing the output side instead let a
+                // crafted path/pool debit far less than the input the router actually pulled.
+                bool exactOutput = selector == IUniswapV2Router01.swapTokensForExactTokens.selector
+                    || selector == IUniswapV2Router01.swapTokensForExactETH.selector;
+                uint256 amountSlot = exactOutput ? 68 : 36; // data offset of amountInMax vs amountIn
                 address tokenIn;
-                address tokenOut;
                 assembly {
-                    extractedValue := mload(add(data, 36))
+                    extractedValue := mload(add(data, amountSlot))
                     let paramsBase := add(data, 36)
                     let pathOffset := mload(add(paramsBase, 64))
                     let pathPtr := add(paramsBase, pathOffset)
-                    let pathLen := mload(pathPtr)
                     tokenIn := mload(add(pathPtr, 32))
-                    tokenOut := mload(add(pathPtr, add(32, mul(sub(pathLen, 1), 32))))
                 }
-                token = (selector == IUniswapV2Router01.swapExactTokensForTokens.selector
-                        || selector == IUniswapV2Router01.swapExactTokensForETH.selector)
-                    ? tokenIn
-                    : tokenOut;
-                debitValueInUsd += oracle.getUsdValue(token, extractedValue);
+                debitValueInUsd += oracle.getUsdValue(tokenIn, extractedValue);
             } else if (selector == IUniswapV2Router01.addLiquidity.selector && data.length >= 132) {
                 address tokenA;
                 address tokenB;

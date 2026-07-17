@@ -5,7 +5,7 @@ import {IEntryPoint} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol
 import {AccountERC7579Hooked} from "@openzeppelin/contracts/account/extensions/draft-AccountERC7579Hooked.sol";
 import {MODULE_TYPE_VALIDATOR, MODULE_TYPE_HOOK} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
 import {Mode} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -14,6 +14,8 @@ import {SHRegistry} from "./SHRegistry.sol";
 import {SessionHandlerModule} from "./SessionHandlerModule.sol";
 import {IReputationRegistry} from "./interfaces/IReputationRegistry.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
+import {Context} from "@openzeppelin/contracts/utils/Context.sol";
+import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
 
 /**
  * @title SessionHandler
@@ -30,7 +32,7 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
  *      the owner never has to submit a UserOp for their own admin actions -- they just call the
  *      account directly, without needing a second "owner validator" module.
  */
-contract SessionHandler is AccountERC7579Hooked, Ownable, Pausable {
+contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
@@ -48,18 +50,29 @@ contract SessionHandler is AccountERC7579Hooked, Ownable, Pausable {
 
     /// @dev Overrides Account's default (OZ's canonical v0.8 singleton) with this deployment's own
     ///      EntryPoint, since this project actually uses a v0.7 EntryPoint (see HelperConfig.s.sol).
-    address public immutable ENTRY_POINT;
-    address public immutable REPUTATION_REGISTRY;
-    address public immutable IDENTITY_REGISTRY;
-    SHRegistry public immutable REGISTRY;
-    uint256 public immutable WALLET_ID;
-    /// @dev Installed as both MODULE_TYPE_VALIDATOR and MODULE_TYPE_HOOK in the constructor.
-    SessionHandlerModule public immutable SH_MODULE;
+    /// @dev Set once in initialize() rather than the constructor: this account is deployed behind an
+    ///      EIP-1167 minimal proxy by SHFactory, so per-wallet state cannot live in immutables (those
+    ///      are baked into the shared implementation bytecode). initialize() is one-time (initializer).
+    address public ENTRY_POINT;
+    address public REPUTATION_REGISTRY;
+    address public IDENTITY_REGISTRY;
+    SHRegistry public REGISTRY;
+    uint256 public WALLET_ID;
+    /// @dev Installed as both MODULE_TYPE_VALIDATOR and MODULE_TYPE_HOOK in initialize().
+    SessionHandlerModule public SH_MODULE;
 
+    
     /*//////////////////////////////////////////////////////////////
-                                CONSTRUCTOR
+                                Constructor
     //////////////////////////////////////////////////////////////*/
-    constructor(
+    
+    constructor() {
+        _disableInitializers();
+    }
+    /*//////////////////////////////////////////////////////////////
+                                Initialization
+    //////////////////////////////////////////////////////////////*/
+    function initialize(
         address owner,
         address entryPointAddress,
         address reputationRegistry,
@@ -67,7 +80,8 @@ contract SessionHandler is AccountERC7579Hooked, Ownable, Pausable {
         address registry,
         uint256 walletId,
         address spendingLimitModule
-    ) Ownable(owner) {
+    )  external initializer {
+        __Ownable_init(owner);
         ENTRY_POINT = entryPointAddress;
         REPUTATION_REGISTRY = reputationRegistry;
         IDENTITY_REGISTRY = identityRegistry;
@@ -113,7 +127,7 @@ contract SessionHandler is AccountERC7579Hooked, Ownable, Pausable {
         onlyEntryPointOrSelfOrOwner
     {
         bool isSessionKeyExecution =
-            msg.sender == address(entryPoint()) && SH_MODULE.pendingSessionKey(address(this)) != address(0);
+            msg.sender == address(entryPoint()) && SH_MODULE.pendingSessionKey(address(this), keccak256(msg.data)) != address(0);
 
         _execute(Mode.wrap(mode), executionCalldata);
 
@@ -274,5 +288,22 @@ contract SessionHandler is AccountERC7579Hooked, Ownable, Pausable {
         return REGISTRY.router();
     }
 
-    
+    /*//////////////////////////////////////////////////////////////
+                      CONTEXT OVERRIDE RESOLUTION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Resolves the diamond between the non-upgradeable Context (pulled in by the ERC-7579
+    ///      account stack) and ContextUpgradeable (pulled in by OwnableUpgradeable). Both are
+    ///      stateless and identical for a non-ERC-2771 account, so these return the plain msg.* values.
+    function _msgSender() internal view override(Context, ContextUpgradeable) returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view override(Context, ContextUpgradeable) returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view override(Context, ContextUpgradeable) returns (uint256) {
+        return 0;
+    }
 }

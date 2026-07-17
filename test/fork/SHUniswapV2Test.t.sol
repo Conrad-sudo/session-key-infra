@@ -771,8 +771,8 @@ contract SHUniswapV2Test is Test {
      * @notice Session key can execute swapTokensForExactETH through SessionHandler.
      * @dev Sells DAI to receive exactly 0.5 ETH. The owner first acquires DAI for
      *      sessionHandler by swapping 2 WETH→DAI and approving the router to spend DAI,
-     *      both via direct execute() calls (no UserOp). Budget is charged against the USD value
-     *      of the ETH output (amountOut), as extracted by SessionHandlerModule. Assertion uses a
+     *      both via direct execute() calls (no UserOp). Budget is charged against the USD value of
+     *      the DAI input at the amountInMax ceiling (path[0]), not the ETH output. Assertion uses a
      *      small tolerance because Uniswap may return slightly more ETH than requested before
      *      unwrapping.
      */
@@ -812,8 +812,10 @@ contract SHUniswapV2Test is Test {
         path[1] = config.weth;
 
         uint256 amountOut = 0.5 ether;
-        uint256 spentAMount = oracle.getUsdValue(address(0), amountOut);
         uint256 amountInMax = 2000e18;
+        // Exact-output swap: budget is charged against the input token (path[0] = DAI) at the
+        // amountInMax ceiling, not the ETH received. See SHValueInterpreter exact-output pricing.
+        uint256 spentAMount = oracle.getUsdValue(config.dai, amountInMax);
         uint256 deadline = block.timestamp + 2 hours;
         address to = address(sessionHandler);
 
@@ -1136,6 +1138,48 @@ contract SHUniswapV2Test is Test {
         assertEq(IERC20(pair).balanceOf(to), 0);
         assertEq(balanceAfterA, balanceBeforeA + expectedA);
         assertEq(balanceAfterB, balanceBeforeB + expectedB);
+        assertEq(sessionHandler.getRemainingBudget(user), BUDGET);
+    }
+
+    /**
+     * @notice A session-key removeLiquidity that sends the withdrawn assets to a foreign recipient
+     *         is rejected at validation, closing the budget-credit drain loop.
+     * @dev Mirrors testRemoveLiquidityWithSession but points `to` at an attacker address. The
+     *      recipient check in SessionHandlerModule._validateSession fails the signature, so the
+     *      EntryPoint reverts the whole handleOps (AA24) before the inner call runs -- the LP is
+     *      never burned and the budget is never credited.
+     */
+    function testRemoveLiquidityToForeignRecipientReverts()
+        public
+        routerSessionAdded
+        liquidityAdded(address(sessionHandler))
+    {
+        address attacker = makeAddr("attacker");
+        address tokenA = config.dai;
+        address tokenB = config.weth;
+        address pair = FACTORY.getPair(tokenA, tokenB);
+        uint256 liquidity = IERC20(pair).balanceOf(address(sessionHandler));
+        uint256 deadline = block.timestamp + 1.2 hours;
+        address dest = config.router;
+
+        bytes memory data = abi.encodeWithSelector(
+            IUniswapV2Router01.removeLiquidity.selector, tokenA, tokenB, liquidity, 0, 0, attacker, deadline
+        );
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(sessionHandler), config, address(spendingLimitModule), dest, 0, data, user, privateKey
+        );
+        PackedUserOperation[] memory packedUserOp = new PackedUserOperation[](1);
+        packedUserOp[0] = userOp;
+
+        vm.warp(block.timestamp + 1.1 hours);
+        _refreshForkFeeds();
+        vm.startPrank(bundler, bundler);
+        vm.expectRevert(); // EntryPoint FailedOp (AA24): validation rejects the foreign recipient
+        IEntryPoint(config.entryPoint).handleOps(packedUserOp, payable(user));
+        vm.stopPrank();
+
+        // LP untouched and budget uncredited: the op never executed.
+        assertEq(IERC20(pair).balanceOf(address(sessionHandler)), liquidity);
         assertEq(sessionHandler.getRemainingBudget(user), BUDGET);
     }
 

@@ -1,6 +1,14 @@
 from web3 import Web3
 from db import get_rpc_url, get_chain_id_from_name, get_user_network
 
+# One cached {"instance": Web3, "chain_id": int} per chain_name, so the underlying
+# HTTP keep-alive pool is reused instead of a fresh session being built on every
+# lookup. Shared by both loaders below (both key by chain_name). web3.py's
+# HTTPProvider is safe to share across the bot's worker threads (it sends over a
+# thread-safe requests.Session). RPC URLs are static config; restart to pick up a
+# changed rpcs table.
+_web3_cache: dict[str, dict] = {}
+
 
 def load_network_config(chat_id: int) -> tuple[Web3, int, str]:
     """
@@ -11,16 +19,31 @@ def load_network_config(chat_id: int) -> tuple[Web3, int, str]:
     @param chat_id  The Telegram chat ID of the user.
     @return            A tuple of (Web3 instance, chain_id, chain_name).
     """
+
+    
     chain_name = get_user_network(chat_id)
     if chain_name is None:
         raise ValueError(f"No network configured for user {chat_id}. Deploy first.")
-    rpc_url = get_rpc_url(chain_name)
-    chain_id = get_chain_id_from_name(chain_name)
+    
+    if chain_name not in _web3_cache:
 
-    if rpc_url is None or chain_id is None:
-        raise ValueError(f"Chain name '{chain_name}' not found in database")
+        rpc_url = get_rpc_url(chain_name)
+        chain_id = get_chain_id_from_name(chain_name)
 
-    return Web3(Web3.HTTPProvider(rpc_url)), chain_id, chain_name
+        if rpc_url is None or chain_id is None:
+            raise ValueError(f"Chain name '{chain_name}' not found in database")
+
+        instance=Web3(Web3.HTTPProvider(rpc_url))
+
+        
+        _web3_cache[chain_name] = {
+            "instance": instance,
+            "chain_id": chain_id
+        }
+    return _web3_cache[chain_name]["instance"], _web3_cache[chain_name]["chain_id"], chain_name
+
+    
+    
 
 
 def load_network_config_by_name(chain_name: str) -> tuple[Web3, int]:
@@ -33,10 +56,15 @@ def load_network_config_by_name(chain_name: str) -> tuple[Web3, int]:
     @return            A tuple of (Web3 instance, chain_id).
     """
 
-    rpc_url = get_rpc_url(chain_name)
-    chain_id = get_chain_id_from_name(chain_name)
+    if chain_name not in _web3_cache:
+        rpc_url = get_rpc_url(chain_name)
+        chain_id = get_chain_id_from_name(chain_name)
 
-    if rpc_url is None or chain_id is None:
-        raise ValueError(f"Chain name '{chain_name}' not found in database")
+        if rpc_url is None or chain_id is None:
+            raise ValueError(f"Chain name '{chain_name}' not found in database")
 
-    return Web3(Web3.HTTPProvider(rpc_url)), chain_id
+        _web3_cache[chain_name] = {
+            "instance": Web3(Web3.HTTPProvider(rpc_url)),
+            "chain_id": chain_id,
+        }
+    return _web3_cache[chain_name]["instance"], _web3_cache[chain_name]["chain_id"]

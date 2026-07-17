@@ -9,7 +9,8 @@ viaIR = true
 gas_reports = ["*"]
 remappings= ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
  ,"@account-abstraction/contracts/=lib/account-abstraction/contracts/",
- '@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/'
+ '@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/',
+ "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/"
  ]
 
 

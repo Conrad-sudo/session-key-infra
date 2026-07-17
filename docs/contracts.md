@@ -121,18 +121,19 @@ uint256 public totalFeesCollected;
 
 ## `SHFactory.sol`
 
-`SHFactory` is the user-facing entry point for deploying new `SessionHandler` wallets. Calling `deployWallet()` deploys a new `SessionHandler` owned by `msg.sender`, installs the configured `SessionHandlerModule` as both its Validator and Hook, and wires it to the shared protocol infrastructure. ETH sent with the call is forwarded to the new wallet as the initial gas prefund.
+`SHFactory` is the user-facing entry point for deploying new `SessionHandler` wallets. It deploys a single `SessionHandler` implementation in its own constructor, then `deployWallet()` creates each user's wallet as an **EIP-1167 minimal-proxy clone** of that implementation and calls `initialize()` on the clone — which installs the configured `SessionHandlerModule` as both its Validator and Hook and wires it to the shared protocol infrastructure. ETH sent with the call is forwarded to the new wallet as the initial gas prefund. Cloning makes each deployment cost a fraction of deploying the full account bytecode (~403k gas per wallet).
 
-`SHFactory` stores the `EntryPoint`, `SHRegistry`, `IdentityRegistry`, and `ReputationRegistry` addresses as immutables, baking them into every `SessionHandler` it deploys. The `SessionHandlerModule` address is stored as a plain (settable) variable instead, consistent with how `SHRegistry`'s own dependent addresses are owner-updatable without redeployment — `deployWallet()` reverts while it's unset.
+`SHFactory` stores the `EntryPoint`, `SHRegistry`, `IdentityRegistry`, and `ReputationRegistry` addresses as immutables and passes them to each clone's `initialize()`. The `SessionHandlerModule` address is stored as a plain (settable) variable instead, consistent with how `SHRegistry`'s own dependent addresses are owner-updatable without redeployment — `deployWallet()` reverts while it's unset.
 
-Each deployed wallet is assigned a sequential `walletId` (0-indexed, tracked via `totalWallets`), recorded immutably on the `SessionHandler` itself and queryable back from the factory via `wallets(walletId)`.
+Each deployed wallet is assigned a sequential `walletId` (starting at 1, tracked via `totalWallets`), recorded on the `SessionHandler` itself — set once in `initialize()` — and queryable back from the factory via `wallets(walletId)`.
 
 ```solidity
 constructor(
     address _entryPoint,
     address _feeRegistry,        // SHRegistry address
     address _reputationRegistry, // ERC-8004 ReputationRegistry
-    address _identityRegistry    // ERC-8004 IdentityRegistry
+    address _identityRegistry,   // ERC-8004 IdentityRegistry
+    address _module              // SessionHandlerModule installed on every clone
 );
 
 /// Deploys a new SessionHandler owned by msg.sender; forwards msg.value as ETH prefund.
@@ -144,7 +145,7 @@ function pause() external onlyOwner;
 function unpause() external onlyOwner;
 
 address public spendingLimitModule;
-uint256 public totalWallets;               // doubles as the next walletId to assign
+uint256 public totalWallets = 1;           // next walletId to assign (wallet IDs start at 1)
 mapping(uint256 => address) public wallets;
 
 event WalletDeployed(address indexed walletAddress, address indexed owner, uint256 indexed walletId);
@@ -207,7 +208,7 @@ function getUsdValue(address token, uint256 amount) external view returns (uint2
 
 ## `SessionHandler.sol`
 
-The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `AccountERC7579Hooked`, plus `Ownable` and `Pausable`) that carries no session-key logic of its own. All session-key state and USD-value enforcement live in the installed `SessionHandlerModule`, which is registered as **both** a Validator (type 1) and a Hook (type 4) in the constructor. `SessionHandler` only keeps the account-level concerns that aren't session-key specific: ownership, ETH/ERC20 withdrawal, pausing, protocol fee charging, a sequential `walletId`, and the ERC-8004 identity/reputation lookups.
+The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `AccountERC7579Hooked`, plus `OwnableUpgradeable` and `Pausable`) that carries no session-key logic of its own. It is deployed behind an EIP-1167 minimal-proxy clone by `SHFactory`, so its per-wallet configuration is set in `initialize()` (not a constructor), and the installed `SessionHandlerModule` is registered there as **both** a Validator (type 1) and a Hook (type 4). `SessionHandler` only keeps the account-level concerns that aren't session-key specific: ownership, ETH/ERC20 withdrawal, pausing, protocol fee charging, a sequential `walletId`, and the ERC-8004 identity/reputation lookups.
 
 **Deliberate deviation from stock `AccountERC7579Hooked`:** `execute`, `installModule`, and `uninstallModule` are normally `onlyEntryPointOrSelf` — an EOA owner cannot call them directly. This contract reopens that direct-owner path via `onlyEntryPointOrSelfOrOwner` so the owner never has to submit a UserOp for their own admin actions; they just call the account directly, without needing a separate "owner validator" module. `addSessionKey`, `addUnpricedSessionKey`, and `revokeSessionKey` are gated by a plain `onlyOwner` instead — session management never needs EntryPoint routing at all.
 
@@ -216,7 +217,7 @@ The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `A
 | Feature | Detail |
 |---|---|
 | ERC-7579 modular account | `execute(bytes32 mode, bytes executionCalldata)` — the standard single-call shape |
-| Sequential wallet ID | `WALLET_ID` immutable, assigned by `SHFactory` at deployment |
+| Sequential wallet ID | `WALLET_ID` storage var, set once by `SHFactory` in `initialize()` |
 | Session-key logic | Entirely delegated to `SH_MODULE` (installed as both Validator and Hook) |
 | Protocol fee | Charges a flat ETH fee (`REGISTRY.protocolFee()`) to `REGISTRY.treasury()` whenever `execute()` is driven by a session key through the EntryPoint |
 | Owner escape hatches | `execute`, `installModule`, `uninstallModule` callable directly by the owner (`onlyEntryPointOrSelfOrOwner`); session management is plain `onlyOwner` |
@@ -225,7 +226,8 @@ The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `A
 | Session view passthroughs | `getSession`, `isSessionActive`, `getRemainingBudget`, `isSpendingWithinBudget` all forward to `SH_MODULE`, scoped to `address(this)` |
 
 ```solidity
-constructor(
+/// Called once by SHFactory on each freshly cloned wallet (replaces the constructor).
+function initialize(
     address owner,
     address entryPointAddress,
     address reputationRegistry,
@@ -233,7 +235,7 @@ constructor(
     address registry,
     uint256 walletId,
     address spendingLimitModule
-);
+) external;
 
 function execute(bytes32 mode, bytes calldata executionCalldata) public payable override whenNotPaused onlyEntryPointOrSelfOrOwner;
 function installModule(uint256 moduleTypeId, address module, bytes calldata initData) public override onlyEntryPointOrSelfOrOwner;
@@ -296,10 +298,10 @@ struct Session {
 
 **Unpriced sessions (`addUnpricedSessionKey`):** for targets `SHOracle` has no price feed for (e.g. the ERC-8004 Reputation Registry), `addUnpricedSessionKey` registers a session with `pricingExempt = true`, skipping the `SHValueInterpreter`/`SHOracle` call in `preCheck` entirely. This was chosen deliberately over a blanket try/catch around the pricing call — a try/catch would silently treat *any* misconfigured price feed as free-to-spend, even for a real token that should have been priced. Selector allowlisting is never skipped, even for exempt sessions.
 
-**EIP-1153 transient storage bridge:** `validateUserOp` and `preCheck` run as two separate calls within the same `handleOps` transaction, keyed per-account:
+**EIP-1153 transient storage bridge:** `validateUserOp` and `preCheck` run as two separate calls within the same `handleOps` transaction, keyed per-account **and per-execution** — the slot mixes in `callHash` (keccak256 of the `execute()` calldata, which both phases see identically) so two ops for the same account in one bundle land in distinct slots and can't clobber each other (the EntryPoint validates every op before executing any):
 
 ```solidity
-bytes32 slot = keccak256(abi.encode("SessionHandlerModule.pendingSession", account));
+bytes32 slot = keccak256(abi.encode("SessionHandlerModule.pendingSession", account, callHash));
 // tstore / tload the pending session key at that slot
 ```
 
@@ -331,7 +333,7 @@ function getSession(address account, address sessionKey) public view returns (Se
 function isSessionActive(address account, address sessionKey) public view returns (bool);
 function getRemainingBudget(address account, address sessionKey) public view returns (uint256);
 function isSpendingWithinBudget(address account, address sessionKey, address token, uint256 amount) public view returns (bool);
-function pendingSessionKey(address account) external view returns (address);
+function pendingSessionKey(address account, bytes32 callHash) external view returns (address);
 
 event SessionAdded(address indexed account, address indexed sessionKey, address indexed target, uint48 validUntil);
 event SessionRevoked(address indexed account, address indexed sessionKey);
@@ -400,7 +402,7 @@ Orchestrates deployment of all shared protocol infrastructure. Individual `Sessi
 5. Deploy `SHTreasury(initialFee, oracle, agentId, router)` — the treasury's constructor deploys its own `SHRegistry`.
 6. Deploy `SHValueInterpreter(treasury.REGISTRY())` and wire it in via `treasury.setCallValueInterpreter(interpreter)`.
 7. Deploy `SessionHandlerModule(treasury.REGISTRY())`.
-8. Deploy `SHFactory(entryPoint, treasury.REGISTRY(), reputationRegistry, identityRegistry)` and call `factory.setSpendingLimitModule(address(module))`.
+8. Deploy `SHFactory(entryPoint, treasury.REGISTRY(), reputationRegistry, identityRegistry, address(module))` — the module is set via the constructor, and the factory deploys the `SessionHandler` implementation it clones from internally.
 
 ```solidity
 function run() external returns (SHFactory factory, SHTreasury treasury, HelperConfig.NetworkConfig memory config, SHOracle oracle);

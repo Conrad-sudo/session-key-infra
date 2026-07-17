@@ -5,6 +5,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import ToolRetryMiddleware
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from db import DB_PATH
 import asyncio
@@ -44,294 +45,6 @@ SYSTEM_PROMPT = """You are an smart wallet agent that manages ERC20 tokens on be
   ETH either — say plainly that their wallet is on a network whose native asset is BNB, not ETH,
   and there is no separate ETH balance to check for this wallet on this network.
 
-## Tools
-
-- **get_supported_tokens(chat_id)** — Returns the list of token tickers supported on the user's current network (e.g. ["usdc", "dai"]).
-  Call this to validate a token before any on-chain action. Always pass `chat_id` so the correct network table is queried.
-
-- **get_native_asset(chat_id)** — Returns the display name of the chain's native gas asset (e.g.
-  "ETH", "BNB", "CELO"). Call this before stating a native-asset amount in your response, so you
-  say "BNB" instead of "ETH" when the wallet is on BSC.
-
-- **get_session_keys(target)** — Retrieves the session_key_ciphertext needed to authorize any on-chain
-  transaction. Call this before any write operation. `target` is a token ticker (e.g. "usdc") for
-  ERC20 operations, `"uniswapv2_router"` for Uniswap swaps, `"eth"` for native ETH transfers, or
-  `"reputation_registry"` for posting ERC-8004 reputation feedback.
-
-- **get_contact(name)** — Looks up the Ethereum address of a saved contact by name. Call this when
-  you need to resolve a name to an address. If the contact is not found, ask the user for their
-  address and call save_contact before proceeding.
-
-- **save_contact(name, address)** — Associates a human-readable name with an Ethereum address.
-  Call this when the user provides a new name and address they want saved. Names are case-insensitive.
-
-- **transfer_erc20(session_key_ciphertext, token, recipient, amount)** — Sends ERC20 tokens to a saved
-  contact. `amount` is in whole token units (e.g. 100 for 100 USDC), not raw base units.
-
-- **approve_erc20(session_key_ciphertext, token, spender, amount)** — Approves a saved contact to spend
-  ERC20 tokens from the wallet up to `amount`. Use this when the user wants to grant a spender an
-  allowance. `amount` is in whole token units.
-
-- **transferFrom_erc20(session_key_ciphertext, token, sender, recipient, amount)** — Transfers tokens
-  from a sender's address to a recipient using a pre-approved allowance. Use this when the wallet
-  has been approved to move tokens on behalf of `sender`. Both sender and recipient must be saved
-  contacts. `amount` is in whole token units. **Exception:** if the user refers to themselves or
-  the wallet as the recipient (e.g. "to me", "to my wallet"),pass "me" as the `recipient` argument.
-
-- **get_eth_balance(chat_id)** — Returns `{"balance": float, "asset": str}` — the smart wallet's
-  native-asset balance in whole units, and the correct name for that asset on the current network
-  (e.g. `{"balance": 10.0, "asset": "BNB"}`). Call this when the user asks how much of their native
-  asset the wallet holds — "eth" in the tool name is generic, this works on every network, not just
-  Ethereum. Always report the `asset` field's value, never assume "ETH". See the mismatch rule above
-  if the user asked about a different ticker than `asset`.
-
-- **get_erc20_balance(chat_id, token)** — Returns the smart wallet's own token balance in whole units.
-  Call this when the user asks about their own wallet's balance (e.g. "my balance", "how much USDC do I have").
-  Do NOT use this for a contact's balance — use get_contact_erc20_balance instead.
-
-- **get_contact_erc20_balance(chat_id, contact_name, token)** — Returns a saved contact's token balance in whole units.
-  Call this when the user asks about a contact's balance (e.g. "how much USDC does Sandy have?", "what is Alice's LINK balance?").
-  The contact must already be saved; if not, ask the user for their address and call save_contact first.
-
-- **send_eth(chat_id, session_key_ciphertext, recipient, amount_eth)** — Sends the chain's native
-  asset (ETH, BNB, etc.) directly to a saved contact. Use this when the user wants to send their
-  native asset to someone — do NOT wrap it first. Works identically on every network; do NOT refuse
-  because the network isn't Ethereum. The recipient must be a saved contact; if not, call
-  save_contact first. `amount_eth` is in whole units (e.g. 1.5). Retrieve the session key by
-  calling get_session_keys("eth").
-
-- **wrap_eth(chat_id, session_key_ciphertext, amount_eth)** — Wraps native ETH/BNB into the chain's
-  wrapped-native token by calling deposit() on that contract. This is a direct 1:1 wrap — not a
-  Uniswap/Pancake swap. Call this when the user wants to convert ETH/BNB to its wrapped form.
-  `amount_eth` is in whole units (e.g. 1.5). Retrieve the session key by calling
-  get_session_keys() with the chain's wrapped-native ticker before calling this tool.
-
-- **swap_ETH_for_exact_tokens(chat_id, session_key_ciphertext, token_out, amount_out, slippage_bps)** — Swaps
-  the chain's native asset (ETH, BNB, etc.) for an exact amount of an ERC20 token via the router
-  using `swapETHForExactTokens`. The user specifies how many tokens to receive; the router charges
-  however much of the native asset is needed and refunds any excess. `token_out` is the ticker of
-  the token to receive (e.g. "usdc"). `amount_out` is the exact token amount in whole units (e.g.
-  100 for 100 USDC). `slippage_bps` is the maximum acceptable slippage in basis points (e.g. 50 =
-  0.5%); defaults to 50. If the user does not specify slippage, use the default. **Always** retrieve
-  the session key by calling get_session_keys("uniswapv2_router") — the session is scoped to the
-  router, not the output token.
-
-- **swap_exact_tokens_for_ETH(chat_id, session_key_ciphertext, token_in, amount_in, slippage_bps)** — Sells
-  an exact amount of an ERC20 token and receives the chain's native asset in return via the router
-  using `swapExactTokensForETH`. `token_in` is the ticker of the token being sold (e.g. "usdc"),
-  `amount_in` is in whole token units, and `slippage_bps` is the maximum acceptable slippage in
-  basis points (e.g. 50 = 0.5%); defaults to 50. If the user does not specify slippage, use the
-  default. **Always** retrieve the session key by calling get_session_keys("uniswapv2_router").
-
-- **swap_exact_ETH_for_tokens(chat_id, session_key_ciphertext, token_out, eth_amount_in, slippage_bps)** — Swaps
-  an exact amount of the chain's native asset for an ERC20 token via the router using
-  `swapExactETHForTokens`. The user specifies how much of their native asset to spend; they receive
-  however many tokens the pool gives back. `token_out` is the ticker of the token to receive (e.g.
-  "usdc"). `eth_amount_in` is in whole native-asset units (e.g. 1.5). `slippage_bps` is the maximum
-  acceptable slippage in basis points (e.g. 50 = 0.5%); defaults to 50. If the user does not specify
-  slippage, use the default. **Always** retrieve the session key by calling
-  get_session_keys("uniswapv2_router").
-
-- **swap_tokens_for_exact_ETH(chat_id, session_key_ciphertext, token_in, amount_out_eth, slippage_bps)** — Swaps
-  however much of an ERC20 token is needed to receive an exact amount of the chain's native asset
-  via the router using `swapTokensForExactETH`. The user specifies how much of their native asset
-  they want to receive; the router spends as much `token_in` as required (up to a slippage-buffered
-  maximum). `token_in` is the ticker of the token to sell (e.g. "usdc"). `amount_out_eth` is the
-  exact native-asset amount to receive in whole units (e.g. 1.5). `slippage_bps` defaults to 50. If
-  the user does not specify slippage, use the default. **Always** retrieve the session key by
-  calling get_session_keys("uniswapv2_router").
-
-- **get_erc20_allowance(token, spender)** — Returns how many tokens the wallet has approved a saved
-  contact to spend. Call this when the user wants to check an existing allowance.
-
-- **get_all_sessions()** — Returns all session keys for the user as a list of dicts, each with
-  `target` (token ticker), `spending_limit` (in whole units, e.g. 1000.0), and `end_time` (ISO 8601
-  date). Call this when the user asks to see their sessions or wants an overview of their session keys.
-
-- **get_all_contacts()** — Returns the full list of saved contacts (name + address) for the user.
-  Call this when the user asks to see their contacts.
-
-- **delete_contact(name)** — Removes a saved contact by name. Call this when the user wants to
-  delete a contact. Names are case-insensitive.
-
-- **preflight_check(chat_id, token, amount, is_uniswap)** — Runs session validity, budget check,
-  and USD value conversion in a single call. Returns a dict with `session_active` (bool),
-  `within_budget` (bool), and `usd_value` (float). Call this instead of check_session_validity,
-  check_spending_within_budget, and get_usd_value separately before any on-chain action.
-  Set `is_uniswap=True` for Uniswap swaps so the router session key is used. If `session_active`
-  is False, abort and notify the user. If `within_budget` is False, abort and notify the user.
-  Supports `token="eth"` for native ETH — in that case the budget check is skipped (ETH is not
-  an ERC20) and `usd_value` reflects the ETH amount at the current ETH price.
-
-- **check_session_validity(token)** — Returns True if the session key for a token is still active.
-  Use only when preflight_check cannot be applied.
-
-- **check_remaining_budget(token)** — Returns the remaining spending budget for a session key in
-  whole USD units. Call this when the user wants to know how much budget is left on their session.
-
-- **check_spending_within_budget(token, amount)** — Returns True if the proposed amount is within
-  the session key's remaining budget. Use only when preflight_check cannot be applied.
-
-- **get_price(token)** — Returns the current USD price of a token as a float (e.g. 2500.0 for ETH
-  at $2500). Supports any registered token ticker and "eth" for native ETH. Call this only when the
-  user asks what a token is worth in USD. **Never use this to estimate swap output quantities** —
-  use get_quote_in or get_quote_out instead, which query actual pool reserves.
-
-- **get_usd_value(token, amount)** — Converts a token amount to its current USD equivalent as a
-  float (e.g. 99.5 for 100 USDC at $0.995). Use only when preflight_check cannot be applied or
-  when the user explicitly asks how much a given token amount is worth in USD.
-
-- **get_quote_in(chat_id, token_in, token_out, amount_out)** — Returns how much of `token_in` is
-  required to receive an exact amount of `token_out`, queried from the Uniswap V2 router via
-  `getAmountsIn`. Routes through the chain's wrapped-native token automatically when neither
-  token is the wrapped-native token. **Always call this
-  when the user asks how much they need to spend to receive a specific token amount** (e.g. "How
-  much USDC do I need to buy exactly 100 DAI?"). Returns a dict — **when presenting the result to
-  the user, show only `amount_in` and `amount_out`; never expose `path`, `amount_in_base`, or
-  `amount_out_base`.** Never estimate this with get_price.
-
-- **get_quote_out(chat_id, token_in, token_out, amount_in)** — Returns how much of `token_out`
-  will be received when spending an exact amount of `token_in`, queried from the Uniswap V2 router
-  via `getAmountsOut`. Routes through the chain's wrapped-native token automatically when neither
-  token is the wrapped-native token. **Always call
-  this when the user asks how much they will receive for a given spend** (e.g. "How much LINK will
-  I get for 1 ETH?"). Returns a dict — **when presenting the result to the user, show only
-  `amount_in` and `amount_out`; never expose `path`, `amount_in_base`, or `amount_out_base`.**
-  Never estimate this with get_price.
-
-- **is_derived_input_sufficient(chat_id, token_in, token_out, amount_out, slippage_bps)** — Checks whether
-  the wallet holds enough of `token_in` to cover an exact-output swap (including the slippage buffer).
-  Uses `getAmountsIn` internally to find the required input amount, then compares it against the live
-  on-chain balance. Pass `"eth"` as `token_in` for ETH-funded swaps and `"eth"` as `token_out` for
-  swaps that produce ETH. Returns a dict with `is_sufficient` (bool) and `derived_input` (float, the
-  required input amount including slippage in whole units). Call this in exact-output swap workflows
-  after slippage is confirmed and **before** asking for user confirmation — if `is_sufficient` is
-  `False`, abort and notify the user. Use `derived_input` to show the user how much `token_in` is needed.
-
-- **is_exact_input_sufficient(chat_id, token_in, amount_in)** — Checks whether the wallet holds
-  enough of `token_in` to spend an exact input amount. Compares the live on-chain balance directly
-  against `amount_in` with no slippage buffer — appropriate for exact-input swaps where the spend
-  amount is fixed. Pass `"eth"` as `token_in` for ETH-funded swaps. Returns `True` if funds are
-  sufficient, `False` otherwise. Call this in exact-input swap workflows after preflight_check and
-  **before** asking for user confirmation — if it returns `False`, abort and notify the user.
-
-- **is_liquidity_sufficient(chat_id, token_a, amount_a, token_b)** — Checks whether the wallet
-  holds enough of both tokens to add liquidity to a Uniswap V2 pool. Derives the required `token_b`
-  amount from live pool reserves internally via `router.quote()` — no need to pre-compute it. Pass
-  `"eth"` as `token_b` for token/ETH pools (add_liquidity_eth); the function maps it to the
-  chain's wrapped-native token for the reserve lookup and checks the ETH/BNB balance accordingly. Returns a dict with `is_sufficient`
-  (bool) and `amount_b` (float, the proportional token_b amount in whole units). Call this after
-  preflight_check and **before** asking for user confirmation — if `is_sufficient` is `False`,
-  abort and notify the user of which token is short. Use `amount_b` to show the user how much
-  token_b will be required.
-
-- **is_liquidity_removal_sufficient(chat_id, token_a, token_b, lp_amount)** — Checks whether the
-  wallet holds at least `lp_amount` LP tokens for the given `token_a`/`token_b` pair. Returns `True`
-  if the balance is sufficient, `False` otherwise. Call this after the user specifies `lp_amount` and
-  **before** asking for confirmation — if it returns `False`, abort and notify the user.
-
-- **swap_exact_tokens_for_tokens(chat_id, session_key_ciphertext, token_in, token_out, amount_in, slippage_bps)** — Swaps
-  an exact amount of one ERC20 token for another via the Uniswap V2 router using `swapExactTokensForTokens`.
-  `token_in` is the ticker of the token being sold, `token_out` is the ticker of the token being bought,
-  and `amount_in` is in whole token units. `slippage_bps` is the maximum acceptable slippage in basis points
-  (e.g. 50 = 0.5%); defaults to 50. If the user does not specify slippage, use the default.
-  **Always** retrieve the session key by calling get_session_keys("uniswapv2_router").
-
-- **swap_tokens_for_exact_tokens(chat_id, session_key_ciphertext, token_in, token_out, amount_out, slippage_bps)** — Swaps
-  however much of `token_in` is needed to acquire an exact amount of `token_out` via the Uniswap V2 router
-  using `swapTokensForExactTokens`. Use this when the user wants to receive a specific amount of a token
-  (e.g. "I want exactly 100 DAI"). `amount_out` is the exact amount to receive in whole token units.
-  `slippage_bps` is the maximum acceptable slippage in basis points (e.g. 50 = 0.5%); defaults to 50.
-  If the user does not specify slippage, use the default. **Always** retrieve the session key by calling
-  get_session_keys("uniswapv2_router").
-
-- **get_liquidity_token_balance(chat_id, token_a, token_b)** — Returns the smart wallet's balance of
-  Uniswap V2 LP tokens for the pair formed by `token_a` and `token_b`, in whole units. `token_b`
-  defaults to the chain's wrapped-native token (omit it rather than hardcoding a ticker). Call
-  this when the user asks how much liquidity they have in a pool or wants to know their LP token
-  balance before removing liquidity.
-
-- **get_pool_quote(chat_id, token_a, token_b, amount_a)** — Returns the proportional `token_b`
-  amount required to pair with a given `amount_a` deposit in a Uniswap V2 pool, derived from live
-  reserves via `router.quote()`. Use this when the user wants to preview deposit amounts before
-  adding liquidity (e.g. "How much ETH do I need to pair with 2500 DAI?"). For native-paired
-  pools, pass `token_b` as the chain's wrapped-native ticker. Returns a dict with `amount_a`, `amount_b_desired`, and internal base-unit
-  fields used by the add_liquidity tools. **When presenting to the user, only show `amount_a` and
-  `amount_b_desired` — never expose token addresses or base-unit fields.**
-
-- **get_lp_amounts(chat_id, token_a, token_b, lp_amount)** — Returns the expected token amounts
-  redeemable by burning a given amount of LP tokens in a Uniswap V2 pool, computed from live
-  reserves using the proportional share formula (liquidity × reserve / totalSupply). Use this when
-  the user wants to preview returns before removing liquidity (e.g. "How much DAI and ETH will I
-  get for 0.5 LP tokens?"). For native-paired pools, pass `token_b` as the chain's wrapped-native
-  ticker. Returns a dict with `expected_a`,
-  `expected_b`, and internal base-unit fields used by the remove_liquidity tools. **When presenting
-  to the user, only show `expected_a` and `expected_b` — never expose token addresses, base-unit
-  fields, or `liquidity`.**
-
-- **add_liquidity(chat_id, session_key_ciphertext, token_a, amount_a, token_b, slippage_bps)** — Adds
-  liquidity to a Uniswap V2 pool via `addLiquidity`. The user specifies `token_a` and `amount_a`;
-  the proportional `token_b` amount is derived automatically from live pool reserves using
-  `router.quote()`. `token_b` defaults to the chain's wrapped-native token (omit it rather than
-  hardcoding a ticker) — only override it when depositing into a non-wrapped-native pair. `amount_a` is in whole token units (e.g. 2500 for 2500 DAI). `slippage_bps`
-  is the maximum acceptable slippage in basis points; defaults to 50 (0.5%). Both tokens must
-  have their ERC20 allowance set for the router before this call. **Always** retrieve the session
-  key by calling get_session_keys("uniswapv2_router").
-
-- **add_liquidity_eth(chat_id, session_key_ciphertext, token, amount_token, slippage_bps)** — Adds
-  liquidity to a Uniswap V2 token/ETH pool via `addLiquidityETH`. The user specifies `token` and
-  `amount_token`; the proportional ETH amount is derived automatically from live pool reserves
-  using `router.quote()` and forwarded as `msg.value` — no prior wrapping is needed.
-  Use this instead of `add_liquidity` when the user wants to deposit raw ETH/BNB (not the wrapped form) alongside
-  an ERC20 token. `amount_token` is in whole token units (e.g. 2500 for 2500 DAI). `slippage_bps`
-  defaults to 50 (0.5%). The token must have its ERC20 allowance set for the router before this
-  call. **Always** retrieve the session key by calling get_session_keys("uniswapv2_router").
-
-- **remove_liquidity(chat_id, session_key_ciphertext, token_a, lp_amount, token_b, slippage_bps)** — Removes
-  liquidity from a Uniswap V2 pool via `removeLiquidity`. The user specifies `lp_amount` (in whole LP
-  token units, e.g. 0.5); the expected return amounts for both tokens are computed from live reserves
-  using the proportional share formula and passed as the minimums (with slippage applied downward).
-  `token_b` defaults to the chain's wrapped-native token (omit it rather than hardcoding a ticker). `slippage_bps` defaults to 50 (0.5%). The LP token allowance for
-  the router must already be set. **Note:** this operation credits the session budget back rather than
-  charging it — skip the budget check. Only confirm session validity before calling. **Always** retrieve
-  the session key by calling get_session_keys("uniswapv2_router").
-
-- **remove_liquidity_eth(chat_id, session_key_ciphertext, token, lp_amount, slippage_bps)** — Removes
-  liquidity from a Uniswap V2 token/ETH pool via `removeLiquidityETH`. The user specifies the ERC20
-  `token` and `lp_amount` (in whole LP token units); expected return amounts are computed from live
-  reserves. The router unwraps the wrapped-native share to raw ETH/BNB before sending it back to the wallet. Use
-  this instead of `remove_liquidity` when the pool is a token/ETH pair and the user wants raw ETH
-  back. `slippage_bps` defaults to 50 (0.5%). **Note:** credits the session budget back — skip the
-  budget check, only confirm session validity. **Always** retrieve the session key by calling
-  get_session_keys("uniswapv2_router").
-
-- **get_recurring_transfers()** — Returns all scheduled recurring transfers for the user as a list
-  of dicts with 'id', 'token', 'recipient', 'amount', and 'interval_hrs'. Call this when the user
-  asks to see their recurring transfers.
-
-- **schedule_recurring_transfer(token, recipient, amount, interval_hrs)** — Schedules a repeating
-  ERC20 transfer. `amount` is in whole token units. `interval_hrs` is how often to repeat in hours
-  (e.g. 24 for daily, 168 for weekly). Only available when the bot is running.
-
-- **cancel_recurring_transfer(transfer_id)** — Cancels a scheduled recurring transfer by its ID.
-  The ID is shown in get_recurring_transfers output. Only available when the bot is running.
-
-- **get_agent_identity(chat_id)** — Looks up this agent's ERC-8004 on-chain identity. Returns the
-  agent's `token_id` and `card_uri` (a URL or IPFS CID pointing to the agent card JSON). Call this
-  when the user asks who or what this agent is, wants to verify on-chain registration, or asks to
-  see the agent card. Returns `registered: False` if the agent is not yet registered.
-
-- **get_agent_reputation(chat_id)** — Returns this agent's ERC-8004 reputation summary:
-  `average_score` (float, 0–100) and `feedback_count` (total number of reviews). Call this when
-  the user asks how trustworthy or well-rated this agent is, or asks for its reputation score.
-  An `average_score` of 0 with `feedback_count` of 0 means no reviews have been posted yet.
-
-- **post_reputation_feedback(chat_id, session_key_ciphertext, score, tags)** — Posts on-chain
-  feedback for this agent to the ERC-8004 Reputation Registry. `score` must be 0–100. `tags` is a
-  comma-separated string of short labels (e.g. "fast,accurate,trustworthy"). Always confirm the
-  score and tags with the user before calling this — it is an on-chain write and cannot be undone.
-  **Always** retrieve the session key by calling get_session_keys("reputation_registry") before
-  calling this tool. Call this when the user wants to rate or review the agent.
 
 ## Workflows
 
@@ -527,7 +240,7 @@ llm = ChatAnthropic(
     timeout=30,
     max_tokens=4096,
     max_retries=2,
-    verbose=True,
+   
 )
 _checkpointer_cm= None
 _checkpointer= None
@@ -560,7 +273,10 @@ def init_agent(job_queue=None):
         # tool-call args, not runtime failures — and crashes the process mid-tool-call,
         # leaving an orphaned tool_use with no tool_result in the sqlite checkpoint. That
         # corrupts the thread permanently: Anthropic rejects every future message in it.
-        middleware=[ToolRetryMiddleware(max_retries=0, on_failure="continue")],
+        middleware=[ToolRetryMiddleware(max_retries=0, on_failure="continue"),
+                    AnthropicPromptCachingMiddleware(ttl="5m")
+                    
+                    ],
     )
 
 

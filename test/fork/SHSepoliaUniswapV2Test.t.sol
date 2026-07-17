@@ -797,8 +797,8 @@ contract SHSepoliaUniswapV2Test is Test {
      *      sessionHandler by swapping 0.1 WETH->USDC and approving the router to spend USDC,
      *      both via direct execute() calls (no UserOp) — demonstrating the owner escape hatch,
      *      though sessionHandler already holds plenty of USDC from setUp regardless. Budget is
-     *      charged against the USD value of the ETH output (amountOut), as extracted by
-     *      SessionHandlerModule. Assertion uses a small tolerance because Uniswap may return
+     *      charged against the USD value of the USDC input at the amountInMax ceiling (path[0]),
+     *      not the ETH output. Assertion uses a small tolerance because Uniswap may return
      *      slightly more ETH than requested before unwrapping.
      */
     function testSwapTokensForExactETHWithSession() public routerSessionAdded {
@@ -837,8 +837,10 @@ contract SHSepoliaUniswapV2Test is Test {
         path[1] = config.weth;
 
         uint256 amountOut = 0.05 ether;
-        uint256 spentAMount = oracle.getUsdValue(address(0), amountOut);
         uint256 amountInMax = router.getAmountsIn(amountOut, path)[0];
+        // Exact-output swap: budget is charged against the input token (path[0] = USDC) at the
+        // amountInMax ceiling, not the ETH received. See SHValueInterpreter exact-output pricing.
+        uint256 spentAMount = oracle.getUsdValue(config.usdc, amountInMax);
         uint256 deadline = block.timestamp + 2 hours;
         address to = address(sessionHandler);
 
