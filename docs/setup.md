@@ -112,7 +112,6 @@ make bot
 What is my wallet address?
 What is my USDC balance?
 Send 10 LINK to Sandy
-Show me my recurring transfers
 ```
 
 **Optional — interactive CLI (no Telegram required):**

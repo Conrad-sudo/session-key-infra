@@ -1,4 +1,3 @@
-import asyncio
 import time
 from decimal import Decimal
 
@@ -10,9 +9,6 @@ from db import (
     get_all_contacts as _get_all_contacts,
     delete_contact as _delete_contact,
     get_all_sessions as _get_all_sessions,
-    get_recurring_transfers as _get_recurring_transfers,
-    save_recurring_transfer as _save_recurring_transfer,
-    delete_recurring_transfer as _delete_recurring_transfer,
     delete_session,
    
 )
@@ -81,7 +77,6 @@ from web3.exceptions import ContractLogicError
 BPS_DENOMINATOR = 10_000
 DEFAULT_SLIPPAGE_BPS = 50  # 0.5%
 SWAP_DEADLINE_SECS = 600  # 10 minutes
-SECONDS_PER_HOUR = 3_600
 
 
 def _submit_router_call(chat_id, session_key_ciphertext, router, fn_name, args, value=0):
@@ -260,25 +255,6 @@ def delete_contact(chat_id: int, name: str):
     """
     print("Running delete_contact")
     return _delete_contact(chat_id, name)
-
-
-@tool
-def get_recurring_transfers(chat_id: int) -> list[dict]:
-    """
-    Returns all scheduled recurring transfers for a user.
-
-    Use this tool when the user asks to see their recurring transfers or wants to
-    review what scheduled payments are active.
-
-    Args:
-        chat_id: The Telegram chat ID of the user making the request.
-
-    Returns:
-        A list of dicts with 'id', 'token', 'recipient', 'amount', and 'interval_hrs' keys.
-        Returns an empty list if no recurring transfers are scheduled.
-    """
-    print("Running get_recurring_transfers")
-    return _get_recurring_transfers(chat_id)
 
 
 """
@@ -2060,163 +2036,6 @@ def remove_liquidity_eth(
 
 """
  /*//////////////////////////////////////////////////////////////
-                        JOB AND SCHEDULING TOOLS
-//////////////////////////////////////////////////////////////*/
-"""
-
-
-async def recurring_transfer_job(context) -> None:
-    """
-    PTB job callback that executes a single iteration of a scheduled ERC20 transfer.
-
-    Reads transfer details from context.job.data, checks session validity, and sends
-    the tokens. If the session has expired the job removes itself and notifies the user.
-    """
-    job_data = context.job.data
-    chat_id = job_data["chat_id"]
-    transfer_id = job_data["transfer_id"]
-    token = job_data["token"]
-    recipient = job_data["recipient"]
-    amount = job_data["amount"]
-
-    def _execute():
-        session_key, session_key_ciphertext = get_session_keys.func(chat_id, token)
-        session_handler = load_session_handler(chat_id)
-        if not session_handler.functions.isSessionActive(session_key).call():
-            return None, None, "expired"
-        erc20 = load_ierc20(chat_id=chat_id, token=token)
-        recipient_addr = _get_contact(chat_id, recipient)
-        decimals = erc20.functions.decimals().call()
-        value = _to_base_units(amount, decimals)
-        calldata = load_calldata(
-            instance=erc20, fn_name="transfer", args=[recipient_addr, value]
-        )
-        tx_hash, receipt = send_user_op_as_session(
-            chat_id=chat_id,
-            key_ciphertext=session_key_ciphertext,
-            target=erc20.address,
-            value=int(0),
-            data=calldata,
-        )
-        return tx_hash, receipt, "ok"
-
-    try:
-        tx_hash, receipt, status = await asyncio.to_thread(_execute)
-    except Exception as e:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"⚠️ Recurring transfer error: {e}",
-        )
-        return
-
-    if status == "expired":
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ Recurring transfer of {amount} {token.upper()} to {recipient} "
-                f"was skipped — the {token.upper()} session key has expired. "
-                f"Please renew your session to resume scheduled transfers."
-            ),
-        )
-        context.job.schedule_removal()
-        _delete_recurring_transfer(transfer_id)
-        return
-
-    if receipt["status"] == 1:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"✅ Recurring transfer of {amount} {token.upper()} to {recipient} sent.\n"
-                f"Tx: `{tx_hash.hex()}`"
-            ),
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"❌ Recurring transfer of {amount} {token.upper()} to {recipient} failed.\n"
-                f"Tx: `{tx_hash.hex()}`"
-            ),
-        )
-
-
-def _make_schedule_tool(job_queue):
-    @tool
-    def schedule_recurring_transfer(
-        chat_id: int, token: str, recipient: str, amount: float, interval_hrs: int
-    ) -> str:
-        """
-        Schedules a recurring ERC20 transfer that repeats at a fixed interval.
-
-        Use this tool when the user confirms they want a transfer to repeat automatically.
-        The recipient must already be a saved contact. The job will fire every `interval_hrs`
-        hours, starting after the first interval has elapsed.
-
-        Args:
-            chat_id: The Telegram chat ID of the user making the request.
-            token: The token ticker symbol to transfer (e.g. "usdc").
-            recipient: The name of the saved contact to send tokens to (e.g. "Sandy").
-            amount: The amount of tokens to send each time, in whole units (e.g. 100 for 100 USDC).
-            interval_hrs: How often to repeat the transfer, in hours (e.g. 24 for daily).
-
-        Returns:
-            A confirmation string including the assigned transfer ID.
-        """
-        print("Running schedule_recurring_transfer")
-        transfer_id = _save_recurring_transfer(
-            chat_id, token, recipient, amount, interval_hrs
-        )
-        interval_secs = interval_hrs * SECONDS_PER_HOUR
-        job_queue.run_repeating(
-            recurring_transfer_job,
-            interval=interval_secs,
-            first=interval_secs,
-            chat_id=chat_id,
-            name=f"recurring_{transfer_id}",
-            data={
-                "chat_id": chat_id,
-                "transfer_id": transfer_id,
-                "token": token,
-                "recipient": recipient,
-                "amount": amount,
-            },
-        )
-        return (
-            f"Recurring transfer #{transfer_id} scheduled: "
-            f"{amount} {token.upper()} to {recipient} every {interval_hrs}h."
-        )
-
-    return schedule_recurring_transfer
-
-
-def _make_cancel_tool(job_queue):
-    @tool
-    def cancel_recurring_transfer(chat_id: int, transfer_id: int) -> str:
-        """
-        Cancels a scheduled recurring transfer by its ID.
-
-        Use this tool when the user wants to stop a recurring transfer. Removes the
-        scheduled job and deletes the record from the database.
-
-        Args:
-            chat_id: The Telegram chat ID of the user making the request.
-            transfer_id: The numeric ID of the recurring transfer to cancel (visible in
-                         get_recurring_transfers output).
-
-        Returns:
-            A confirmation string.
-        """
-        print("Running cancel_recurring_transfer")
-        for job in job_queue.get_jobs_by_name(f"recurring_{transfer_id}"):
-            job.schedule_removal()
-        _delete_recurring_transfer(transfer_id, chat_id)
-        return f"Recurring transfer #{transfer_id} cancelled."
-
-    return cancel_recurring_transfer
-
-
-"""
- /*//////////////////////////////////////////////////////////////
                        ERC-8004 TOOLS
 //////////////////////////////////////////////////////////////*/
 """
@@ -2321,7 +2140,7 @@ def post_reputation_feedback(
     return {"tx_hash": tx_hash.hex(), "status": receipt["status"]}
 
 
-def get_tools(job_queue=None):
+def get_tools():
     tools_list = [
         # Database tools
         get_supported_tokens,
@@ -2330,7 +2149,6 @@ def get_tools(job_queue=None):
         get_contact,
         get_all_contacts,
         delete_contact,
-        get_recurring_transfers,
         # Blockchain tools
         get_eth_balance,
         get_native_asset,
@@ -2374,17 +2192,6 @@ def get_tools(job_queue=None):
         post_reputation_feedback,
     ]
 
-
-
-
-    
-    if job_queue is not None:
-        tools_list.extend(
-            [
-                _make_schedule_tool(job_queue),
-                _make_cancel_tool(job_queue),
-            ]
-        )
     for t in tools_list:
         t.handle_tool_error = True
     return tools_list

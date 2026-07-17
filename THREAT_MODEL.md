@@ -10,7 +10,7 @@
 | AppRole credentials (`VAULT_ROLE_ID` / `VAULT_SECRET_ID`) | Authenticate the Python agent to Vault; required to call Transit encrypt/decrypt |
 | Owner private key | Full control over the contract |
 | Bundler private key | Submits UserOps to the EntryPoint |
-| `wallet.db` | Stores session metadata, contacts, recurring transfer schedules, and `key_ciphertext` blobs |
+| `wallet.db` | Stores session metadata, contacts, and `key_ciphertext` blobs |
 
 ---
 
@@ -40,8 +40,13 @@
 
 ### 3.2 Uniswap/PancakeSwap Spending Limit Enforcement
 **Status: Mitigated.**  
-`SHValueInterpreter.computeUsdValue()` (called from `SessionHandlerModule.preCheck`, the ERC-7579 Hook entrypoint) decodes calldata via inline assembly for all six Uniswap V2-shaped swap functions (`swapExactTokensForTokens`, `swapTokensForExactTokens`, `swapExactTokensForETH`, `swapTokensForExactETH`, `swapExactETHForTokens`, `swapETHForExactTokens`) plus `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, and `removeLiquidityETH`. This is DEX-agnostic — the same code path applies identically to Uniswap V2 on mainnet and PancakeSwap V2 on BSC, since both expose the same router ABI. The extracted token amounts are priced via `SHOracle.getUsdValue()` and charged against `spentAmount` before the inner call is allowed to proceed.  
-**Residual risk:** `swapETHForExactTokens` charges the full forwarded `msg.value` against the budget, not the actual ETH/BNB consumed — the router refunds unused native asset but the budget is decremented by the full amount. This is conservative (over-charges the session) rather than exploitable. See §3.8.
+`SHValueInterpreter.computeUsdValue()` (called from `SessionHandlerModule.preCheck`, the ERC-7579 Hook entrypoint) decodes calldata via inline assembly for all six Uniswap V2-shaped swap functions (`swapExactTokensForTokens`, `swapTokensForExactTokens`, `swapExactTokensForETH`, `swapTokensForExactETH`, `swapExactETHForTokens`, `swapETHForExactTokens`) plus `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, and `removeLiquidityETH`. This is DEX-agnostic — the same code path applies identically to Uniswap V2 on mainnet and PancakeSwap V2 on BSC, since both expose the same router ABI. The extracted token amounts are priced via `SHOracle.getUsdValue()` and charged against `spentAmount` before the inner call is allowed to proceed.
+
+**Debit is priced on the token that leaves the wallet, not the token received.** For exact-input swaps this is `amountIn` of `path[0]`; for exact-output swaps (`swapTokensForExactTokens`, `swapTokensForExactETH`) it is `amountInMax` of `path[0]` — the ceiling on what the router can pull. Pricing the *output* side instead (a prior bug) let a compromised session key route an exact-output swap through an attacker-controlled path/pool where a large input produced a tiny output, so the budget barely moved while the wallet drained; charging the input ceiling closes that. If `path[0]` has no registered price feed the swap reverts rather than executing unpriced.
+
+**Router proceeds must return to the wallet.** `SessionHandlerModule._validateSession` requires the `to` recipient argument of every swap and liquidity call to equal the account itself (via `_routerRecipientSlot`, a pure-calldata check keyed off the selector that runs during validation). Without it, a session key could send swap output — or `removeLiquidity`/`removeLiquidityETH` withdrawals — to a third party. This matters most for the liquidity-removal functions, which *credit* the budget back on the assumption the assets return to the wallet: a foreign recipient combined with that credit would let an attacker loop `addLiquidity` (debit) → `removeLiquidity` to their own address (credit + asset exfiltration) for a near-budget-neutral, unbounded drain. Requiring `to == account` closes both the plain exfiltration and the credit loop; a negative test (`testRemoveLiquidityToForeignRecipientReverts`) locks it in.
+
+**Residual risk:** Exact-output swaps are priced at the `amountInMax` / `msg.value` ceiling rather than the amount the router actually consumes (it refunds the unused remainder), so the budget is over-charged — conservative, not exploitable (see §3.8). A session that legitimately wants proceeds sent elsewhere must do it in two budgeted steps: swap or withdraw to the wallet, then transfer.
 
 ---
 
@@ -67,7 +72,9 @@
 
 ### 3.6 State Mutation in `validateUserOp`
 **Threat:** `SessionHandlerModule._validateSession` writes to an EIP-1153 transient storage slot inside `validateUserOp`. The EntryPoint calls `validateUserOp` during simulation — if simulation triggers state writes, the actual execution may behave differently than simulated.  
-**Status: Mitigated.** The transient slot (`keccak256(abi.encode("SessionHandlerModule.pendingSession", account))`) is scoped per-account and zeroed automatically at transaction end. `SessionHandlerModule` is installed as both Validator and Hook on the same contract instance specifically so this transient-storage bridge works — EIP-1153 storage is scoped per contract address, and a validator/hook split across two different contracts couldn't share it this way. ERC-4337 v0.7 simulation rules permit transient storage writes by the account itself (a validator module is treated as part of the account for this purpose). Verified against a live Alchemy bundler on Ethereum Sepolia — UserOps pass simulation and execute correctly with no bundler rejection.
+**Status: Mitigated.** The transient slot (`keccak256(abi.encode("SessionHandlerModule.pendingSession", account, callHash))`, where `callHash` is `keccak256` of the `execute()` calldata) is scoped per-account and per-execution, and zeroed automatically at transaction end. `SessionHandlerModule` is installed as both Validator and Hook on the same contract instance specifically so this transient-storage bridge works — EIP-1153 storage is scoped per contract address, and a validator/hook split across two different contracts couldn't share it this way. ERC-4337 v0.7 simulation rules permit transient storage writes by the account itself (a validator module is treated as part of the account for this purpose). Verified against a live Alchemy bundler on Ethereum Sepolia — UserOps pass simulation and execute correctly with no bundler rejection.
+
+**Why `callHash` is part of the slot key:** the EntryPoint validates every op in a bundle before executing any, so two ops for the *same* account keyed only by `account` would clobber each other — the second op's `validateUserOp` would overwrite the pending-session slot before the first op's `preCheck` reads it, letting a priced op execute against another op's (possibly pricing-exempt) session and skip pricing entirely. Mixing in `callHash` gives each op its own slot. Both `validateUserOp` (hashing `userOp.callData`) and `preCheck` (hashing the account's `msg.data`) see the identical calldata, so both recompute the same key. Keying by nonce was rejected: `preCheck` never receives the executing op's nonce and cannot recover it, since all bundled nonces are incremented during the validation loop before any execution runs.
 
 ---
 
@@ -78,10 +85,10 @@
 
 ---
 
-### 3.8 `swapETHForExactTokens` Over-Charges Budget
-**Threat:** The contract charges the full `value` (ETH forwarded as `msg.value`) against the session budget, not the actual ETH consumed by the swap. The Uniswap router refunds unused ETH, but the budget is still decremented by the full forwarded amount.  
-**Impact:** Session budgets are depleted faster than the actual USD value transacted. Not exploitable for theft, but degrades session utility.  
-**Residual risk:** Low severity — funds are not at risk, only session budget accounting is imprecise.
+### 3.8 Exact-Output Swaps Over-Charge Budget
+**Threat:** Exact-output swaps charge the budget at the input *ceiling*, not the amount actually consumed. `swapETHForExactTokens` charges the full `msg.value` forwarded; `swapTokensForExactTokens` and `swapTokensForExactETH` charge `amountInMax` of the input token (see §3.2). The router refunds the unused remainder, but the budget is still decremented by the ceiling.  
+**Impact:** Session budgets are depleted faster than the actual USD value transacted. Not exploitable for theft, but degrades session utility. Callers can keep `amountInMax` / `msg.value` tight (sized via `getAmountsIn`) to minimize the gap.  
+**Residual risk:** Low severity — funds are not at risk, only session budget accounting is imprecise. This is the deliberate trade-off for the §3.2 fix that prices exact-output swaps on the input side.
 
 ---
 
@@ -109,9 +116,9 @@
 ---
 
 ### 4.3 `wallet.db` Compromise
-**Threat:** `wallet.db` stores session metadata (spending limits, expiry dates), contacts, recurring transfer schedules, and `key_ciphertext` blobs. A file-system compromise exposes this data.  
+**Threat:** `wallet.db` stores session metadata (spending limits, expiry dates), contacts, and `key_ciphertext` blobs. A file-system compromise exposes this data.  
 **Mitigation in place:** Session private keys are stored only as Vault Transit ciphertexts — the raw key material is never written to disk. Compromising `wallet.db` alone does not give an attacker the ability to sign transactions.  
-**Residual risk:** Contacts and recurring transfer schedules are exposed in plaintext. Combined with a separately compromised AppRole credential pair, the attacker can decrypt session keys and has full context to execute transactions.
+**Residual risk:** Contacts are exposed in plaintext. Combined with a separately compromised AppRole credential pair, the attacker can decrypt session keys and has full context to execute transactions.
 
 ---
 
@@ -125,13 +132,6 @@
 **Threat:** The bot processes messages from any Telegram user with a known `chat_id`. A user who obtains another user's `chat_id` could attempt to trigger transactions against their account.  
 **Mitigation in place:** Session keys are generated per `(chat_id, target)` pair and stored encrypted — an attacker would need both the target `chat_id`'s `key_ciphertext` from the DB and the AppRole credentials to forge a valid session key for another user.  
 **Residual risk:** `chat_id` values are not secret by design in Telegram.
-
----
-
-### 4.6 Recurring Transfer Session Expiry
-**Threat:** A scheduled recurring transfer will silently fail if the underlying session key has expired between scheduling and execution.  
-**Mitigation in place:** `recurring_transfer_job` checks session validity before each execution. On failure it cancels the job, deletes the DB record, and sends the user a Telegram alert.  
-**Residual risk:** A transfer may be missed in the interval between session expiry and the next job firing.
 
 ---
 

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from constants import (
     CHAIN_ID_ANVIL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA, WEI_PER_ETH,
 )
+from seed_data import SEEDS
 
 CHAIN_IDs=[CHAIN_ID_ANVIL, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA, CHAIN_ID_BSC, CHAIN_ID_CELO]
 
@@ -122,29 +123,6 @@ def init_db():
             chain_name TEXT  NOT NULL
         );             
 
-        CREATE TABLE IF NOT EXISTS recurring_transfers (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id      INTEGER NOT NULL,
-            token        TEXT NOT NULL,
-            recipient    TEXT NOT NULL,
-            amount       REAL NOT NULL,
-            interval_hrs INTEGER NOT NULL
-        );
-                     
-          CREATE TABLE IF NOT EXISTS mainnet_pricefeeds (
-            token TEXT PRIMARY KEY,
-            address TEXT  NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sepolia_pricefeeds (
-            token TEXT PRIMARY KEY,
-            address TEXT  NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS bsc_pricefeeds (
-            token TEXT PRIMARY KEY,
-            address TEXT  NOT NULL
-        );
-
-
         CREATE TABLE IF NOT EXISTS session_keys (
             chat_id         INTEGER NOT NULL,
             target          TEXT NOT NULL,
@@ -167,116 +145,25 @@ def init_db():
     db.commit()
 
 
-def migrate_json_to_db():
+def seed_reference_data():
     """
-    Seeds reference data from JSON files into the SQLite DB.
+    Seeds reference data from seed_data.SEEDS into the SQLite DB, then records
+    the deployed SHFactory address per chain from the Forge broadcast files.
     Uses INSERT OR REPLACE, so re-running `make db` is idempotent: existing rows
     are updated and missing rows are inserted without needing to delete the DB first.
     """
     db = get_db()
 
-    if os.path.exists("./app/migrate/selectors/ERC20_Selectors.json"):
-        for name, selector in get_json(
-            "./app/migrate/selectors/ERC20_Selectors.json"
-        ).items():
+    for table, key_col, value_col, data, checksum in SEEDS:
+        for key, value in data.items():
+            if checksum:
+                value = Web3.to_checksum_address(value)
             db.execute(
-                "INSERT OR REPLACE INTO erc20_selectors (name, selector) VALUES (?, ?)",
-                (name, selector),
+                f"INSERT OR REPLACE INTO {table} ({key_col}, {value_col}) VALUES (?, ?)",
+                (key, value),
             )
 
-    if os.path.exists("./app/migrate/contracts/UniswapV2_Selectors.json"):
-        for name, selector in get_json(
-            "./app/migrate/contracts/UniswapV2_Selectors.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO uniswapv2_selectors (name, selector) VALUES (?, ?)",
-                (name, selector),
-            )
-
-    if os.path.exists("./app/migrate/selectors/ReputationRegistry_Selectors.json"):
-        for name, selector in get_json(
-            "./app/migrate/selectors/ReputationRegistry_Selectors.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO reputation_registry_selectors (name, selector) VALUES (?, ?)",
-                (name, selector),
-            )
-
-    if os.path.exists("./app/migrate/network/Chains.json"):
-        for name, chain_id in get_json("./app/migrate/network/Chains.json").items():
-            db.execute(
-                "INSERT OR REPLACE INTO chains (name, chain_id) VALUES (?, ?)",
-                (name, chain_id),
-            )
-
-    if os.path.exists("./app/migrate/tokens/Mainnet_Tokens.json"):
-        for name, address in get_json(
-            "./app/migrate/tokens/Mainnet_Tokens.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO mainnet_tokens (ticker, address) VALUES (?, ?)",
-                (name, Web3.to_checksum_address(address)),
-            )
-    if os.path.exists("./app/migrate/tokens/Sepolia_Tokens.json"):
-        for name, address in get_json(
-            "./app/migrate/tokens/Sepolia_Tokens.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO sepolia_tokens (ticker, address) VALUES (?, ?)",
-                (name, Web3.to_checksum_address(address)),
-            )
-    if os.path.exists("./app/migrate/tokens/Bsc_Tokens.json"):
-        for name, address in get_json(
-            "./app/migrate/tokens/Bsc_Tokens.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO bsc_tokens (ticker, address) VALUES (?, ?)",
-                (name, Web3.to_checksum_address(address)),
-            )
-    if os.path.exists("./app/migrate/tokens/Celo_Tokens.json"):
-        for name, address in get_json(
-            "./app/migrate/tokens/Celo_Tokens.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO celo_tokens (ticker, address) VALUES (?, ?)",
-                (name, Web3.to_checksum_address(address)),
-            )
-
-    if os.path.exists("./app/migrate/pricefeeds/Mainnet_Pricefeeds.json"):
-        for name, address in get_json(
-            "./app/migrate/pricefeeds/Mainnet_Pricefeeds.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO mainnet_pricefeeds (token, address) VALUES (?, ?)",
-                (name, address),
-            )
-    if os.path.exists("./app/migrate/pricefeeds/Sepolia_Pricefeeds.json"):
-        for name, address in get_json(
-            "./app/migrate/pricefeeds/Sepolia_Pricefeeds.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO sepolia_pricefeeds (token, address) VALUES (?, ?)",
-                (name, address),
-            )
-    if os.path.exists("./app/migrate/pricefeeds/Bsc_Pricefeeds.json"):
-        for name, address in get_json(
-            "./app/migrate/pricefeeds/Bsc_Pricefeeds.json"
-        ).items():
-            db.execute(
-                "INSERT OR REPLACE INTO bsc_pricefeeds (token, address) VALUES (?, ?)",
-                (name, address),
-            )
-
-
-    if os.path.exists("./app/migrate/network/RPC.json"):
-        for name, rpc_url in get_json("./app/migrate/network/RPC.json").items():
-            db.execute(
-                "INSERT OR REPLACE INTO rpcs (name, rpc_url) VALUES (?, ?)",
-                (name, rpc_url),
-            )
-
-
-    for chain_id in CHAIN_IDs:        
+    for chain_id in CHAIN_IDs:
 
         if os.path.exists(f"./broadcast/DeploySHProtocol.s.sol/{chain_id}/run-latest.json"):
             broadcast_data = get_json(f"./broadcast/DeploySHProtocol.s.sol/{chain_id}/run-latest.json")
@@ -293,7 +180,7 @@ def migrate_json_to_db():
 
 
     db.commit()
-    print("Migration complete.")
+    print("Seeding complete.")
 
 
 # ── Session handlers ──────────────────────────────────────────────────────────
@@ -660,29 +547,6 @@ def get_supported_tokens(chat_id: int) -> list[str]:
     return [row["ticker"] for row in rows]
 
 
-
-def get_pricefeed_address(chat_id: int, token: str) -> str:
-    """
-    Retrieves the price feed address for a specific token on the user's network.
-
-    @param chat_id  The Telegram chat ID of the user. Used to determine which network.
-    @param token    The token ticker symbol (e.g. "usdc", "weth").
-    @return  A single Chainlink feed address (e.g. "0xD10a...").
-    @raises ValueError  If the network is unsupported or the token has no feed.
-    """
-    network = get_user_network(chat_id)
-    prefix = _NETWORK_DB_PREFIX.get(network)
-    if prefix is None:
-        raise ValueError(f"Unsupported network: '{network}'")
-    table = f"{prefix}_pricefeeds"
-    row = get_db().execute(
-        f"SELECT address FROM {table} WHERE token = ?", (token.lower(),)
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"No price feed for token '{token}' on network '{network}'")
-    return row["address"]
-
-
 # ── Contacts ──────────────────────────────────────────────────────────────────
 
 
@@ -762,80 +626,6 @@ def delete_contact(chat_id: int, name: str) -> str:
     return f"Contact deleted: {name}"
 
 
-# ── Recurring transfers ───────────────────────────────────────────────────────
-
-
-def save_recurring_transfer(
-    chat_id: int, token: str, recipient: str, amount: float, interval_hrs: int
-) -> int:
-    """
-    Saves a new recurring transfer to the database.
-
-    @param chat_id       The Telegram chat ID of the user.
-    @param token         The token ticker symbol (e.g. "usdc").
-    @param recipient     The contact name to send tokens to.
-    @param amount        The amount in whole token units (e.g. 100.0 for 100 USDC).
-    @param interval_hrs  How often to repeat, in hours (e.g. 24 for daily).
-    @return              The auto-assigned transfer ID.
-    """
-    db = get_db()
-    cursor = db.execute(
-        "INSERT INTO recurring_transfers (chat_id, token, recipient, amount, interval_hrs) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, token.lower(), recipient.lower(), amount, interval_hrs),
-    )
-    db.commit()
-    return cursor.lastrowid
-
-
-def get_recurring_transfers(chat_id: int) -> list[dict]:
-    """
-    Returns all recurring transfers for a given user.
-
-    @param chat_id  The Telegram chat ID of the user.
-    @return         A list of dicts with 'id', 'token', 'recipient', 'amount', and 'interval_hrs' keys.
-    """
-    rows = (
-        get_db()
-        .execute(
-            "SELECT id, token, recipient, amount, interval_hrs FROM recurring_transfers WHERE chat_id = ?",
-            (chat_id,),
-        )
-        .fetchall()
-    )
-    return [dict(row) for row in rows]
-
-
-def get_all_recurring_transfers() -> list[dict]:
-    """
-    Returns all recurring transfers across all users. Used on bot startup to restore jobs.
-
-    @return  A list of dicts with 'id', 'chat_id', 'token', 'recipient', 'amount', and 'interval_hrs' keys.
-    """
-    rows = (
-        get_db()
-        .execute(
-            "SELECT id, chat_id, token, recipient, amount, interval_hrs FROM recurring_transfers"
-        )
-        .fetchall()
-    )
-    return [dict(row) for row in rows]
-
-
-def delete_recurring_transfer(transfer_id: int, chat_id: int):
-    """
-    Deletes a recurring transfer by ID, scoped to the owning chat_id.
-
-    @param transfer_id  The ID of the recurring transfer to delete.
-    @param chat_id      The Telegram chat ID of the transfer owner.
-    """
-    db = get_db()
-    db.execute(
-        "DELETE FROM recurring_transfers WHERE id = ? AND chat_id = ?",
-        (transfer_id, chat_id),
-    )
-    db.commit()
-
-
 def save_user_network(chat_id: int, chain_name: str):
 
     db = get_db()
@@ -863,4 +653,4 @@ def get_user_network(chat_id: int):
 
 if __name__ == "__main__":
     init_db()
-    migrate_json_to_db()
+    seed_reference_data()

@@ -76,6 +76,7 @@ sh-protocol/
 ├── app/
 │   ├── constants.py
 │   ├── db.py
+│   ├── seed_data.py
 │   ├── network_config.py
 │   ├── contracts.py
 │   ├── anvil.py
@@ -87,33 +88,15 @@ sh-protocol/
 │   ├── telebot.py
 │   ├── agent_card.json
 │   ├── wallet.db                    ← not committed
-│   ├── artifacts/
-│   │   ├── IEntryPoint.json
-│   │   ├── IReputationRegistry.json
-│   │   ├── IERC20Extended.json
-│   │   ├── IWETH.json
-│   │   ├── IUniswapV2Router02.json
-│   │   ├── IUniswapV2Factory.json
-│   │   ├── IUniswapV2Pair.json
-│   │   └── ERC20Mock.json
-│   └── migrate/
-│       ├── network/
-│       │   ├── Chains.json
-│       │   └── RPC.json
-│       ├── selectors/
-│       │   ├── ERC20_Selectors.json
-│       │   └── ReputationRegistry_Selectors.json
-│       ├── contracts/
-│       │   └── UniswapV2_Selectors.json
-│       ├── tokens/
-│       │   ├── Mainnet_Tokens.json
-│       │   ├── Sepolia_Tokens.json
-│       │   ├── Bsc_Tokens.json
-│       │   └── Celo_Tokens.json
-│       └── pricefeeds/
-│           ├── Mainnet_Pricefeeds.json
-│           ├── Sepolia_Pricefeeds.json
-│           └── Bsc_Pricefeeds.json
+│   └── artifacts/
+│       ├── IEntryPoint.json
+│       ├── IReputationRegistry.json
+│       ├── IERC20Extended.json
+│       ├── IWETH.json
+│       ├── IUniswapV2Router02.json
+│       ├── IUniswapV2Factory.json
+│       ├── IUniswapV2Pair.json
+│       └── ERC20Mock.json
 ├── docs/
 │   ├── contracts.md
 │   ├── app.md

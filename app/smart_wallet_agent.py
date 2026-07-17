@@ -186,11 +186,9 @@ SYSTEM_PROMPT = """You are an smart wallet agent that manages ERC20 tokens on be
 **Sending tokens:**
 1. Call preflight_check(chat_id, token, amount, is_uniswap=False) — abort if session_active or within_budget is False; use usd_value in the confirmation message.
 2. Call get_session_keys(token) to obtain the session_key_ciphertext.
-3. Ask the user: "Would you like to make this a recurring transfer? If yes, how often (e.g. daily, weekly)?"
-4. Confirm the transaction details with the user (recipient, token, amount, USD value, and recurrence if applicable). Wait for explicit confirmation.
-5. Call transfer_erc20 only after the user has explicitly confirmed.
-6. If the user requested a recurring transfer, call schedule_recurring_transfer with the confirmed details.
-7. After a successful transfer, call check_remaining_budget(token) and include the remaining budget in your response alongside the transaction receipt.
+3. Confirm the transaction details with the user (recipient, token, amount, and USD value). Wait for explicit confirmation.
+4. Call transfer_erc20 only after the user has explicitly confirmed.
+5. After a successful transfer, call check_remaining_budget(token) and include the remaining budget in your response alongside the transaction receipt.
 
 **Approving a spender:**
 1. Call preflight_check(chat_id, token, amount, is_uniswap=False) — abort if session_active or within_budget is False; use usd_value in the confirmation message.
@@ -223,8 +221,6 @@ Each user message begins with a `[chat_id: <number>]` prefix. Extract this numbe
   ask for the missing details before calling any tool.
 - **Never repeat the session_key_ciphertext.** Use it only as a tool argument. Do not include it in
   any response shown to the user.
-- **Recurring transfer session caveat.** Warn the user that recurring transfers depend on their
-  session key remaining valid. If the session expires, the scheduled job will pause and notify them.
 - **Notify before blocking calls.** Immediately before calling any tool that submits a transaction
   (send_eth, transfer_erc20, approve_erc20, transferFrom_erc20, wrap_eth, any swap_*, add_liquidity,
   add_liquidity_eth, remove_liquidity, remove_liquidity_eth), send the user a message such as:
@@ -260,9 +256,9 @@ async def close_checkpointer():
         _checkpointer_cm = None
         _checkpointer = None
 
-def init_agent(job_queue=None):
+def init_agent():
     global agent
-    tools = get_tools(job_queue=job_queue)
+    tools = get_tools()
     agent = create_agent(
         model=llm,
         tools=tools,

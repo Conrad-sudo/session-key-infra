@@ -47,9 +47,6 @@ sepolia-uniswap-test:
 pancakeswap-test:
 	forge test --match-path test/fork/SHPancakeswapV2Test.t.sol --fork-url $(BSC_RPC_URL) -vvvv
 
-ubeswap-test:
-	forge test --match-path test/fork/SHUbeswapV2Test.t.sol --fork-url $(CELO_RPC_URL) -vvvv
-
 sepolia-test:
 	forge test --match-path test/fork/SHSepoliaTest.t.sol --fork-url $(SEPOLIA_RPC_URL) -vvvv
 

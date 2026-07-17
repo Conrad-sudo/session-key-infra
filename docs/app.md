@@ -8,6 +8,7 @@ The `app/` directory bridges the AI agent to the on-chain contracts. It is built
 app/
 ├── constants.py           ← Chain IDs, DEX factory addresses, ETH sentinel, heartbeat constants, native-wrapped ticker map
 ├── db.py                  ← SQLite data layer (all reads/writes to wallet.db)
+├── seed_data.py           ← Static reference data (selectors, chains, RPCs, tokens) seeded by make db
 ├── network_config.py      ← Web3 connection factory
 ├── contracts.py           ← Contract loading with per-chat_id caching; ERC-7579 calldata/nonce helpers
 ├── anvil.py               ← Session key management and UserOp execution (local/fork)
@@ -18,36 +19,18 @@ app/
 ├── smart_wallet_agent.py  ← LangChain agent and system prompt
 ├── telebot.py             ← Telegram bot front end
 ├── agent_card.json        ← ERC-8004/v1 agent card (hosted publicly, referenced by tokenURI)
-├── artifacts/
-│   ├── IEntryPoint.json           ← ABI for EntryPoint
-│   ├── IReputationRegistry.json   ← ABI for ERC-8004 ReputationRegistry
-│   ├── IERC20Extended.json        ← ABI for ERC20 tokens
-│   ├── IWETH.json                 ← ABI for WETH/WBNB
-│   ├── IUniswapV2Router02.json    ← ABI for Uniswap/PancakeSwap V2 Router (identical ABI, shared artifact)
-│   ├── IUniswapV2Factory.json     ← ABI for Uniswap/PancakeSwap V2 Factory
-│   ├── IUniswapV2Pair.json        ← ABI for Uniswap/PancakeSwap V2 Pair
-│   └── ERC20Mock.json             ← ABI for ERC20Mock (Anvil)
-└── migrate/
-    ├── network/
-    │   ├── Chains.json                ← Chain name → chain ID mapping
-    │   └── RPC.json                   ← Chain name → RPC URL mapping
-    ├── selectors/
-    │   ├── ERC20_Selectors.json       ← ERC20 function name → selector
-    │   └── ReputationRegistry_Selectors.json ← ERC-8004 function name → selector
-    ├── contracts/
-    │   └── UniswapV2_Selectors.json   ← Uniswap/PancakeSwap V2 function name → selector
-    ├── tokens/
-    │   ├── Mainnet_Tokens.json        ← Token ticker → mainnet address
-    │   ├── Sepolia_Tokens.json        ← Token ticker → Sepolia address
-    │   ├── Bsc_Tokens.json            ← Token ticker → BSC address
-    │   └── Celo_Tokens.json           ← Token ticker → Celo address (see note below)
-    └── pricefeeds/
-        ├── Mainnet_Pricefeeds.json    ← Token ticker → Chainlink feed address (mainnet)
-        ├── Sepolia_Pricefeeds.json    ← Token ticker → Chainlink feed address (Sepolia)
-        └── Bsc_Pricefeeds.json        ← Token ticker → Chainlink feed address (BSC)
+└── artifacts/
+    ├── IEntryPoint.json           ← ABI for EntryPoint
+    ├── IReputationRegistry.json   ← ABI for ERC-8004 ReputationRegistry
+    ├── IERC20Extended.json        ← ABI for ERC20 tokens
+    ├── IWETH.json                 ← ABI for WETH/WBNB
+    ├── IUniswapV2Router02.json    ← ABI for Uniswap/PancakeSwap V2 Router (identical ABI, shared artifact)
+    ├── IUniswapV2Factory.json     ← ABI for Uniswap/PancakeSwap V2 Factory
+    ├── IUniswapV2Pair.json        ← ABI for Uniswap/PancakeSwap V2 Pair
+    └── ERC20Mock.json             ← ABI for ERC20Mock (Anvil)
 ```
 
-> **Celo support is partial.** `celo_tokens` has a full migration table and `constants.py`/`deploy_wallet.py` handle `"celo"`/`"celo-fork"` as network names (including a Ubeswap V2 factory address), but there is no Solidity-side deployment path yet — `HelperConfig.s.sol` has no Celo chain ID branch, so `DeploySHProtocol.s.sol` cannot deploy the shared infrastructure to Celo until that's added (see [docs/contracts.md](contracts.md#helperconfigssol)). There's also no `celo_pricefeeds` table, since Celo has no Chainlink-registered SHOracle deployment yet.
+> **Celo support is partial.** `celo_tokens` has a full seeded table and `constants.py`/`deploy_wallet.py` handle `"celo"`/`"celo-fork"` as network names (including a Ubeswap V2 factory address), but there is no Solidity-side deployment path yet — `HelperConfig.s.sol` has no Celo chain ID branch, so `DeploySHProtocol.s.sol` cannot deploy the shared infrastructure to Celo until that's added (see [docs/contracts.md](contracts.md#helperconfigssol)).
 
 ## Module Dependency Flow
 
@@ -142,31 +125,12 @@ CREATE TABLE sepolia_tokens (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE bsc_tokens     (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE celo_tokens    (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 
--- Chainlink feed addresses are per-network (unlike Pyth's network-agnostic bytes32 feed IDs),
--- so each chain that has real feeds gets its own table. No celo_pricefeeds table yet.
-CREATE TABLE mainnet_pricefeeds (token TEXT PRIMARY KEY, address TEXT NOT NULL);
-CREATE TABLE sepolia_pricefeeds (token TEXT PRIMARY KEY, address TEXT NOT NULL);
-CREATE TABLE bsc_pricefeeds     (token TEXT PRIMARY KEY, address TEXT NOT NULL);
-
 CREATE TABLE erc20_selectors               (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
 CREATE TABLE uniswapv2_selectors           (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
 CREATE TABLE reputation_registry_selectors (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
-
-CREATE TABLE recurring_transfers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
-    token TEXT NOT NULL, recipient TEXT NOT NULL, amount REAL NOT NULL, interval_hrs INTEGER NOT NULL
-);
 ```
 
-**Initialisation:** Run `make db` once to create all tables and seed from the `migrate/` JSON files, plus the `factory` table from the Forge broadcast file written by `make deploy`. Re-running is safe — it uses `INSERT OR REPLACE`.
-
-**Chainlink feed lookups:**
-
-```python
-def get_pricefeed_address(chat_id: int, token: str) -> str
-    # Returns the Chainlink feed address for a ticker, resolved against the user's
-    # current network prefix (mainnet/sepolia/bsc). Raises ValueError if unregistered.
-```
+**Initialisation:** Run `make db` once to create all tables and seed from the static data in `seed_data.py`, plus the `factory` table from the Forge broadcast file written by `make deploy`. Re-running is safe — it uses `INSERT OR REPLACE`. The `sepolia` row in `rpcs` is taken from `SEPOLIA_RPC_URL` in `.env` (falling back to a keyless public endpoint), so API-keyed RPC URLs stay out of source control.
 
 ---
 
@@ -396,7 +360,7 @@ Each session gets a 50-day validity window and a $50,000 spending limit (`0` for
 
 Wraps blockchain operations as LangChain `@tool`-decorated functions. Each tool has a structured docstring the LLM uses to decide when and how to call it.
 
-**`get_tools(job_queue=None)`** is the tool factory. Passing a live `JobQueue` appends the recurring-transfer tools.
+**`get_tools()`** is the tool factory.
 
 All write tools route through the central `send_user_op_as_session()` dispatcher (see `live_network.py` section above).
 
@@ -410,7 +374,6 @@ All write tools route through the central `send_user_op_as_session()` dispatcher
 | `get_contact(chat_id, name)` | Resolves a contact name to an Ethereum address |
 | `get_all_contacts(chat_id)` | Returns the full contact list |
 | `delete_contact(chat_id, name)` | Removes a contact |
-| `get_recurring_transfers(chat_id)` | Returns all scheduled recurring transfers |
 
 ### Blockchain read tools
 
@@ -465,13 +428,6 @@ All write tools route through the central `send_user_op_as_session()` dispatcher
 
 All write tools accept `session_key_ciphertext: str` — the opaque Vault ciphertext from `get_session_keys`. Never decrypted or logged at the tool layer.
 
-### Recurring transfer tools *(requires `job_queue`)*
-
-| Tool | Description |
-|---|---|
-| `schedule_recurring_transfer(chat_id, token, recipient, amount, interval_hrs)` | Saves to DB and registers a repeating PTB job |
-| `cancel_recurring_transfer(chat_id, transfer_id)` | Removes the job and DB record |
-
 ### ERC-8004 tools
 
 | Tool | Description |
@@ -491,14 +447,14 @@ All write tools accept `session_key_ciphertext: str` — the opaque Vault cipher
 ### Architecture
 
 ```python
-def init_agent(job_queue=None):
-    tools = get_tools(job_queue=job_queue)
+def init_agent():
+    tools = get_tools()
     agent = create_agent(
         model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, checkpointer=memory
     )
 ```
 
-Called once at startup — by `main()` for CLI mode (no recurring tools) and by the bot's `post_init` callback with a live `JobQueue`.
+Called once at startup — by `main()` for CLI mode and by the bot's `post_init` callback.
 
 `AsyncSqliteSaver` persists the full message history to SQLite, keyed by `thread_id`. Each Telegram user gets an isolated, persistent conversation context that survives bot restarts.
 
@@ -507,7 +463,7 @@ Called once at startup — by `main()` for CLI mode (no recurring tools) and by 
 The `SYSTEM_PROMPT` instructs the agent on:
 
 - **Hard rule:** Never estimate swap quantities from prices — always call `get_quote_in` or `get_quote_out`. Price-based estimates ignore pool depth and fees.
-- Multi-step workflows for every operation type (transfers, swaps, liquidity, recurring transfers).
+- Multi-step workflows for every operation type (transfers, swaps, liquidity).
 - Chain-aware wording: resolve the wrapped-native ticker (`"weth"` vs `"wbnb"`) via `get_supported_tokens` before assuming which one applies.
 - Safety rules: never invent addresses; always resolve names via `get_contact` first; never expose `session_key_ciphertext` in responses.
 - Token validation: always call `get_supported_tokens` before any on-chain action.
@@ -548,18 +504,11 @@ The `chat_id` is embedded in the `HumanMessage` content because Anthropic's API 
 
 ### `post_init` Callback
 
-Runs once before polling starts:
-
-1. Calls `init_agent(job_queue)` to wire the `JobQueue` into the agent.
-2. Reads all `recurring_transfers` rows and re-registers each with `job_queue.run_repeating` — restoring scheduled jobs after a restart.
+Runs once before polling starts: opens the checkpointer and calls `init_agent()`.
 
 ### Session Expiry Alerts
 
 A daily `session_expiry_alert` job is registered per user on `/start`. Every 24 hours it checks all sessions and sends a warning if any expires within the next day.
-
-### Recurring Transfers
-
-After a transfer the agent asks if the user wants it to repeat. If yes, `schedule_recurring_transfer` persists the schedule and registers a `recurring_transfer_job`. If the session key expires, the job cancels itself and alerts the user.
 
 ### Async and Thread Safety
 

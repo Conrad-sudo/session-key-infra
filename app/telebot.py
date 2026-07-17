@@ -10,8 +10,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from smart_wallet_agent import chat, init_agent,open_checkpointer,close_checkpointer
-from db import get_all_recurring_transfers
-from tools import recurring_transfer_job, SECONDS_PER_HOUR, get_all_sessions
+from tools import get_all_sessions
 
 telegram_token = os.getenv("TELEGRAM_TOKEN")
 
@@ -80,29 +79,10 @@ async def post_init(application: Application) -> None:
     """
     Called once after the Application is initialised but before polling starts.
 
-    Initialises the agent with the live JobQueue so that recurring-transfer tools
-    are available, then restores any recurring transfer jobs that were persisted in
-    the database from a previous run.
+    Opens the checkpointer and initialises the agent.
     """
     await open_checkpointer()
-    job_queue = application.job_queue
-    init_agent(job_queue)
-
-    for transfer in get_all_recurring_transfers():
-        job_queue.run_repeating(
-            recurring_transfer_job,
-            interval=transfer["interval_hrs"] * SECONDS_PER_HOUR,
-            first=transfer["interval_hrs"] * SECONDS_PER_HOUR,
-            chat_id=transfer["chat_id"],
-            name=f"recurring_{transfer['id']}",
-            data={
-                "chat_id": transfer["chat_id"],
-                "transfer_id": transfer["id"],
-                "token": transfer["token"],
-                "recipient": transfer["recipient"],
-                "amount": transfer["amount"],
-            },
-        )
+    init_agent()
 
 async def post_shutdown(application: Application) -> None:
     await close_checkpointer()
