@@ -1,70 +1,70 @@
 # Smart Contract Architecture
 
-The smart contract layer implements the full SessionHandler Protocol as an **ERC-7579 modular account system**: shared infrastructure contracts deployed once per chain, and per-user `SessionHandler` smart wallets deployed on demand through `SHFactory`. Session-key logic and USD spending-limit enforcement live in a single installable module (`SessionHandlerModule`) rather than in the account itself, so any ERC-7579-compatible account could reuse it.
+The smart contract layer implements the SessionHandler Protocol as an **ERC-7579 modular account system**: shared infrastructure contracts deployed once per chain, and per-user `SessionHandler` smart wallets deployed on demand through `SHFactory`.
+
+The account (`SessionHandler`) validates its own UserOperations and manages a session-key allowlist. The USD spending cap lives in a single installable **hook** (`SpendingLimitModule`) that meters net portfolio value around every execution, so any ERC-7579 account could reuse it.
 
 ## Contract Overview
 
 ```
 src/
 ├── SHFactory.sol              ← User-facing factory — deploys one SessionHandler per user, assigns sequential walletIds
-├── SHTreasury.sol             ← Protocol fee collector — owns and administers SHRegistry
-├── SHRegistry.sol             ← Central config store (fee, treasury, oracle, agentId, router, interpreter)
-├── SHOracle.sol                ← Chainlink-based USD value converter
-├── SHValueInterpreter.sol     ← Decodes session-key calldata → USD debit/credit values
-├── SessionHandler.sol         ← ERC-7579 smart account (account-level concerns only)
-├── SessionHandlerModule.sol   ← ERC-7579 module (Validator + Hook) — all session-key state and logic
+├── SHTreasury.sol             ← Protocol operator — owns and administers SHRegistry (fee plumbing present but not charged)
+├── SHRegistry.sol             ← Central config store (treasury, oracle, agentId, router, protocol fee)
+├── SHOracle.sol               ← Chainlink-based USD value converter
+├── SessionHandler.sol         ← ERC-7579 smart account — self-validation, session-key allowlist, cap config, admin guard
+├── SpendingLimitModule.sol   ← ERC-7579 Hook (type 4 only) — global USD spending cap (net-value metering)
 ├── interfaces/
-│   ├── IWETH.sol              ← WETH interface (extends IERC20Extended)
-│   ├── IERC20Extended.sol     ← IERC20 + IERC20Metadata combined interface
-│   ├── IIdentityRegistry.sol  ← ERC-8004 IIdentityRegistry interface
-│   └── IReputationRegistry.sol← ERC-8004 IReputationRegistry interface
+│   ├── IWETH.sol                 ← WETH interface (extends IERC20Extended)
+│   ├── IERC20Extended.sol        ← IERC20 + IERC20Metadata combined interface
+│   ├── AggregatorV3Interface.sol ← Vendored Chainlink price-feed interface (used by SHOracle)
+│   ├── IIdentityRegistry.sol     ← ERC-8004 IIdentityRegistry interface
+│   └── IReputationRegistry.sol   ← ERC-8004 IReputationRegistry interface
 └── mocks/
-    ├── MockIdentityRegistry.sol  ← Full ERC-8004 Identity Registry mock (local testing)
-    ├── MockReputationRegistry.sol← ERC-8004 Reputation Registry mock (local testing)
-    ├── ERC20Mock.sol             ← Mintable ERC20 for local testing
-    ├── MockV3Aggregator.sol      ← Chainlink AggregatorV3Interface mock, seeded per-token on Anvil
-    └── MockWeth.sol              ← WETH mock with deposit/withdraw for Anvil
+    ├── MockIdentityRegistry.sol   ← Full ERC-8004 Identity Registry mock (local testing)
+    ├── MockReputationRegistry.sol ← ERC-8004 Reputation Registry mock (local testing)
+    ├── ERC20Mock.sol              ← Mintable ERC20 for local testing
+    ├── MockV3Aggregator.sol       ← Chainlink AggregatorV3Interface mock, seeded per-token on Anvil
+    └── MockWeth.sol               ← WETH mock with deposit/withdraw for Anvil
 
 script/
-├── DeploySHProtocol.s.sol    ← Deployment entry point (SHOracle → agent registration → SHTreasury → SHValueInterpreter → SessionHandlerModule → SHFactory)
+├── DeploySHProtocol.s.sol     ← Deployment entry point (SHOracle → agent registration → SHTreasury → SpendingLimitModule → SHFactory)
 ├── Constants.s.sol            ← Chain IDs, canonical addresses, per-network token/Chainlink-feed addresses, Anvil mock prices
 ├── HelperConfig.s.sol         ← Chain-specific configuration resolver (Mainnet, Sepolia, BSC, Anvil)
-└── SendPackedUserOp.s.sol     ← ERC-7579 UserOp construction and signing helper (session-key signing only)
+└── SendPackedUserOp.s.sol     ← ERC-7579 UserOp construction and signing helper (single + batch)
 
 test/
 ├── unit/
-│   ├── SHProtocolTest.t.sol         ← Full SessionHandler + SessionHandlerModule unit test suite (58 tests)
-│   └── SessionHandlerModuleHarness.sol ← Test harness exposing SessionHandlerModule's internal functions
+│   ├── SHProtocolTest.t.sol            ← Core unit suite: deploy, module lifecycle, metering, approvals, trusted spenders (60 tests)
+│   ├── SessionGuardTest.t.sol          ← End-to-end guard + session-key auth proof via the real EntryPoint (13 tests)
+│   └── SpendingLimitModuleHarness.sol ← Test harness exposing the module's internal calldata/approval helpers
 ├── fork/
-│   ├── SHUniswapV2Test.t.sol   ← Uniswap V2 integration tests (Ethereum mainnet fork)
-│   ├── SHSepoliaUniswapV2Test.t.sol ← Uniswap V2 integration tests (Sepolia fork)
-│   ├── SHPancakeswapV2Test.t.sol ← PancakeSwap V2 integration tests (BSC fork)
-│   └── SHSepoliaTest.t.sol     ← SessionHandler integration tests (Sepolia fork; ETH/ERC20/reputation, not Uniswap)
+│   ├── SHForkTestBase.sol              ← Shared abstract fork suite (10 tests) parameterized per network
+│   ├── SHUniswapV2Test.t.sol           ← Mainnet-fork instance (WETH→DAI)
+│   ├── SHSepoliaUniswapV2Test.t.sol    ← Sepolia-fork instance (WETH→USDC)
+│   └── SHPancakeswapV2Test.t.sol       ← BSC-fork instance (USDT→WBNB→LINK)
 └── invariant/
-    ├── InvariantSH.t.sol  ← Stateful invariant tests
-    └── SHHandler.sol      ← Action handler for fuzzing
+    ├── InvariantSH.t.sol  ← Stateful invariant tests (8 invariants)
+    └── SHHandler.sol      ← Action handler for fuzzing, with a ghost metering model
 ```
 
-> **Celo is not yet wired into the Solidity deployment path.** The Python app layer has scaffolding for Celo (token list, chain ID, Ubeswap V2 factory address — see [docs/app.md](app.md)), but `HelperConfig.s.sol` / `Constants.s.sol` have no Celo branch yet, so `DeploySHProtocol.s.sol` cannot deploy the shared infrastructure to Celo until that's added.
+> **Celo is not yet wired into the Solidity deployment path.** The Python app layer has partial scaffolding for Celo, but `HelperConfig.s.sol` / `Constants.s.sol` have no Celo branch, so `DeploySHProtocol.s.sol` cannot deploy to Celo until that's added.
 
 ---
 
 ## `SHRegistry.sol`
 
-The `SHRegistry` is the central configuration store for the entire protocol. All deployed `SessionHandler` wallets (via `SessionHandlerModule`) read their runtime parameters — protocol fee, treasury address, price oracle, Uniswap/PancakeSwap router, value interpreter, and agent identity — from this single contract. This means any protocol parameter can be updated by the operator without redeploying any user wallets.
-
-`SHRegistry` is owned by `SHTreasury`. All admin functions on the registry are exposed through `SHTreasury`'s pass-through setters — operators never call `SHRegistry` directly.
+The `SHRegistry` is the central configuration store. Deployed `SessionHandler` wallets read runtime parameters — treasury address, price oracle, agent identity, and Uniswap/PancakeSwap router — from this single contract, so any parameter can be updated by the operator without redeploying user wallets. It is owned by `SHTreasury`, and all admin flows through `SHTreasury`'s pass-through setters.
 
 **Stored parameters:**
 
 | Parameter | Type | Purpose |
 |---|---|---|
-| `protocolFee` | `uint256` | Flat ETH fee charged on every session-key execution (capped at `MAX_PROTOCOL_FEE = 0.001 ether`) |
-| `treasury` | `address` | Destination for protocol fee payments — `SHTreasury` |
+| `protocolFee` | `uint256` | Flat ETH fee config (capped at `MAX_PROTOCOL_FEE = 0.001 ether`). **Retained but no longer charged** — `SessionHandler.execute` does not collect a per-execution fee in the current design. |
+| `treasury` | `address` | `SHTreasury` — fee sink and registry owner |
 | `priceOracle` | `address` | Canonical `SHOracle` address for USD accounting |
 | `agentId` | `uint256` | ERC-8004 token ID of the registered protocol agent |
-| `router` | `address` | Uniswap V2-compatible router (Uniswap on mainnet, PancakeSwap on BSC); `address(0)` on chains without one |
-| `callValueInterpreter` | `address` | `SHValueInterpreter` address for calldata → USD computation |
+| `router` | `address` | Uniswap V2-compatible router (Uniswap on mainnet/Sepolia, PancakeSwap on BSC); `address(0)` on chains without one. Auto-trusted as a spender on each wallet at deploy. |
 
 ```solidity
 uint256 public constant MAX_PROTOCOL_FEE = 0.001 ether;
@@ -74,34 +74,26 @@ function setTreasury(address newTreasury) external onlyOwner;
 function setPriceOracle(address newOracle) external onlyOwner;
 function setAgentId(uint256 newId) external onlyOwner;
 function setUniswapRouter(address newRouter) external onlyOwner;
-function setCallValueInterpreter(address newInterpreter) external onlyOwner;
 ```
+
+> The former `callValueInterpreter` parameter and `SHValueInterpreter` contract were **removed**: the new module meters spending by diffing watched-token balances, so it needs no per-call calldata decoder.
 
 ---
 
 ## `SHTreasury.sol`
 
-`SHTreasury` is the protocol's operator and fee-sink contract, fulfilling two coupled responsibilities: it acts as the terminal receiver in a push-based settlement pipeline, accepting a per-execution ETH debit from every deployed `SessionHandler` instance via a low-level `call`, and it holds exclusive write-capability over the `SHRegistry` singleton. Self-referential construction — instantiating `SHRegistry` from within the `SHTreasury` constructor — establishes `address(this)` as the canonical owner and fee-destination atomically at deploy time, eliminating a separate ownership-transfer step and its associated trust window.
-
-**Fee flow:**
-```
-SessionHandler.execute() → payable(REGISTRY.treasury()).call{value: fee}() → SHTreasury.receive()
-```
-
-**Admin flow:**
-```
-Protocol operator → SHTreasury.set*() → SHRegistry.set*()
-```
+`SHTreasury` is the protocol operator and fee-sink contract. It deploys its own `SHRegistry` in its constructor — establishing `address(this)` as the canonical registry owner and fee destination atomically — and holds exclusive write access to it. It can still receive ETH and hold accumulated balance, though the account no longer pushes a fee on each execution.
 
 ```solidity
 constructor(
-    uint256 initialFee,      // starting protocol fee in wei
+    uint256 initialFee,      // starting protocol fee config in wei
     address priceOracle,     // SHOracle address
     uint256 initialAgentId,  // ERC-8004 agent token ID
     address uniswapRouter    // address(0) on chains without a Uniswap V2-compatible router
 );
 
-// Fee management
+// Balance management
+receive() external payable;                                                   // totalFeesCollected += msg.value
 function withdraw(address recipient, uint256 amount) external onlyOwner nonReentrant;
 function withdrawAll(address recipient) external onlyOwner nonReentrant;
 
@@ -111,7 +103,6 @@ function setPriceOracle(address newOracle) external onlyOwner;
 function setTreasury(address newTreasury) external onlyOwner;
 function setAgentId(uint256 newId) external onlyOwner;
 function setUniswapRouter(address newRouter) external onlyOwner;
-function setCallValueInterpreter(address newInterpreter) external onlyOwner;
 
 address public immutable REGISTRY;
 uint256 public totalFeesCollected;
@@ -121,11 +112,9 @@ uint256 public totalFeesCollected;
 
 ## `SHFactory.sol`
 
-`SHFactory` is the user-facing entry point for deploying new `SessionHandler` wallets. It deploys a single `SessionHandler` implementation in its own constructor, then `deployWallet()` creates each user's wallet as an **EIP-1167 minimal-proxy clone** of that implementation and calls `initialize()` on the clone — which installs the configured `SessionHandlerModule` as both its Validator and Hook and wires it to the shared protocol infrastructure. ETH sent with the call is forwarded to the new wallet as the initial gas prefund. Cloning makes each deployment cost a fraction of deploying the full account bytecode (~403k gas per wallet).
+`SHFactory` is the user-facing entry point for deploying new `SessionHandler` wallets. It deploys a single `SessionHandler` implementation in its constructor, then `deployWallet(...)` creates each user's wallet as an **EIP-1167 minimal-proxy clone** and calls `initialize()` on it — which installs the configured `SpendingLimitModule` as a **hook** and seeds the wallet's spending-cap configuration. ETH sent with the call is forwarded to the new wallet as the initial gas prefund.
 
-`SHFactory` stores the `EntryPoint`, `SHRegistry`, `IdentityRegistry`, and `ReputationRegistry` addresses as immutables and passes them to each clone's `initialize()`. The `SessionHandlerModule` address is stored as a plain (settable) variable instead, consistent with how `SHRegistry`'s own dependent addresses are owner-updatable without redeployment — `deployWallet()` reverts while it's unset.
-
-Each deployed wallet is assigned a sequential `walletId` (starting at 1, tracked via `totalWallets`), recorded on the `SessionHandler` itself — set once in `initialize()` — and queryable back from the factory via `wallets(walletId)`.
+`deployWallet` takes the per-wallet spending-cap config so each wallet is born with a cap, a window, and its watched-token set:
 
 ```solidity
 constructor(
@@ -133,12 +122,15 @@ constructor(
     address _feeRegistry,        // SHRegistry address
     address _reputationRegistry, // ERC-8004 ReputationRegistry
     address _identityRegistry,   // ERC-8004 IdentityRegistry
-    address _module              // SessionHandlerModule installed on every clone
+    address _module              // SpendingLimitModule installed on every clone
 );
 
 /// Deploys a new SessionHandler owned by msg.sender; forwards msg.value as ETH prefund.
-/// Reverts with SHFactory_SpendingLimitModuleNotSet if spendingLimitModule hasn't been configured.
-function deployWallet() external payable whenNotPaused returns (address);
+/// dailyLimitUsd (18 decimals, >= 0), windowDuration (seconds, > 0), and watchedTokens (each
+/// must already be priced by the oracle) seed the hook's onInstall config.
+/// Reverts with SHFactory_SpendingLimitModuleNotSet if the module hasn't been configured.
+function deployWallet(int256 dailyLimitUsd, uint256 windowDuration, address[] calldata watchedTokens)
+    external payable whenNotPaused returns (address);
 
 function setSpendingLimitModule(address newModule) external onlyOwner;
 function pause() external onlyOwner;
@@ -154,79 +146,44 @@ event SpendingLimitModuleUpdated(address indexed oldModule, address indexed newM
 
 ---
 
-## `SHValueInterpreter.sol`
-
-`SHValueInterpreter` decodes session-key calldata and converts the involved token amounts to USD. It's called by `SessionHandlerModule.preCheck()` — the ERC-7579 Hook entrypoint — to compute the debit or credit value of each session-key operation before the spending limit is enforced.
-
-Extracting this logic into a standalone contract allows the oracle and router addresses to be updated in `SHRegistry` without redeploying any user wallets or the module itself. The interpreter reads both from `SHRegistry` at call time. The router check is DEX-agnostic — whichever router `SHRegistry.router()` currently points at (Uniswap V2 on mainnet and Sepolia, PancakeSwap V2 on BSC) is treated identically, since both expose the same `IUniswapV2Router01`/`02` ABI.
-
-**Supported operations:**
-
-| Operation | USD treatment |
-|---|---|
-| Native ETH/BNB send (`value > 0`, not a WETH/WBNB `deposit`) | `value` priced via the native-asset Chainlink feed |
-| ERC-20 `transfer` / `transferFrom` | token `amount` priced via the token's Chainlink feed |
-| Uniswap/PancakeSwap V2 swaps | exact input or exact output amount priced at the input (or output) token |
-| `addLiquidity` / `addLiquidityETH` | both deposit amounts priced and summed |
-| `removeLiquidity` / `removeLiquidityETH` | returns a `creditValueInUsd` (budget credit, not debit) |
-| WETH/WBNB `deposit` | native-asset component excluded (deposit just wraps — no net spend) |
-
-The `value > 0` guard on the native-asset branch matters because `computeUsdValue` is also reachable with `value == 0` for plain token calls — without it, every such call would needlessly price `address(0)` for zero value. The zero-router revert is skipped on Anvil (no official router deployment there) so tests can still exercise ERC-20 transfers without a router configured; Sepolia is also still listed in that exemption in code, but it's moot in practice now that Sepolia has an officially deployed Uniswap V2 router wired into `HelperConfig`, so `SHRegistry.router()` is never actually zero there.
-
-```solidity
-constructor(address registry);  // SHRegistry address
-
-// Returns (debitValueInUsd, creditValueInUsd) — creditValueInUsd non-zero only for removeLiquidity variants.
-function computeUsdValue(
-    address dest,
-    uint256 value,
-    bytes memory data,
-    bytes4 selector
-) external view returns (uint256 debitValueInUsd, uint256 creditValueInUsd);
-```
-
----
-
 ## `SHOracle.sol`
 
-The `SHOracle` converts native-asset and ERC-20 token amounts into real-time USD values using **Chainlink** price feeds. It's called by `SHValueInterpreter` to enforce USD-denominated spending limits rather than raw token amounts.
+The `SHOracle` converts native-asset and ERC-20 token amounts into real-time USD values using **Chainlink** price feeds. It accounts for stablecoin depeg events (e.g. USDC at $0.87 during the March 2023 SVB crisis) by querying actual market prices rather than assuming a 1:1 peg.
 
-This design accounts for stablecoin depeg events (e.g., USDC at $0.87 during the March 2023 SVB crisis) by querying actual market prices rather than assuming a 1:1 peg.
+The module calls it directly (there is no interpreter layer). `getPrice` returns the **signed 18-decimal USD value** of an amount, and `isPriced` gates whether a token may be watched or approved through the hook.
 
-**Supported tokens:** registered per-token via parallel `(address token, address priceFeed, uint256 heartbeat)` arrays passed to the constructor — native ETH/BNB uses `address(0)`. Pairs whose `priceFeed` is `address(0)` are silently skipped at construction, so the same array shapes can be reused across networks even when a token has no feed on a given chain (e.g. most of the long-tail token list has no feed on Sepolia). `HelperConfig.s.sol` currently resolves feeds for ~22 tokens across Mainnet, BSC, and Sepolia (a much smaller subset there) — see its `NetworkConfig` struct for the full list.
+**Supported tokens:** registered per-token via parallel `(address token, address priceFeed, uint256 heartbeat)` arrays passed to the constructor — native ETH/BNB uses `address(0)`. Pairs whose `priceFeed` is `address(0)` are silently skipped, so the same array shapes can be reused across networks. Each token's `decimals` is read once at construction and cached, so `getPrice` never makes an external `decimals()` call at valuation time.
 
-**Staleness protection:** each registered feed has its **own** heartbeat (unlike a single protocol-wide value) — Chainlink heartbeats vary per feed: volatile assets (ETH, LINK, BTC) update roughly hourly, while stablecoin feeds like USDC/USDT update every 23–24 hours. `getPrice`/`getUsdValue` revert with `SHOracle_StalePrice` if `block.timestamp - updatedAt > heartbeat` for that specific feed, where `updatedAt` comes from `AggregatorV3Interface.latestRoundData()`.
+**Staleness protection:** each registered feed has its **own** heartbeat, set once at construction — volatile assets (ETH, LINK, BTC) update roughly hourly, stablecoins every 23–24 hours. `getPrice` reverts with `PriceOracle_StalePrice` if `block.timestamp - updatedAt > heartbeat` for that feed, and with `PriceOracle_InvalidPrice` on a non-positive answer. (The error names retain the `PriceOracle_` prefix from the contract's earlier name.)
 
 ```solidity
 constructor(address[] memory tokens, address[] memory priceFeeds, uint256[] memory heartbeats);
 
-function getPrice(address token) external view returns (uint256 price, uint8 decimals);
-function getUsdValue(address token, uint256 amount) external view returns (uint256);
+/// True if `token` has a registered feed (safe to watch/approve/price).
+function isPriced(address token) external view returns (bool);
+
+/// USD value of `amount` of `token`, 18 decimals, signed (int256 for arithmetic parity with the module).
+function getPrice(address token, uint256 amount) external view returns (int256);
 ```
 
 ---
 
 ## `SessionHandler.sol`
 
-The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `AccountERC7579Hooked`, plus `OwnableUpgradeable` and `Pausable`) that carries no session-key logic of its own. It is deployed behind an EIP-1167 minimal-proxy clone by `SHFactory`, so its per-wallet configuration is set in `initialize()` (not a constructor), and the installed `SessionHandlerModule` is registered there as **both** a Validator (type 1) and a Hook (type 4). `SessionHandler` only keeps the account-level concerns that aren't session-key specific: ownership, ETH/ERC20 withdrawal, pausing, protocol fee charging, a sequential `walletId`, and the ERC-8004 identity/reputation lookups.
+The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `AccountERC7579Hooked`, plus `OwnableUpgradeable` and `Pausable`), deployed behind an EIP-1167 clone by `SHFactory`. It owns three responsibilities the module doesn't: **validating its own UserOps**, **managing the session-key allowlist**, and **guarding session-key executions** away from its own admin surface. `SpendingLimitModule` is installed as a **hook only** (no validator).
 
-**Deliberate deviation from stock `AccountERC7579Hooked`:** `execute`, `installModule`, and `uninstallModule` are normally `onlyEntryPointOrSelf` — an EOA owner cannot call them directly. This contract reopens that direct-owner path via `onlyEntryPointOrSelfOrOwner` so the owner never has to submit a UserOp for their own admin actions; they just call the account directly, without needing a separate "owner validator" module. `addSessionKey`, `addUnpricedSessionKey`, and `revokeSessionKey` are gated by a plain `onlyOwner` instead — session management never needs EntryPoint routing at all.
+**Self-validation — no separate validator module.** OZ's `AccountERC7579._validateUserOp` looks up a validator module from the nonce key and, when none is installed, falls back to `Account._validateUserOp → _rawSignatureValidation`. Since this account installs no validator, that fallback always runs. `SessionHandler` overrides `_rawSignatureValidation` to accept a UserOp signed by the **owner** or by any address on the **`allowedSession`** allowlist. The signer signs the EIP-191 envelope of the userOpHash (`toEthSignedMessageHash`), matching the bot and the Foundry helper.
 
-**Key features:**
+**Admin-surface guard.** For any non-owner execution (a session-key UserOp through the EntryPoint, or a self-call), `execute` runs `_guardSessionExecution`, which reverts if any single/batch sub-call targets `address(this)` or `address(SH_MODULE)`, and rejects `delegatecall` outright. This is what stops a session key from calling the module's cap setters, self-calling `uninstallModule` to delete the cap, minting more session keys, or delegatecalling arbitrary code. Owner-initiated calls skip the guard.
 
-| Feature | Detail |
-|---|---|
-| ERC-7579 modular account | `execute(bytes32 mode, bytes executionCalldata)` — the standard single-call shape |
-| Sequential wallet ID | `WALLET_ID` storage var, set once by `SHFactory` in `initialize()` |
-| Session-key logic | Entirely delegated to `SH_MODULE` (installed as both Validator and Hook) |
-| Protocol fee | Charges a flat ETH fee (`REGISTRY.protocolFee()`) to `REGISTRY.treasury()` whenever `execute()` is driven by a session key through the EntryPoint |
-| Owner escape hatches | `execute`, `installModule`, `uninstallModule` callable directly by the owner (`onlyEntryPointOrSelfOrOwner`); session management is plain `onlyOwner` |
-| Owner withdrawal | `withdraw(token, amount, to)` allows the owner to pull ERC20 tokens or ETH from the wallet to a chosen recipient |
-| Agent identity | `getAgentIdentity()` and `getAgentReputation()` proxy to the ERC-8004 registries |
-| Session view passthroughs | `getSession`, `isSessionActive`, `getRemainingBudget`, `isSpendingWithinBudget` all forward to `SH_MODULE`, scoped to `address(this)` |
+**Deliberate deviation from stock `AccountERC7579Hooked`:** `execute`, `installModule`, and `uninstallModule` are reopened to the owner via `onlyEntryPointOrSelfOrOwner`, so the owner never has to submit a UserOp for admin actions. Session-key management and cap configuration are plain `onlyOwner`.
+
+**Session keys are a bare allowlist.** `addSession(key)` / `removeSession(key)` — no per-key target/selector scope, no expiry. A session key can drive any external call, bounded by the spending cap and the guard. The registry router is auto-trusted as a spender in `initialize()` so `removeLiquidity`'s LP-token approval works out of the box.
 
 ```solidity
 /// Called once by SHFactory on each freshly cloned wallet (replaces the constructor).
+/// Installs the module as a HOOK with abi.encode(dailyLimitUsd, windowDuration, watchedTokens),
+/// then auto-trusts REGISTRY.router() (if nonzero) as a spender.
 function initialize(
     address owner,
     address entryPointAddress,
@@ -234,110 +191,121 @@ function initialize(
     address identityRegistry,
     address registry,
     uint256 walletId,
-    address spendingLimitModule
+    address spendingLimitModule,
+    int256 dailyLimitUsd,
+    uint256 windowDuration,
+    address[] calldata watchedTokens
 ) external;
 
+// Execution + module admin (owner escape hatch)
 function execute(bytes32 mode, bytes calldata executionCalldata) public payable override whenNotPaused onlyEntryPointOrSelfOrOwner;
 function installModule(uint256 moduleTypeId, address module, bytes calldata initData) public override onlyEntryPointOrSelfOrOwner;
 function uninstallModule(uint256 moduleTypeId, address module, bytes calldata deInitData) public override onlyEntryPointOrSelfOrOwner;
 
-function addSessionKey(address sessionKey, address target, bytes4[] calldata selectors, uint48 validFrom, uint48 validUntil, uint256 spendingLimit) external onlyOwner;
-function addUnpricedSessionKey(address sessionKey, address target, bytes4[] calldata selectors, uint48 validFrom, uint48 validUntil) external onlyOwner;
-function revokeSessionKey(address sessionKey) external onlyOwner;
+// Session-key allowlist (owner-only)
+mapping(address sessionKey => bool allowed) public allowedSession;
+function addSession(address sessionKey) external onlyOwner;
+function removeSession(address sessionKey) external onlyOwner;
 
-function getSession(address sessionKey) external view returns (SessionHandlerModule.Session memory);
-function isSessionActive(address sessionKey) external view returns (bool);
-function getRemainingBudget(address sessionKey) external view returns (uint256);
-function isSpendingWithinBudget(address sessionKey, address token, uint256 amount) external view returns (bool);
+// Spending-cap config passthroughs (owner-only; call the module as this account)
+function setDailyLimit(int256 dailyLimitUsd) external onlyOwner;
+function setWindowDuration(uint256 windowDuration) external onlyOwner;
+function addWatchedToken(address token) external onlyOwner;
+function removeWatchedToken(address token) external onlyOwner;
+function addTrustedSpender(address spender) external onlyOwner;
+function removeTrustedSpender(address spender) external onlyOwner;
 
+// Cap views
+function getConfig() external view returns (SpendingLimitModule.Config memory);
+function isWatched(address token) external view returns (bool);
+function isTrustedSpender(address spender) external view returns (bool);
+function getRemainingBudget() external view returns (int256);          // remaining USD this window
+function getUsdValue(address token, uint256 amount) public view returns (int256);
+
+// Owner-only account functions
 function pause() external onlyOwner;
 function unpause() external onlyOwner;
-function withdraw(address token, uint256 amount, address to) external onlyOwner;
+function withdraw(address token, uint256 amount, address to) external onlyOwner;   // ERC20 or ETH; bypasses the hook
 
-function getPrice(address token) public view returns (uint256 price, uint8 decimals);
+// ERC-8004
 function getAgentId() public view returns (uint256);
 function getAgentIdentity() public view returns (bool registered, uint256 agentId, string memory agentUri);
 function getAgentReputation() public view returns (uint256 agentId, uint64 feedbackCount, int128 summaryValue, uint8 summaryValueDecimals);
 function getRouter() public view returns (address);
 
-address public immutable ENTRY_POINT;
-address public immutable REPUTATION_REGISTRY;
-address public immutable IDENTITY_REGISTRY;
-SHRegistry public immutable REGISTRY;
-uint256 public immutable WALLET_ID;
-SessionHandlerModule public immutable SH_MODULE;
+event SessionAdded(address indexed sessionKey);
+event SessionRemoved(address indexed sessionKey);
 ```
+
+> The account currently has **no validator module**. Until a validator (an owner/ECDSA validator or Smart Sessions) is added, this self-validation path is what makes UserOps work — the bot's nonce-key scheme still validates fine because any extracted "validator" isn't installed and the account falls through to `_rawSignatureValidation`.
 
 ---
 
-## `SessionHandlerModule.sol`
+## `SpendingLimitModule.sol`
 
-`SessionHandlerModule` is an **ERC-7579 module pair** — a single contract registered as both a Validator (type 1) and a Hook (type 4) — implementing all session-key spending-limit logic as an installable module usable by any ERC-7579 account. A single deployed instance serves every account that installs it: all session state is keyed by `account` (the installing smart account), not assumed to belong to "this contract's own wallet."
+`SpendingLimitModule` is an **ERC-7579 Hook (type 4 only — not a validator)** enforcing a global, USD-denominated spending cap per rolling window across every venue and every key on the installing account. One deployed instance serves every account; all state is keyed by `account` (`msg.sender` in the hook callbacks). It never authenticates anyone — authentication is the account's job.
 
-**Why Validator + Hook are the same contract instead of two separate modules:** EIP-1153 transient storage is scoped per contract address, not shared across different deployed contracts. A monolithic single-contract account could bridge `validateUserOp` → `execute` via transient storage trivially, since both phases run as code of that same contract. Two separate modules could not share a bridge that way, and a validator cannot safely call out to a separate Hook contract during `validateUserOp` anyway (ERC-4337 validation-phase storage-access rules forbid calling arbitrary external contracts). Making this one contract installed as both a Validator and a Hook restores that same bridge trick, re-scoped per account.
-
-**Design boundaries:**
-- Owner-signed UserOps are out of scope — this module only ever sees session-key signers; the account dispatches to it by nonce key (top 20 bytes of the 192-bit nonce key select the validator module).
-- Protocol fee collection is an account-level concern, handled by `SessionHandler.execute()` itself via `pendingSessionKey()`, not hardcoded into a Hook meant to be reusable on arbitrary accounts.
-- Batched executions are rejected outright for session-key UserOps — only `CALLTYPE_SINGLE` is supported.
-
-**Session struct:**
+**Config (per account):**
 
 ```solidity
-struct Session {
-    bool active;
-    address target;         // whitelisted target contract; address(0) = native ETH/BNB send
-    uint48 validFrom;
-    uint48 validUntil;
-    uint256 spendingLimit;  // max cumulative USD spend (18 decimals) — 0 for pricingExempt sessions
-    uint256 spentAmount;
-    bytes4[] selectors;     // whitelisted function selectors
-    bool pricingExempt;     // skips SHValueInterpreter/SHOracle pricing entirely — see addUnpricedSessionKey
+struct Config {
+    bool installed;              // gates every hook and setter
+    uint48 windowStart;          // timestamp anchoring the current window
+    uint48 windowDuration;       // seconds
+    int256 dailyLimitUsd;        // 18-decimal USD cap per window
+    int256 spentInWindow;        // 18-decimal USD net value spent this window
+    address[] watchedTokens;     // tokens whose value changes are metered (max 32)
+    address[] trustedSpenders;   // spenders approvable even for unpriced tokens (max 16)
 }
 ```
 
-**Unpriced sessions (`addUnpricedSessionKey`):** for targets `SHOracle` has no price feed for (e.g. the ERC-8004 Reputation Registry), `addUnpricedSessionKey` registers a session with `pricingExempt = true`, skipping the `SHValueInterpreter`/`SHOracle` call in `preCheck` entirely. This was chosen deliberately over a blanket try/catch around the pricing call — a try/catch would silently treat *any* misconfigured price feed as free-to-spend, even for a real token that should have been priced. Selector allowlisting is never skipped, even for exempt sessions.
+**How metering works (net value, not gross outflow):**
 
-**EIP-1153 transient storage bridge:** `validateUserOp` and `preCheck` run as two separate calls within the same `handleOps` transaction, keyed per-account **and per-execution** — the slot mixes in `callHash` (keccak256 of the `execute()` calldata, which both phases see identically) so two ops for the same account in one bundle land in distinct slots and can't clobber each other (the EntryPoint validates every op before executing any):
+- **`preCheck`** rolls the spending window if expired, collects any `approve` sub-calls (rejecting unlimited approvals and unpriced-to-untrusted approvals up front), and snapshots the raw balance of every watched token. **No oracle calls happen here.**
+- **`postCheck`** does two independent checks:
+  1. **Net-value spend.** For each watched token whose balance *changed*, it prices the delta via `SHOracle` and sums the signed differences across the portfolio; any net USD **decrease** is added to `spentInWindow`, reverting `BudgetExceeded` if it crosses `dailyLimitUsd`. A token that didn't move is never priced (so a stale feed on an untouched token can't block a transaction), and a net increase adds nothing and never banks credit for a later transaction.
+  2. **No standing approvals.** Any allowance approved in this transaction must be consumed to **exactly 0** by the end of it, else revert `StandingApprovalNotAllowed`. This closes deferred-pull risk outright rather than size-bounding it.
 
-```solidity
-bytes32 slot = keccak256(abi.encode("SessionHandlerModule.pendingSession", account, callHash));
-// tstore / tload the pending session key at that slot
-```
+Because spending *is* the drop in watched-portfolio USD, the module needs no per-venue swap decoder: a value-neutral swap nets ~0, and a bad-rate or sandwiched swap registers its lost value automatically. Both `execute` and `executeFromExecutor` calldata are decoded for approvals; delegatecalls are not decoded (no reliable selector), but the net-value cap still applies to them.
 
-USD computation is deferred entirely to `preCheck()` (called by the account as its installed Hook, right before the inner call), because oracle reads are unrestricted there but forbidden during ERC-4337 validation.
-
-**Validation flow (`validateUserOp`, module type 1):**
-
-1. Recover the signer from the EIP-191-wrapped `userOpHash` via ECDSA.
-2. If no session exists for `(account, signer)` — return `VALIDATION_FAILED`.
-3. Decode `(mode, executionCalldata)` from the UserOp's `execute()` calldata; reject anything that isn't a single-call `execute()` invocation (falls through to failure).
-4. Native asset send (`callData.length == 0 && value > 0`): assert session target is `address(0)` and the session is usable.
-5. Otherwise: assert `dest` matches the session's target, extract the selector, assert the session is usable and the selector is allowed.
-6. On success: write the pending-session transient slot, return packed time-bounded validation data.
-
-**Spending enforcement (`preCheck`, module type 4):** Called by the account right before the inner call executes. Consumes the pending-session transient slot; if empty (an owner-initiated call, or a UserOp validated by a different validator), it's a no-op. For pricing-exempt sessions, only auto-expiry cleanup runs. Otherwise, calls `SHValueInterpreter.computeUsdValue()` and either credits back `spentAmount` (for `removeLiquidity` variants) or reverts with `SessionHandlerModule_SpendingLimitExceeded` if the debit would exceed `spendingLimit`. Auto-revokes the session if it becomes inactive (expired or budget-exhausted) after this check.
+**Trusted-spender exemption (unpriced approvals).** An `approve` on a token the oracle can't price normally reverts (`TokenNotPriced`) — *unless* the spender is on the account's `trustedSpenders` list. This is the escape hatch that lets a Uniswap V2 **LP token** (which has no Chainlink feed) be approved to the router for `removeLiquidity`. The no-standing-approval and no-unlimited-approval rules still apply in full to trusted spenders — the exemption only skips the price check. The account auto-trusts the registry router at deploy; owners can add/remove others.
 
 ```solidity
-constructor(address registry);  // SHRegistry address
+constructor(address oracle);   // SHOracle address (immutable)
 
-function addSessionKey(address sessionKey, address target, bytes4[] calldata selectors, uint48 validFrom, uint48 validUntil, uint256 spendingLimit) external;
-function addUnpricedSessionKey(address sessionKey, address target, bytes4[] calldata selectors, uint48 validFrom, uint48 validUntil) external;
-function revokeSessionKey(address sessionKey) external;
+// IERC7579Module
+function onInstall(bytes calldata data) external;    // decodes (int256 dailyLimitUsd, uint256 windowDuration, address[] watchedTokens)
+function onUninstall(bytes calldata) external;        // wipes all per-account state
+function isModuleType(uint256 moduleTypeId) external pure returns (bool);   // true only for MODULE_TYPE_HOOK (4)
 
-function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash) external returns (uint256);
-function preCheck(address, uint256, bytes calldata msgData) external returns (bytes memory);
-function postCheck(bytes calldata) external;  // no-op — nothing to reconcile post-execution
+// Hook callbacks (called by the account around _execute)
+function preCheck(address, uint256, bytes calldata msgData) external returns (bytes memory hookData);
+function postCheck(bytes calldata hookData) external;
 
-function getSession(address account, address sessionKey) public view returns (Session memory);
-function isSessionActive(address account, address sessionKey) public view returns (bool);
-function getRemainingBudget(address account, address sessionKey) public view returns (uint256);
-function isSpendingWithinBudget(address account, address sessionKey, address token, uint256 amount) public view returns (bool);
-function pendingSessionKey(address account, bytes32 callHash) external view returns (address);
+// Config setters (onlyInstalled — the account calls these as itself, via SessionHandler passthroughs)
+function setDailyLimit(int256 dailyLimitUsd) external;
+function setWindowDuration(uint256 windowDuration) external;
+function addWatchedToken(address token) external;
+function removeWatchedToken(address token) external;
+function addTrustedSpender(address spender) external;
+function removeTrustedSpender(address spender) external;
 
-event SessionAdded(address indexed account, address indexed sessionKey, address indexed target, uint48 validUntil);
-event SessionRevoked(address indexed account, address indexed sessionKey);
+// Views (keyed by account)
+function getConfig(address account) external view returns (Config memory);
+function isWatched(address account, address token) external view returns (bool);
+function isTrustedSpender(address account, address spender) external view returns (bool);
+function getRemainingBudget(address account) external view returns (int256);
+
+event ConfigUpdated(address indexed account);
+event WatchedTokenAdded(address indexed account, address indexed token);
+event WatchedTokenRemoved(address indexed account, address indexed token);
+event TrustedSpenderAdded(address indexed account, address indexed spender);
+event TrustedSpenderRemoved(address indexed account, address indexed spender);
 ```
+
+**Native value IS metered.** preCheck snapshots the account's native balance and postCheck prices its net change through the `address(0)` sentinel feed, alongside the watched tokens — so a native send, and the native leg of a swap (e.g. `swapExactETHForTokens`), count against the cap. Gas is excluded: the ERC-4337 prefund leaves the account before preCheck and the refund settles to the EntryPoint deposit after postCheck, never touching the metered delta.
+
+**Deliberate v1 exclusions** (per design, not gaps): Permit2/permit-signature approvals and per-venue rate limits. Any unwatched ERC-20 sits outside the meter — the protection model is "watch the tokens you care about" (native and watched tokens are always metered).
 
 ---
 
@@ -345,64 +313,48 @@ event SessionRevoked(address indexed account, address indexed sessionKey);
 
 The project integrates the **ERC-8004** standard for on-chain agent identity and reputation.
 
-**Canonical registries (Sepolia / Mainnet):** On live networks, the UUPS-upgradeable registries deployed by the ERC-8004 working group are used. Their addresses are baked into `SHFactory` and `SessionHandler` at deployment time via `HelperConfig`.
+**Canonical registries (Sepolia / Mainnet):** On live networks, the UUPS-upgradeable registries deployed by the ERC-8004 working group are used, baked into `SHFactory` and `SessionHandler` at deployment via `HelperConfig`.
 
 | Contract | Sepolia | Mainnet |
 |---|---|---|
 | `IdentityRegistry` | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` |
 | `ReputationRegistry` | `0x8004B663056A597Dffe9eCcC1965A193B7388713` | `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63` |
 
-> BSC currently reuses the Mainnet ERC-8004 registry addresses in `HelperConfig.getBscConfig()` — confirm this is intentional (i.e. that the working group has deployed to the same addresses on BSC) before relying on it in production.
+> BSC currently reuses the Mainnet ERC-8004 registry addresses — confirm before relying on it in production.
 
-**`src/mocks/MockIdentityRegistry.sol`** — full non-upgradeable mock of the ERC-8004 Identity Registry for Anvil and unit tests. Implements all three `register()` overloads, `setAgentWallet` (EIP-712 + ERC-1271), `setMetadata`, `setAgentURI`, `getAgentWallet`, and `isAuthorizedOrOwner`. Clears `agentWallet` metadata on NFT transfer.
+`src/mocks/MockIdentityRegistry.sol` and `MockReputationRegistry.sol` are full non-upgradeable mocks for Anvil and unit tests. `DeploySHProtocol.s.sol` calls `IIdentityRegistry.register(AGENT_URI)` during deployment, minting the agent's identity NFT; the returned `agentId` is stored in `SHRegistry` and readable from any `SessionHandler` via `getAgentId()`.
 
-**`src/mocks/MockReputationRegistry.sol`** — mock of the ERC-8004 Reputation Registry for Anvil and unit tests.
-
-**`src/interfaces/IIdentityRegistry.sol`** — canonical ERC-8004 identity interface: `register()` (3 overloads), `setAgentURI`, `setMetadata`, `getMetadata`, `setAgentWallet`, `getAgentWallet`, `unsetAgentWallet`, `tokenURI`, `ownerOf`, `balanceOf`, `isAuthorizedOrOwner`.
-
-**`src/interfaces/IReputationRegistry.sol`** — canonical ERC-8004 reputation interface: `giveFeedback`, `getSummary`, `readAllFeedback`.
-
-**Agent registration** — `DeploySHProtocol.s.sol` calls `IIdentityRegistry.register(AGENT_URI)` during deployment, minting the agent's ERC-721 identity NFT. The returned `agentId` is stored in `SHRegistry` via the `SHTreasury` constructor and is readable from any `SessionHandler` via `getAgentId()`.
+Session-key calls to the Reputation Registry (`giveFeedback`) work without any special registration: `giveFeedback` moves no value, and the target is not a watched token, so the net-value meter simply charges nothing. (The old `addUnpricedSessionKey` escape hatch no longer exists — there's nothing per-target to exempt.)
 
 ---
 
 ## `HelperConfig.s.sol`
 
-`HelperConfig` resolves chain-specific deployment parameters at runtime, keeping deployment and test scripts chain-agnostic. Its `NetworkConfig` struct carries ~22 tokens and their Chainlink USD price feeds + heartbeats (stablecoins, majors, and a long tail — AAVE, LINK, 1INCH, APE, ARB, WBTC, COMP, CRV, ENS, SAND, SUSHI, wTAO, UNI, YFI, WAVAX, IMX, KNC, CAKE), plus the router and ERC-8004 registry addresses for the chain.
+`HelperConfig` resolves chain-specific deployment parameters at runtime. Its `NetworkConfig` struct carries ~22 tokens and their Chainlink USD price feeds + heartbeats, plus the router and ERC-8004 registry addresses.
 
 | Network | Chain ID | EntryPoint | Router |
 |---|---|---|---|
 | Ethereum Mainnet | 1 | `ENTRYPOINT_V07` (canonical) | Uniswap V2 |
 | Ethereum Sepolia | 11155111 | `ENTRYPOINT_V07` (canonical) | Uniswap V2 |
-| BSC (Binance Smart Chain) | 56 | `ENTRYPOINT_V07` (canonical) | PancakeSwap V2 |
+| BSC | 56 | `ENTRYPOINT_V07` (canonical) | PancakeSwap V2 |
 | Anvil (local) | 31337 | Freshly deployed, cached per session | none (`address(0)`) |
 
-`getConfigByChainId` falls back to `getMainnetConfig()` for any unrecognised chain ID rather than reverting — this means an unconfigured chain silently gets mainnet token/feed addresses, which is almost certainly wrong for that chain. Celo is not yet a recognised chain ID here.
-
-For Anvil, `HelperConfig` deploys a fresh `EntryPoint`, `MockV3Aggregator` price feeds seeded with approximate real-world prices for every registered token (ETH at $1000, USDC at $0.998, etc. — see `Constants.s.sol`), `MockIdentityRegistry`, and `MockReputationRegistry`, then caches the result for the rest of the session. All Anvil feed heartbeats are `HEARTBEAT_1H`.
-
-For Sepolia, only ETH, USDC, DAI, LINK, and BTC have real Chainlink feeds — everything else resolves to `address(0)` and is silently skipped by `SHOracle`'s constructor. Sepolia heartbeats use `HEARTBEAT_72H` across the board rather than matching each feed's real mainnet heartbeat — Sepolia's Chainlink nodes update noticeably less often than mainnet's (observed gaps of ~16-17h on the USDC/DAI feeds in practice; ETH/LINK/BTC typically stay under 1h), so a tighter window like `HEARTBEAT_1H` or even `HEARTBEAT_24H` produces spurious `SHOracle_StalePrice` reverts against a live fork. This is an accepted characteristic of testnet oracles, not a real staleness risk, since there's no real economic value at stake on Sepolia.
-
-For Mainnet and BSC, heartbeats are sourced per-feed from Chainlink's own published reference data (mostly `HEARTBEAT_1H` or `HEARTBEAT_24H`, with BSC's CAKE/USD feed getting a `HEARTBEAT_1H` safety buffer over its real ~1-minute heartbeat).
-
-`getMainnetConfig()`'s deployer account (`MAINNET_DEPLOYER_PK`) is a placeholder derived from `keccak256("session-handler-mainnet-deployer")` — **replace this with a real funded key before broadcasting an actual mainnet deployment.**
+`getConfigByChainId` falls back to `getMainnetConfig()` for any unrecognised chain ID. For Anvil, `HelperConfig` deploys a fresh `EntryPoint`, `MockV3Aggregator` feeds seeded with approximate real-world prices, and the ERC-8004 mocks (all inside `vm.startBroadcast`, so the mock token addresses land on-chain and are recoverable from the broadcast file). Sepolia uses a wide 72h heartbeat across the board (its Chainlink nodes update far less often than mainnet's — an accepted testnet characteristic). `MAINNET_DEPLOYER_PK` is a placeholder — replace it before a real mainnet deployment.
 
 ---
 
 ## `DeploySHProtocol.s.sol`
 
-Orchestrates deployment of all shared protocol infrastructure. Individual `SessionHandler` wallets are not deployed here — users call `SHFactory.deployWallet()` themselves.
+Orchestrates deployment of all shared infrastructure. Individual `SessionHandler` wallets are not deployed here — users call `SHFactory.deployWallet(...)`.
 
 **Deployment sequence:**
 
-1. Instantiate `HelperConfig` to resolve chain-specific addresses.
-2. Build parallel `(tokens, priceFeeds, heartbeats)` arrays from `config` — 20 slots, with the native-asset slot (index 0) pointing at the ETH/USD feed everywhere except BSC, where it points at the BNB/USD feed instead.
-3. Deploy `SHOracle(tokens, priceFeeds, heartbeats)`.
-4. Call `IIdentityRegistry.register(AGENT_URI)` to mint the agent's identity NFT and obtain `agentId`.
-5. Deploy `SHTreasury(initialFee, oracle, agentId, router)` — the treasury's constructor deploys its own `SHRegistry`.
-6. Deploy `SHValueInterpreter(treasury.REGISTRY())` and wire it in via `treasury.setCallValueInterpreter(interpreter)`.
-7. Deploy `SessionHandlerModule(treasury.REGISTRY())`.
-8. Deploy `SHFactory(entryPoint, treasury.REGISTRY(), reputationRegistry, identityRegistry, address(module))` — the module is set via the constructor, and the factory deploys the `SessionHandler` implementation it clones from internally.
+1. Instantiate `HelperConfig`; build parallel `(tokens, priceFeeds, heartbeats)` arrays.
+2. Deploy `SHOracle(tokens, priceFeeds, heartbeats)`.
+3. Call `IIdentityRegistry.register(AGENT_URI)` to mint the agent NFT and obtain `agentId`.
+4. Deploy `SHTreasury(initialFee, address(oracle), agentId, router)` — its constructor deploys `SHRegistry`.
+5. Deploy `SpendingLimitModule(address(oracle))` — **wired directly to the oracle** (no interpreter, and not the registry).
+6. Deploy `SHFactory(entryPoint, treasury.REGISTRY(), reputationRegistry, identityRegistry, address(module))` — the factory deploys the `SessionHandler` implementation it clones from internally.
 
 ```solidity
 function run() external returns (SHFactory factory, SHTreasury treasury, HelperConfig.NetworkConfig memory config, SHOracle oracle);
@@ -412,26 +364,28 @@ function run() external returns (SHFactory factory, SHTreasury treasury, HelperC
 
 ## `SendPackedUserOp.s.sol`
 
-A reusable script helper for constructing signed `PackedUserOperation`s, used by both the test suite and deployment tooling. Every UserOp it builds is a **session-key-signed** call to `execute(...)` — `SessionHandler` deliberately has no owner-validator module, since owner actions never route through the EntryPoint at all (owners call the account directly instead — see `SessionHandler.onlyEntryPointOrSelfOrOwner`).
+A reusable helper for constructing signed `PackedUserOperation`s, used by the test suite. Because the account installs no validator module, UserOp validation always falls through to the account's own `_rawSignatureValidation`, so this helper signs with **whatever key it's given** — the same flow covers owner-signed and session-key-signed ops.
 
 **Signing flow:**
-1. Fetch nonce from `EntryPoint.getNonce(sender, nonceKey)`, where `nonceKey`'s top 20 bytes equal the spending-limit module's address — `SessionHandler` dispatches UserOp validation to whichever validator module address is embedded in the nonce key.
-2. Pack `(dest, value, data)` into ERC-7579's single-execution calldata and wrap it in an `execute(mode, executionCalldata)` call.
+1. Fetch nonce from `EntryPoint.getNonce(sender, 0)`. (The nonce key's top bytes select a validator module; `address(0)` is never installed, so the account always falls back to self-validation. Any key value behaves identically — key 0 is the canonical choice.)
+2. Pack the execution into `execute(mode, executionCalldata)` calldata — single-call or batch.
 3. Get `userOpHash` from `EntryPoint.getUserOpHash(userOp)`.
-4. Wrap in EIP-191 envelope via `toEthSignedMessageHash`.
-5. Sign the digest with `vm.sign(sessionSignerKey, digest)`.
-6. Attach `(r, s, v)` signature to the UserOp.
+4. Wrap in the EIP-191 envelope via `toEthSignedMessageHash` (matching `_rawSignatureValidation`).
+5. Sign the digest and attach `(r, s, v)`.
 
 ```solidity
+// Single-call
 function generateSignedUserOp(
-    address sender,
-    HelperConfig.NetworkConfig memory config,
-    address spendingLimitModule,
-    address dest,
-    uint256 value,
-    bytes memory data,
-    address sessionSigner,
-    uint256 sessionSignerKey
+    address sender, HelperConfig.NetworkConfig memory config,
+    address dest, uint256 value, bytes memory data,
+    address signer, uint256 signerKey
+) external view returns (PackedUserOperation memory, bytes32 userOpHash, bytes32 digest);
+
+// Atomic batch (e.g. [approve router, swap] so the approval is consumed in one transaction)
+function generateSignedBatchUserOp(
+    address sender, HelperConfig.NetworkConfig memory config,
+    Execution[] memory executions,
+    address signer, uint256 signerKey
 ) external view returns (PackedUserOperation memory, bytes32 userOpHash, bytes32 digest);
 ```
 
@@ -439,53 +393,17 @@ function generateSignedUserOp(
 
 ## Test Suite
 
-**`test/unit/SHProtocolTest.t.sol`** — comprehensive coverage of the full `SessionHandler` + `SessionHandlerModule` lifecycle (58 tests).
+Totals: **60** unit + **13** guard + **8** invariant (local), and **33** fork (11 × 3 networks). All passing.
 
-| Category | Coverage |
-|---|---|
-| Access Control | Owner/non-owner permissions for `execute`, `installModule`/`uninstallModule`, `addSessionKey`, `revokeSessionKey`. Two distinct error types depending on the function: `Ownable.OwnableUnauthorizedAccount` for session management, OpenZeppelin's `Account.AccountUnauthorized` for `execute`/module install |
-| Session Validation | Time bounds, target matching, selector whitelisting, spending limits |
-| Signature Recovery | ECDSA recovery for session-key UserOps; owner-signed UserOps are rejected outright (no owner validator exists) |
-| ERC-4337 Flow | End-to-end `EntryPoint.handleOps()` for session-key execution |
-| Session Lifecycle | Activation, expiry, auto-revocation, budget exhaustion |
-| View Functions | `isSessionActive`, `getRemainingBudget`, `getSession`, `isSpendingWithinBudget` |
-| Events | `SessionAdded` and `SessionRevoked`, emitted by `SessionHandlerModule` |
+**`test/unit/SHProtocolTest.t.sol` (60 tests)** — deploy/factory config, module lifecycle (install/uninstall/reinstall, `isModuleType` hook-only), config setters (limit/window/watched-token cap, non-owner reverts), session-key allowlist, **net-value metering** (transfer pricing, inflow-offset within a tx, no-banked-credit across txs, window roll, per-token staleness isolation), **approvals** (unlimited rejected, standing reverts, consumed-in-same-tx passes, partial reverts, approve-then-zero), **trusted spenders** (Option C: unpriced approval allowed when trusted / reverts when untrusted, unlimited still rejected, standing still reverts, remove reinstates the price gate, uninstall clears), plus the harness calldata/approval-classifier tests. Uses a `MockSpender` to consume allowances mid-batch.
 
-**`test/fork/SHUniswapV2Test.t.sol`** — integration tests for all six Uniswap V2 swap functions plus liquidity operations against a live Ethereum mainnet fork.
+**`test/unit/SessionGuardTest.t.sol` (13 tests)** — drives real `EntryPoint.handleOps` end-to-end. Session-key UserOps attempting `uninstallModule`, `setDailyLimit`, `addSession`, or a batch smuggling a restricted target all fail with the admin state asserted **unchanged**; direct EntryPoint-pranked calls prove the exact guard errors (`SessionHandler_SessionRestrictedTarget`, `SessionHandler_SessionDelegateCallForbidden`); owner-direct calls bypass the guard; and unknown/removed signers fail validation with `AA24`.
 
-| Test | Swap Function |
-|---|---|
-| `testSwapExactTokensForTokensWithSession` | `swapExactTokensForTokens` |
-| `testSwapTokensForExactTokensWithSession` | `swapTokensForExactTokens` |
-| `testSwapEthForExactTokensWithSession` | `swapETHForExactTokens` |
-| `testSwapExactTokensForETHWithSession` | `swapExactTokensForETH` |
-| `testSwapTokensForExactETHWithSession` | `swapTokensForExactETH` |
-| `testSwapExactETHForTokensWithSession` | `swapExactETHForTokens` |
+> **Gotcha:** the vendored account-abstraction is EntryPoint **v0.9**, whose `nonReentrant` requires `tx.origin == msg.sender` — tests must submit `handleOps` with a two-arg `vm.prank(bundler, bundler)` (EOA bundler) or it reverts `Reentrancy()`.
 
-**`test/fork/SHPancakeswapV2Test.t.sol`** — a near-identical suite against a live BSC fork, exercising the same operations against PancakeSwap V2 (DAI/WBNB/PancakeSwap V2 Router/Factory), confirming `SHValueInterpreter`'s router handling is genuinely DEX-agnostic.
+**`test/fork/SHForkTestBase.sol` (10 tests, abstract)** + thin per-network instances **`SHUniswapV2Test`** (mainnet, WETH→DAI), **`SHSepoliaUniswapV2Test`** (Sepolia, WETH→USDC), and **`SHPancakeswapV2Test`** (BSC, USDT→WBNB→LINK multi-hop). Runs identically against the real router, live Chainlink feeds, and the canonical EntryPoint: wallet deploys with cap config, router auto-trusted; net-value metering at live prices; budget-exceeded reverts atomically; a real **session-key swap** metered by net portfolio change; standing/unlimited approvals rejected on a real DEX; a session op targeting the module reverts; a revoked key fails validation; and a full **`addLiquidity → removeLiquidity` round-trip** proving the unpriced LP-token approval flows through the auto-trusted router (BSC exercises the router's create-pair path). Metering assertions are computed from actual balance diffs priced through the deployed oracle, so they hold despite testnet pool-ratio divergence.
 
-**`test/fork/SHSepoliaUniswapV2Test.t.sol`** — a near-identical suite (23 tests) against a live Sepolia fork, exercising the same six swap functions plus liquidity operations against Sepolia's officially deployed Uniswap V2 Router/Factory (`SPO_UNISWAP_V2_ROUTER_02`/`SPO_UNISWAP_V2_FACTORY` in `Constants.s.sol`). Uses USDC/WETH/LINK — the three tokens with both an official Sepolia deployment and a live Chainlink feed — rather than mainnet's DAI/WETH/MKR. Absolute swap/liquidity amounts are sized against actual Sepolia pool reserves (checked at the time this suite was written; WETH/USDC is by far the deepest of the three pairs) rather than mainnet's much deeper liquidity, and several assertions compare against a router-computed quote rather than a hardcoded expected amount, since testnet pool ratios drift independently of the real Chainlink-priced USD budget accounting.
-
-**`test/fork/SHSepoliaTest.t.sol`** — integration tests against a live Sepolia fork.
-
-| Test | Description |
-|---|---|
-| `testSendingEthWithSession` | Sends 1 ETH via an ETH-session key; verifies budget deduction and recipient balance |
-| `testTransferERC20WithSession` | Transfers 20 LINK via a LINK-session key; verifies recipient balance |
-| `testGiveFeedbackWithSession` | Submits `giveFeedback` to the ERC-8004 Reputation Registry via an unpriced session key (`addUnpricedSessionKey`) |
-
-**`test/unit/SessionHandlerModuleHarness.sol`** — inherits `SessionHandlerModule` and re-exports internal functions (`_packValidationData`) as external for round-trip unit testing.
-
-**`test/invariant/`** — stateful invariant tests. `SHHandler` defines valid actions (`addSession`, `revokeSession`, `revokeSessionAsNonOwner`); `InvariantSH` asserts invariants hold across arbitrary action sequences:
-
-- `spentAmount` never exceeds `spendingLimit`
-- every registered session has `validFrom < validUntil`
-- revoked sessions report `isSessionActive == false`
-- `getRemainingBudget` is always consistent with raw storage
-- `isSpendingWithinBudget(key, address(0), 0)` agrees with storage
-- `address(0)` never holds an active session
-
-Run with 500 sequences × 100 calls each (`foundry.toml`'s `[invariant]` profile).
+**`test/invariant/` (8 invariants)** — `SHHandler` fuzzes owner executes (transfers, mint+transfer batches), config changes, non-owner attacks, session-key management, and time warps, maintaining a **ghost model** that independently replicates the module's roll-then-accumulate net metering. `InvariantSH` asserts, among others: `invariant_meteringMatchesGhostModel` (module `spentInWindow` equals the ghost exactly), spend never negative, config only ever changed by the owner, the hook stays installed, the watched list stays bounded/consistent, remaining-budget consistency, and the session allowlist matches ghost bookkeeping.
 
 ---
 
@@ -498,29 +416,16 @@ forge build
 # Run all local (non-fork) tests
 forge test
 
-# Verbose output
-forge test -vvvv
-
-# Specific test
-forge test --match-test testFunctionName -vvvv
-
-# Unit tests only
-make unit-test
+# Unit + guard suites only
+forge test --match-path "test/unit/*"
 
 # Invariant tests
-forge test --match-path test/invariant/InvariantSH.t.sol
+forge test --match-contract InvariantSH
 
-# Fork test — Uniswap V2 (Ethereum mainnet fork)
-make mainnet-uniswap-test
-
-# Fork test — Uniswap V2 (Sepolia fork)
-make sepolia-uniswap-test
-
-# Fork test — PancakeSwap V2 (BSC fork)
-make pancakeswap-test
-
-# Fork test — Sepolia (ETH/ERC20/reputation, not Uniswap)
-make sepolia-test
+# Fork tests (need the respective RPC in .env)
+make mainnet-uniswap-test    # Uniswap V2, mainnet fork
+make sepolia-uniswap-test    # Uniswap V2, Sepolia fork  (make sepolia-test is an alias)
+make pancakeswap-test        # PancakeSwap V2, BSC fork
 
 # Deploy shared protocol infrastructure
 forge script script/DeploySHProtocol.s.sol \

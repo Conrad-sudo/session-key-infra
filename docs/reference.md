@@ -10,7 +10,7 @@
 | `make mainnet-uniswap-test` | Run Uniswap V2 fork tests against `MAINNET_RPC_URL` |
 | `make sepolia-uniswap-test` | Run Uniswap V2 fork tests against `SEPOLIA_RPC_URL` (`test/fork/SHSepoliaUniswapV2Test.t.sol`) |
 | `make pancakeswap-test` | Run PancakeSwap V2 fork tests against `BSC_RPC_URL` |
-| `make sepolia-test` | Run Sepolia fork tests against `SEPOLIA_RPC_URL` (`test/fork/SHSepoliaTest.t.sol` — ETH/ERC20/reputation, not Uniswap) |
+| `make sepolia-test` | Alias of `make sepolia-uniswap-test` — the standalone Sepolia suite was folded into the shared fork base (`SHForkTestBase.sol`) |
 | `make snapshot` | Generate gas snapshot |
 | `make clean` | Remove build artifacts |
 | `make install` | Install Forge dependencies |
@@ -24,7 +24,7 @@
 | `make deploy [ARGS="sepolia-fork"]` | Deploy `DeploySHProtocol.s.sol` — `ARGS` selects the signer/broadcast target (see `docs/setup.md`) |
 | `make vault` | Configure Vault and refresh `.env` credentials |
 | `make db` | Initialise SQLite database and run migrations |
-| `make deploy-wallet [ARGS=<network>]` | Deploy a per-user `SessionHandler` and register session keys |
+| `make deploy-wallet [ARGS=<network>]` | Deploy a per-user `SessionHandler` (seeded with its USD spending cap) and register its single session key |
 | `make agent` | Start the agent in interactive CLI mode |
 | `make bot` | Start the Telegram bot |
 | `make setup ARGS=<network>` | Runs `deploy` → `fund` → `db` → `deploy-wallet` → `agent` in sequence for `<network>`, stopping on first failure. Assumes Vault is already running and configured (`make vault`) — not part of this chain since it persists across redeploys. Safe for all six networks (live `sepolia`/`bsc` included — `fund` no-ops on those). See `docs/setup.md`'s "Shortcut" callouts |
@@ -42,12 +42,12 @@ sh-protocol/
 │   ├── SHTreasury.sol
 │   ├── SHRegistry.sol
 │   ├── SHOracle.sol
-│   ├── SHValueInterpreter.sol
 │   ├── SessionHandler.sol
-│   ├── SessionHandlerModule.sol
+│   ├── SpendingLimitModule.sol
 │   ├── interfaces/
 │   │   ├── IWETH.sol
 │   │   ├── IERC20Extended.sol
+│   │   ├── AggregatorV3Interface.sol
 │   │   ├── IIdentityRegistry.sol
 │   │   └── IReputationRegistry.sol
 │   └── mocks/
@@ -64,12 +64,13 @@ sh-protocol/
 ├── test/
 │   ├── unit/
 │   │   ├── SHProtocolTest.t.sol
-│   │   └── SessionHandlerModuleHarness.sol
+│   │   ├── SessionGuardTest.t.sol
+│   │   └── SpendingLimitModuleHarness.sol
 │   ├── fork/
+│   │   ├── SHForkTestBase.sol
 │   │   ├── SHUniswapV2Test.t.sol
 │   │   ├── SHSepoliaUniswapV2Test.t.sol
-│   │   ├── SHPancakeswapV2Test.t.sol
-│   │   └── SHSepoliaTest.t.sol
+│   │   └── SHPancakeswapV2Test.t.sol
 │   └── invariant/
 │       ├── InvariantSH.t.sol
 │       └── SHHandler.sol

@@ -1,6 +1,6 @@
 # Vault & Session Key Security
 
-Session keys are cryptographic private keys that authorize an AI agent to sign ERC-4337 `UserOperation`s. Storing them on disk in plaintext is unacceptable — a single database breach would expose all keys for all users. This system uses **HashiCorp Vault Transit** (encryption-as-a-service) so that raw key material never touches disk.
+A session key is a cryptographic private key that authorizes an AI agent to sign ERC-4337 `UserOperation`s. Each wallet has exactly one session key (keyed to the wallet address in the `session_keys` table); it is a bare authorized signer, bounded on-chain by the wallet's USD spending cap and admin-surface guard rather than by any per-key scope. Storing it on disk in plaintext is unacceptable — a single database breach would expose the keys for all users — so this system uses **HashiCorp Vault Transit** (encryption-as-a-service) and raw key material never touches disk. The encryption mechanism below is unchanged from earlier designs; only *what the key is keyed to* changed (one key per wallet, not one per token/target).
 
 ## Environment Variables
 

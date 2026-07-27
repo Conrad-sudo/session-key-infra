@@ -2,9 +2,11 @@
 pragma solidity ^0.8.24;
 
 import {Test, StdInvariant} from "forge-std/Test.sol";
+import {MODULE_TYPE_HOOK} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
-import {SessionHandlerModule} from "../../src/SessionHandlerModule.sol";
+import {SpendingLimitModule} from "../../src/SpendingLimitModule.sol";
 import {ERC20Mock} from "../../src/mocks/ERC20Mock.sol";
+import {MockV3Aggregator} from "../../src/mocks/MockV3Aggregator.sol";
 import {SHOracle} from "../../src/SHOracle.sol";
 import {SHRegistry} from "../../src/SHRegistry.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
@@ -15,135 +17,132 @@ import {SHHandler} from "./SHHandler.sol";
 
 /**
  * @title InvariantSH
- * @notice Invariant test suite for SessionHandler.
- * @dev Session state lives in SessionHandlerModule (installed on sessionHandler as both
- *      validator and hook), so getSession/isSessionActive/getRemainingBudget/
- *      isSpendingWithinBudget here are all passthroughs to that module rather than reading
- *      sessionHandler's own storage directly -- but the assertions are identical, since the
- *      view semantics are the same.
+ * @notice Invariant suite for the USD-spending-cap design. The handler fuzzes owner executes
+ *         (transfers, mint+transfer batches), config changes, non-owner attacks, session-key
+ *         management, and time warps; these invariants then pin down the properties the module
+ *         must never lose.
  *
  * Run with:
  *   forge test --match-contract InvariantSH -vv
- *   forge test --match-contract InvariantSH --fuzz-runs 1000 -vv
  */
 contract InvariantSH is StdInvariant, Test {
-    SessionHandler sessionHandler;
+    SessionHandler wallet;
+    SpendingLimitModule module;
     SHHandler handler;
     ERC20Mock usdc;
+    ERC20Mock dai;
     SHOracle oracle;
-    SHRegistry feeRegistry;
     HelperConfig.NetworkConfig config;
+
+    int256 constant DAILY_LIMIT = 5000e18;
+    uint256 constant WINDOW = 1 days;
 
     function setUp() public {
         DeploySHProtocol deployer = new DeploySHProtocol();
         SHFactory factory;
         SHTreasury treasury;
         (factory, treasury, config, oracle) = deployer.run();
-        feeRegistry = SHRegistry(treasury.REGISTRY());
-        vm.prank(config.account);
-        sessionHandler = SessionHandler(payable(factory.deployWallet()));
+        module = SpendingLimitModule(factory.spendingLimitModule());
         usdc = ERC20Mock(config.usdc);
+        dai = ERC20Mock(config.dai);
 
-        vm.deal(address(sessionHandler), 1 ether);
-        usdc.mint(address(sessionHandler), 10_000e6);
+        address[] memory watched = new address[](2);
+        watched[0] = address(usdc);
+        watched[1] = address(dai);
+        vm.prank(config.account);
+        wallet = SessionHandler(payable(factory.deployWallet(DAILY_LIMIT, WINDOW, watched)));
 
-        handler = new SHHandler(sessionHandler, usdc, sessionHandler.owner());
+        vm.deal(address(wallet), 100 ether);
+        usdc.mint(address(wallet), 1_000_000e6);
+        dai.mint(address(wallet), 1_000_000e18);
+
+        handler = new SHHandler(
+            wallet,
+            module,
+            oracle,
+            usdc,
+            dai,
+            MockV3Aggregator(config.usdcUsdPriceFeed),
+            config.account
+        );
 
         targetContract(address(handler));
     }
 
-    // ──────────────────────────────────────────────
-    //  Invariants
-    // ──────────────────────────────────────────────
+    /*//////////////////////////////////////////////////////////////
+                               INVARIANTS
+    //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @notice spentAmount must never exceed spendingLimit.
-     * @dev This is the core financial safety invariant. If broken, a session key
-     *      could drain more funds than its owner authorised.
-     */
-    function invariant_spentAmountNeverExceedsLimit() public view {
+    /// @notice The core financial safety property: within a live window the module never records
+    ///         more net spending than the cap in force allowed when the spend landed. Since every
+    ///         over-budget execute reverts atomically, spentInWindow may only exceed the CURRENT
+    ///         limit if the owner lowered the limit afterwards — which the ghost model tracks, so
+    ///         equality with the ghost (checked below) is the strict form of this invariant.
+    function invariant_spentNeverNegative() public view {
+        assertGe(module.getConfig(address(wallet)).spentInWindow, 0, "spentInWindow went negative");
+    }
+
+    /// @notice The module's metering must agree EXACTLY with an independent replica of its own
+    ///         rules (roll-then-accumulate, oracle-priced net outflow, floor at net inflow).
+    function invariant_meteringMatchesGhostModel() public view {
+        assertEq(
+            module.getConfig(address(wallet)).spentInWindow,
+            handler.ghostSpent(),
+            "module metering diverged from ghost model"
+        );
+    }
+
+    /// @notice Config scalars only ever change through the owner path the ghost mirrors: if a
+    ///         non-owner write ever landed, these diverge.
+    function invariant_configOnlyChangedByOwner() public view {
+        SpendingLimitModule.Config memory cfg = module.getConfig(address(wallet));
+        assertEq(cfg.dailyLimitUsd, handler.ghostLimit(), "dailyLimit changed outside owner path");
+        assertEq(uint256(cfg.windowDuration), handler.ghostWindowDuration(), "window changed outside owner path");
+    }
+
+    /// @notice The spending-cap hook must stay installed and configured — nothing the handler does
+    ///         (short of the owner uninstalling, which it never does) may remove it.
+    function invariant_hookStaysInstalled() public view {
+        assertTrue(wallet.isModuleInstalled(MODULE_TYPE_HOOK, address(module), ""), "hook uninstalled");
+        assertTrue(module.getConfig(address(wallet)).installed, "module config lost");
+    }
+
+    /// @notice The watched list stays within its gas bound and consistent with the membership map.
+    function invariant_watchedListBoundedAndConsistent() public view {
+        SpendingLimitModule.Config memory cfg = module.getConfig(address(wallet));
+        assertLe(cfg.watchedTokens.length, 32, "watched list exceeded MAX_WATCHED_TOKENS");
+        for (uint256 i = 0; i < cfg.watchedTokens.length; i++) {
+            assertTrue(
+                module.isWatched(address(wallet), cfg.watchedTokens[i]), "list entry missing from membership map"
+            );
+        }
+        // USDC is never removed by the handler, so it must still be watched (metering stayed live).
+        assertTrue(module.isWatched(address(wallet), address(usdc)), "USDC fell off the watched list");
+    }
+
+    /// @notice getRemainingBudget must agree with raw config state under the same window-expiry
+    ///         rule the module itself applies.
+    function invariant_remainingBudgetConsistent() public view {
+        SpendingLimitModule.Config memory cfg = module.getConfig(address(wallet));
+        bool expired = block.timestamp >= uint256(cfg.windowStart) + uint256(cfg.windowDuration);
+        int256 spent = expired ? int256(0) : cfg.spentInWindow;
+        int256 expected = spent >= cfg.dailyLimitUsd ? int256(0) : cfg.dailyLimitUsd - spent;
+        assertEq(wallet.getRemainingBudget(), expected, "remaining budget inconsistent with config");
+    }
+
+    /// @notice The session allowlist matches the ghost bookkeeping of owner adds/removes.
+    function invariant_sessionAllowlistMatchesGhost() public view {
         uint256 n = handler.sessionKeyCount();
-        for (uint256 i; i < n; i++) {
+        for (uint256 i = 0; i < n; i++) {
             address key = handler.sessionKeys(i);
-            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
-            assertLe(s.spentAmount, s.spendingLimit, "spentAmount > spendingLimit");
+            assertEq(wallet.allowedSession(key), handler.expectedAllowed(key), "session allowlist diverged");
         }
     }
 
-    /**
-     * @notice Every successfully registered session must have validFrom < validUntil.
-     * @dev addSessionKey reverts on violated time range, so any persisted session
-     *      must satisfy this. A ghost session with inverted timestamps would indicate
-     *      a storage-write bug.
-     */
-    function invariant_validTimeRangeForAllSessions() public view {
-        uint256 n = handler.sessionKeyCount();
-        for (uint256 i; i < n; i++) {
-            address key = handler.sessionKeys(i);
-            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
-            // spendingLimit == 0 means the session was revoked/deleted — skip the zero struct
-            if (s.spendingLimit == 0) continue;
-            assertLt(s.validFrom, s.validUntil, "validFrom >= validUntil");
-        }
-    }
-
-    /**
-     * @notice Revoked sessions (active == false) must report inactive.
-     * @dev Tests that revokeSessionKey cannot be bypassed and that isSessionActive
-     *      correctly reads the active flag.
-     */
-    function invariant_revokedSessionsAreInactive() public view {
-        uint256 n = handler.sessionKeyCount();
-        for (uint256 i; i < n; i++) {
-            address key = handler.sessionKeys(i);
-            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
-            if (!s.active) {
-                assertFalse(sessionHandler.isSessionActive(key), "revoked session reported active");
-            }
-        }
-    }
-
-    /**
-     * @notice getRemainingBudget must equal spendingLimit - spentAmount, clamped to 0.
-     * @dev Verifies that the view function is consistent with raw storage.
-     */
-    function invariant_remainingBudgetConsistency() public view {
-        uint256 n = handler.sessionKeyCount();
-        for (uint256 i; i < n; i++) {
-            address key = handler.sessionKeys(i);
-            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
-            uint256 remaining = sessionHandler.getRemainingBudget(key);
-
-            if (s.spentAmount >= s.spendingLimit) {
-                assertEq(remaining, 0, "remaining should be 0 when limit exhausted");
-            } else {
-                assertEq(remaining, s.spendingLimit - s.spentAmount, "remaining != limit - spent");
-            }
-        }
-    }
-
-    /**
-     * @notice isSessionWithinBudget(key, 0) must agree with raw storage.
-     * @dev isSessionWithinBudget checks spentAmount + value <= spendingLimit.
-     *      With value == 0 this is equivalent to spentAmount <= spendingLimit.
-     */
-    function invariant_budgetCheckAgreesWithStorage() public view {
-        uint256 n = handler.sessionKeyCount();
-        for (uint256 i; i < n; i++) {
-            address key = handler.sessionKeys(i);
-            SessionHandlerModule.Session memory s = sessionHandler.getSession(key);
-            if (!s.active) continue;
-
-            bool withinBudget = sessionHandler.isSpendingWithinBudget(key, address(0), 0);
-            assertEq(withinBudget, s.spentAmount <= s.spendingLimit, "isSessionWithinBudget disagrees with storage");
-        }
-    }
-
-    /**
-     * @notice address(0) must never have a session stored with active == true.
-     * @dev addSessionKey rejects address(0) — this verifies that invariant is preserved.
-     */
-    function invariant_zeroAddressNeverHasActiveSession() public view {
-        assertFalse(sessionHandler.getSession(address(0)).active, "address(0) has an active session");
+    /// @notice Window bookkeeping stays sane: a positive duration and a start not in the future.
+    function invariant_windowFieldsSane() public view {
+        SpendingLimitModule.Config memory cfg = module.getConfig(address(wallet));
+        assertGt(uint256(cfg.windowDuration), 0, "zero window duration");
+        assertLe(uint256(cfg.windowStart), block.timestamp, "windowStart in the future");
     }
 }

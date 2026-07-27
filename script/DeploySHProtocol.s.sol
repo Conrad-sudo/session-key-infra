@@ -5,15 +5,14 @@ import {HelperConfig} from "./HelperConfig.s.sol";
 import {SHOracle} from "../src/SHOracle.sol";
 import {SHTreasury} from "../src/SHTreasury.sol";
 import {SHFactory} from "../src/SHFactory.sol";
-import {SHValueInterpreter} from "../src/SHValueInterpreter.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
-import {SessionHandlerModule} from "../src/SessionHandlerModule.sol";
+import {SpendingLimitModule} from "../src/SpendingLimitModule.sol";
 import "./Constants.s.sol";
 /**
  * @title DeploySHProtocol
  * @notice Deployment script for the SessionHandler protocol's shared infrastructure
  * @dev Retrieves network configuration from HelperConfig and deploys the SHOracle,
- *      SHTreasury (which deploys its own SHRegistry), SessionHandlerModule, and SHFactory.
+ *      SHTreasury (which deploys its own SHRegistry), SpendingLimitModule, and SHFactory.
  *      Individual SessionHandler wallets are deployed later via SHFactory.deployWallet().
  *
  *      Deployment is broadcast as config.account so that account becomes the
@@ -138,12 +137,8 @@ contract DeploySHProtocol is Script {
         // SHTreasury deploys the SHRegistry in its constructor.
         treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId, config.router);
 
-        // deploy value interpreter and wire it into the registry
-        SHValueInterpreter interpreter = new SHValueInterpreter(treasury.REGISTRY());
-        treasury.setCallValueInterpreter(address(interpreter));
-
-        // deploy the ERC-7579 spending-limit module, wired to the same registry
-        SessionHandlerModule module = new SessionHandlerModule(treasury.REGISTRY());
+        // deploy the ERC-7579 spending-limit module, wired to the price oracle it values tokens with
+        SpendingLimitModule module = new SpendingLimitModule(address(oracle));
 
         //deploy factory (module set via constructor; deploys the SessionHandler implementation internally)
         factory = new SHFactory(

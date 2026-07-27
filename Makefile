@@ -47,8 +47,9 @@ sepolia-uniswap-test:
 pancakeswap-test:
 	forge test --match-path test/fork/SHPancakeswapV2Test.t.sol --fork-url $(BSC_RPC_URL) -vvvv
 
-sepolia-test:
-	forge test --match-path test/fork/SHSepoliaTest.t.sol --fork-url $(SEPOLIA_RPC_URL) -vvvv
+# SHSepoliaTest.t.sol was folded into the shared fork base (identity/reputation checks now run
+# on every network), so sepolia-test is an alias of sepolia-uniswap-test.
+sepolia-test: sepolia-uniswap-test
 
 
 # ── Forking ────────────────────────────────────────────────────────────────────

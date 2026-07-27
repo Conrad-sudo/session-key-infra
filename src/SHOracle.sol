@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 /**
@@ -14,7 +14,15 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
  *
  *      Supports native ETH (sentinel address(0)) and any registered ERC-20 token.
  *      Token decimals are read on-chain via IERC20Metadata; ETH is hardcoded to 18.
- *      Tokens with no registered feed revert with SHOracle_UnsupportedToken.
+ *      Tokens with no registered feed revert with PriceOracle_UnsupportedToken.
+ *
+ *      Staleness is enforced per feed via a heartbeat set once at construction, not a
+ *      caller-supplied age: a Chainlink feed's real staleness ceiling IS its heartbeat (how
+ *      often its node network commits to updating it), so a caller-chosen threshold tighter
+ *      than that would revert constantly for no reason, and looser is meaningless since the
+ *      feed can never be fresher than its own heartbeat regardless. This differs from a pull
+ *      oracle like Pyth, where "how recent" is genuinely caller-choosable since anyone can pay
+ *      to submit a fresh update at any time.
  */
 contract SHOracle {
     /*//////////////////////////////////////////////////////////////
@@ -22,17 +30,17 @@ contract SHOracle {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Reverts when an unsupported token address is provided
-    error SHOracle_UnsupportedToken();
+    error PriceOracle_UnsupportedToken();
 
     /// @dev Reverts when a Chainlink price feed has not been updated within its configured heartbeat
-    error SHOracle_StalePrice();
+    error PriceOracle_StalePrice();
 
     /// @dev Reverts when a Chainlink feed reports a non-positive price (0 or negative). This signals a
     ///      feed malfunction, not a real quote, and must be rejected before the cast to uint256.
-    error SHOracle_InvalidPrice();
+    error PriceOracle_InvalidPrice();
 
     /// @dev Reverts when the tokens and priceFeeds constructor arrays have different lengths
-    error SHOracle_ArrayLengthMismatch();
+    error PriceOracle_ArrayLengthMismatch();
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -41,18 +49,27 @@ contract SHOracle {
     /// @notice Sentinel value for native ETH (used instead of an actual token address)
     address private constant ETH_TOKEN_ADDRESS = address(0);
 
-    /// @notice Maps each registered token address to its Chainlink USD price feed address
-    /// @dev Populated once in the constructor. Unregistered tokens map to address(0).
-    mapping(address => address) private sPriceFeed;
+    /// @notice Everything getPrice needs for one token, packed into a single 32-byte storage slot.
+    /// @dev address(20) + uint8(1) + uint48(6) = 27 bytes, so a getPrice reads ONE slot instead of
+    ///      two separate mappings, and `decimals` is cached here at construction so getPrice no
+    ///      longer makes an external IERC20Metadata.decimals() call into an arbitrary token on
+    ///      every valuation. A uint48 heartbeat holds ~8.9 million years of seconds — Chainlink
+    ///      heartbeats are hours-to-days, so there is no practical ceiling being given up.
+    struct Feed {
+        address feed; // Chainlink USD price feed for this token; address(0) means "not registered"
+        uint8 decimals; // the token's own ERC-20 decimals (18 for native ETH), cached at construction
+        uint48 heartbeat; // this feed's staleness ceiling in seconds (its Chainlink-published heartbeat)
+    }
 
-    /// @notice Maps each registered price feed address to its expected heartbeat interval in seconds
-    /// @dev Chainlink heartbeats vary per feed: volatile assets update hourly, stablecoins every 23–24 hours.
+    /// @notice Maps each registered token address to its packed Feed record.
+    /// @dev Populated once in the constructor. Unregistered tokens map to a zeroed Feed (feed == address(0)).
+    ///      Chainlink heartbeats vary per feed: volatile assets update hourly, stablecoins every 23–24 hours.
     ///      Using a uniform timeout would either flag stablecoin feeds as stale or mask genuinely stale volatile feeds.
-    mapping(address => uint256) private sHeartbeat;
+    mapping(address => Feed) private sFeeds;
 
     /// @notice Multiplier to convert Chainlink's 8-decimal prices to 18-decimal precision
     /// @dev Chainlink returns prices with 8 decimals. Multiply by 1e10 to get 18 decimals.
-    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+    int256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
 
     /*//////////////////////////////////////////////////////////////
                              CONSTRUCTOR
@@ -74,12 +91,15 @@ contract SHOracle {
      */
     constructor(address[] memory tokens, address[] memory priceFeeds, uint256[] memory heartbeats) {
         if (tokens.length != priceFeeds.length || priceFeeds.length != heartbeats.length) {
-            revert SHOracle_ArrayLengthMismatch();
+            revert PriceOracle_ArrayLengthMismatch();
         }
         for (uint256 i = 0; i < tokens.length; i++) {
             if (priceFeeds[i] != address(0)) {
-                sPriceFeed[tokens[i]] = priceFeeds[i];
-                sHeartbeat[priceFeeds[i]] = heartbeats[i];
+                // Native ETH has no contract to query; every other token exposes its own decimals.
+                uint8 tokenDecimals = tokens[i] == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(tokens[i]).decimals();
+                // Heartbeats are small (hours-to-days in seconds); this cast can never truncate a real feed config.
+                sFeeds[tokens[i]] =
+                    Feed({feed: priceFeeds[i], decimals: tokenDecimals, heartbeat: uint48(heartbeats[i])});
             }
         }
     }
@@ -88,19 +108,9 @@ contract SHOracle {
                         EXTERNAL FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @notice Returns the current USD price of a token from its registered Chainlink feed
-     * @dev Reverts if the token has no registered feed or the price is stale.
-     *
-     * @param token     Token address. Use address(0) for native ETH.
-     * @return price    The current price with 8 decimals (Chainlink standard).
-     * @return decimals The decimal count of the returned price (always 8 for Chainlink USD feeds).
-     */
-    function getPrice(address token) external view returns (uint256 price, uint8 decimals) {
-        address feed = sPriceFeed[token];
-        if (feed == address(0)) revert SHOracle_UnsupportedToken();
-        price = _stalePriceCheck(feed);
-        decimals = AggregatorV3Interface(feed).decimals();
+    /// @dev True if `token` has a registered Chainlink price feed (i.e. is safe to price via getPrice).
+    function isPriced(address token) external view returns (bool) {
+        return sFeeds[token].feed != address(0);
     }
 
     /**
@@ -118,38 +128,41 @@ contract SHOracle {
      * @param amount Amount of the token in its native base units.
      * @return       USD value with 18 decimals of precision.
      */
-    function getUsdValue(address token, uint256 amount) external view returns (uint256) {
-        address feed = sPriceFeed[token];
-        if (feed == address(0)) revert SHOracle_UnsupportedToken();
+    function getPrice(address token, uint256 amount) external view returns (int256) {
+        Feed memory f = sFeeds[token]; // single SLOAD: feed + decimals + heartbeat all in one slot
+        if (f.feed == address(0)) revert PriceOracle_UnsupportedToken();
 
-        uint256 price = _stalePriceCheck(feed);
-        uint8 decimals = token == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(token).decimals();
+        int256 price = _stalePriceCheck(f.feed, f.heartbeat);
 
-        return (amount * price * ADDITIONAL_FEED_PRECISION) / (10 ** decimals);
+        // amount is a token balance/allowance that cannot approach 2**255, so the cast never truncates.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return (int256(amount) * price * ADDITIONAL_FEED_PRECISION) / int256(10 ** f.decimals);
     }
 
     /**
      * @dev Validates Chainlink price feed freshness and returns the current price
      * @param priceFeed Address of the Chainlink price feed to query
+     * @param heartbeat This feed's staleness ceiling in seconds (passed in from the packed Feed
+     *                  record so this function makes no extra storage read of its own)
      * @return price    The current price with 8 decimals (Chainlink standard)
      *
-     * @notice Reverts with SHOracle_StalePrice if the feed has not updated within TIMEOUT.
+     * @notice Reverts with PriceOracle_StalePrice if the feed has not updated within its heartbeat.
      *
      * Why this matters: stale price data can lead to incorrect USD conversions. For instance,
      * if ETH crashes from $2500 to $1500 but the feed has not updated in 5 hours, using the
      * stale price would incorrectly value ETH and may allow overspending beyond session limits.
      */
-    function _stalePriceCheck(address priceFeed) internal view returns (uint256) {
+    function _stalePriceCheck(address priceFeed, uint256 heartbeat) internal view returns (int256) {
         (, int256 price,, uint256 updatedAt,) = AggregatorV3Interface(priceFeed).latestRoundData();
 
-        if (block.timestamp - updatedAt > sHeartbeat[priceFeed]) {
-            revert SHOracle_StalePrice();
+        if (block.timestamp - updatedAt > heartbeat) {
+            revert PriceOracle_StalePrice();
         }
         // A non-positive price is a feed malfunction, not a real quote; reject it before the cast
         // below would turn a negative value into an enormous uint that wildly mis-prices the call.
-        if (price <= 0) revert SHOracle_InvalidPrice();
+        if (price <= 0) revert PriceOracle_InvalidPrice();
 
         // forge-lint: disable-next-line(unsafe-typecast)
-        return uint256(price);
+        return price;
     }
 }

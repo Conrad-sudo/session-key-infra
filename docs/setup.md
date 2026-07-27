@@ -19,13 +19,13 @@ Before running any setup, make sure you have completed the one-time steps:
 Every network (Anvil, Ethereum mainnet fork, Sepolia fork, live Sepolia, BSC fork, live BSC) follows the same six steps. The sections below give the exact commands for each network — this is the shape of what's happening and why the order matters:
 
 1. **Start the network** — `make anvil`, `make mainnet-fork`, `make sepolia-fork`, or `make bsc-fork`. This must be running before anything else, since every later step talks to it over RPC. (Live deployments skip this — there's no local node to start.)
-2. **Deploy the shared protocol** — `make deploy ARGS="<network>"`. Runs `script/DeploySHProtocol.s.sol`, which deploys the infrastructure shared by all users: `EntryPoint`, mocks (on Anvil), `SHOracle`, `SHTreasury`, `SHRegistry`, `SHValueInterpreter`, `SessionHandlerModule`, and `SHFactory` (wired to the module via `setSpendingLimitModule`). Only needs to be re-run when this infra doesn't exist yet on the target chain (e.g. after restarting Anvil, which wipes all chain state).
+2. **Deploy the shared protocol** — `make deploy ARGS="<network>"`. Runs `script/DeploySHProtocol.s.sol`, which deploys the infrastructure shared by all users: `EntryPoint`, mocks (on Anvil), `SHOracle`, `SHTreasury`, `SHRegistry`, `SpendingLimitModule`, and `SHFactory` (with the module set via the factory constructor). Only needs to be re-run when this infra doesn't exist yet on the target chain (e.g. after restarting Anvil, which wipes all chain state).
 3. **Start and configure Vault** — start the Vault Docker container, then run `make vault`. Vault holds the Transit key that encrypts/decrypts session keys; it must be ready before any session key is created in step 5.
 4. **Sync the database** — `make db`. Seeds reference data (token addresses, selectors, RPC URLs, Chainlink feed addresses) and, critically, reads the `SHFactory` address out of the Forge broadcast file written in step 2 (`broadcast/DeploySHProtocol.s.sol/<chain_id>/run-latest.json`) into the `factory` table. This step must run *after* step 2 — `deploy_wallet.py` resolves the factory address from the DB, not from the broadcast file directly. Safe to re-run any time; it's idempotent.
 
-   > **Watch for stale addresses.** Every re-run of `forge script script/DeploySHProtocol.s.sol --broadcast` on the same chain overwrites that chain's `run-latest.json` with a fresh set of addresses (new nonces → different addresses for every contract, including `SHFactory`). If you deploy again without re-running `make db`, the DB keeps pointing at the old (now-wrong) addresses — this can fail in a confusing way, since the old address might still have *some* contract's bytecode at it (e.g. a previous deployment's `SessionHandlerModule`), producing an empty-revert rather than an obvious "no code" error.
+   > **Watch for stale addresses.** Every re-run of `forge script script/DeploySHProtocol.s.sol --broadcast` on the same chain overwrites that chain's `run-latest.json` with a fresh set of addresses (new nonces → different addresses for every contract, including `SHFactory`). If you deploy again without re-running `make db`, the DB keeps pointing at the old (now-wrong) addresses — this can fail in a confusing way, since the old address might still have *some* contract's bytecode at it (e.g. a previous deployment's `SpendingLimitModule`), producing an empty-revert rather than an obvious "no code" error.
 
-5. **Deploy your wallet** — `make deploy-wallet ARGS="<network>"`. Calls `SHFactory.deployWallet()` to create a per-user `SessionHandler` (with `SessionHandlerModule` auto-installed as both validator and hook), funds it with 10 ETH (and the bundler, on forks), and registers a default set of session keys.
+5. **Deploy your wallet** — `make deploy-wallet ARGS="<network>"`. Calls `SHFactory.deployWallet(dailyLimitUsd, windowDuration, watchedTokens)` to create a per-user `SessionHandler` (with `SpendingLimitModule` installed as a spending-cap hook and seeded with a $50k/24h cap over the network's default watched tokens), funds it with 10 ETH (and the bundler, on forks), and registers the wallet's single session key via `addSession`.
 
    > **`ARGS` here must exactly match** the network you started in step 1 and deployed to in step 2 (`"anvil"`, `"mainnet-fork"`, `"sepolia-fork"`, `"sepolia"`, `"bsc-fork"`, or `"bsc"`) — `deploy_wallet.py`'s `deploy()` dispatcher passes it straight through to `network`. If it doesn't match, the script will look up the wrong factory address (or none at all) and fail. Omitting `ARGS` defaults to `"anvil"`, matching `make deploy`'s own no-`ARGS` default.
 
@@ -60,7 +60,7 @@ make anvil
 make deploy
 ```
 
-(No `ARGS` needed — the default `NETWORK_ARGS` in the Makefile already points at `http://127.0.0.1:8545` with the Anvil default account.) This deploys the full mock stack (EntryPoint, ERC20Mocks, MockV3Aggregators, MockIdentityRegistry, MockReputationRegistry, SHOracle, SHTreasury, SHRegistry, SHValueInterpreter, SHFactory).
+(No `ARGS` needed — the default `NETWORK_ARGS` in the Makefile already points at `http://127.0.0.1:8545` with the Anvil default account.) This deploys the full mock stack (EntryPoint, ERC20Mocks, MockV3Aggregators, MockIdentityRegistry, MockReputationRegistry, SHOracle, SHTreasury, SHRegistry, SpendingLimitModule, SHFactory).
 
 **Step 3 — Start and configure Vault:**
 
@@ -233,7 +233,7 @@ make bot
 make agent
 ```
 
-> Uniswap V2 is officially deployed on Sepolia. ETH, WETH, LINK, Uniswap V2 Router, and Reputation Registry sessions are all registered by default — see [docs/app.md](app.md#deploy_walletpy) for the exact selector sets.
+> Uniswap V2 is officially deployed on Sepolia, so swap/liquidity tools work here. The wallet is seeded with a $50k/24h USD cap over the default Sepolia watched tokens (WETH, USDC, LINK) and one session key that can drive any of them — see [docs/app.md](app.md#deploy_walletpy).
 
 > **Shortcut — full setup in two commands** (once Vault, step 3, is configured):
 >
@@ -289,7 +289,7 @@ make db
 make deploy-wallet ARGS="bsc-fork"
 ```
 
-Registers ETH-sentinel (native BNB), WBNB, USDC, PancakeSwap V2 Router, and Reputation Registry sessions by default — see [docs/app.md](app.md#deploy_walletpy) for the exact selector sets.
+Seeds the wallet with a $50k/24h USD cap over the default BSC watched tokens (WBNB, USDC, USDT) and one session key — see [docs/app.md](app.md#deploy_walletpy).
 
 **Step 6 — Start:**
 
@@ -350,7 +350,7 @@ make deploy-wallet ARGS="sepolia"
 
 On Sepolia, `live_network.py` submits UserOps through the Alchemy bundler — no local bundler key is used. If `ETHERSCAN_API_KEY` is set, both `SHOracle` and `SessionHandler` are automatically verified on Etherscan after deployment.
 
-> Uniswap V2 is officially deployed on Sepolia, so swap, liquidity, and quote tools are available here too — a `uniswapv2_router` session key is registered by default alongside ETH, WETH, LINK, and Reputation Registry.
+> Uniswap V2 is officially deployed on Sepolia, so swap, liquidity, and quote tools are available here too. The wallet is seeded with a $50k/24h USD cap over WETH/USDC/LINK and one session key that can drive any external call within that cap.
 
 **Step 5 — Start:**
 
@@ -374,7 +374,7 @@ make agent
 | `IdentityRegistry` (canonical ERC-8004) | `0x8004A818BFB912233c491871b3d84c89A494BD9e` |
 | `ReputationRegistry` (canonical ERC-8004) | `0x8004B663056A597Dffe9eCcC1965A193B7388713` |
 
-> `SessionHandler`, `SessionHandlerModule`, and `SHOracle` addresses are deployment-specific and intentionally omitted here — they change on every fresh `forge script --broadcast` run (different deployer nonces). After running `make deploy ARGS="sepolia"`, the fresh addresses are in the Forge broadcast file (`broadcast/DeploySHProtocol.s.sol/11155111/run-latest.json`) and get synced into `wallet.db` by `make db`.
+> `SessionHandler`, `SpendingLimitModule`, and `SHOracle` addresses are deployment-specific and intentionally omitted here — they change on every fresh `forge script --broadcast` run (different deployer nonces). After running `make deploy ARGS="sepolia"`, the fresh addresses are in the Forge broadcast file (`broadcast/DeploySHProtocol.s.sol/11155111/run-latest.json`) and get synced into `wallet.db` by `make db`.
 
 ---
 

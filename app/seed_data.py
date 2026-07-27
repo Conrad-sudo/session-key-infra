@@ -17,34 +17,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# ── Function selectors ────────────────────────────────────────────────────────
-
-ERC20_SELECTORS = {
-    "transfer": "0xa9059cbb",
-    "balanceOf": "0x70a08231",
-    "approve": "0x095ea7b3",
-    "allowance": "0xdd62ed3e",
-    "transferFrom": "0x23b872dd",
-    "deposit": "0xd0e30db0",  # WETH/WBNB wrap
-    "withdraw": "0x2e1a7d4d",  # WETH/WBNB unwrap
-}
-
-UNISWAPV2_SELECTORS = {
-    "swapETHForExactTokens": "0xfb3bdb41",
-    "swapExactTokensForTokens": "0x38ed1739",
-    "swapTokensForExactTokens": "0x8803dbee",
-    "swapExactTokensForETH": "0x18cbafe5",
-    "swapExactETHForTokens": "0x7ff36ab5",
-    "swapTokensForExactETH": "0x4a25d94a",
-    "addLiquidity": "0xe8e33700",
-    "addLiquidityETH": "0xf305d719",
-    "removeLiquidity": "0xbaa2abde",
-    "removeLiquidityETH": "0x02751cec",
-}
-
-REPUTATION_REGISTRY_SELECTORS = {
-    "giveFeedback": "0x3c036a7e",
-}
+# Function-selector tables were removed with the per-target session-key design: the old
+# SpendingLimitModule allowlisted a session key to specific (target, selector) pairs, so the DB
+# had to know every selector. The current module enforces one global USD spending cap instead —
+# no selector allowlisting — so nothing consumes these anymore.
 
 
 # ── Networks ──────────────────────────────────────────────────────────────────
@@ -152,6 +128,10 @@ MAINNET_TOKENS = {
 SEPOLIA_TOKENS = {
     "weth": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
     "link": "0x779877A7B0D9E8603169DdbD7836e478b4624789",
+    # USDC/DAI have live Sepolia Chainlink feeds and are the default watched tokens for Sepolia
+    # deploys (deploy_wallet.DEFAULT_WATCHED_TICKERS) — addresses match Constants.s.sol SPO_USDC/SPO_DAI.
+    "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "dai": "0x68194a729C2450ad26072b3D33ADaCbcef39D574",
 }
 
 BSC_TOKENS = {
@@ -188,9 +168,6 @@ CELO_TOKENS = {
 # (table, key column, value column, data, checksum addresses before insert)
 #for table, key_col, value_col, data, checksum in SEEDS:
 SEEDS = [
-    ("erc20_selectors", "name", "selector", ERC20_SELECTORS, False),
-    ("uniswapv2_selectors", "name", "selector", UNISWAPV2_SELECTORS, False),
-    ("reputation_registry_selectors", "name", "selector", REPUTATION_REGISTRY_SELECTORS, False),
     ("chains", "name", "chain_id", CHAINS, False),
     ("rpcs", "name", "rpc_url", RPCS, False),
     ("mainnet_tokens", "ticker", "address", MAINNET_TOKENS, True),

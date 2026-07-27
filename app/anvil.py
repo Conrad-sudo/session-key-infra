@@ -4,7 +4,7 @@ from web3.contract import Contract
 from web3.logs import DISCARD
 from network_config import load_network_config
 from constants import CHAIN_ID_ANVIL
-from userop import create_signed_user_op, prepare_execute_call
+from userop import create_signed_user_op, prepare_execute_call, prepare_execute_batch_call
 
 load_dotenv()
 
@@ -122,7 +122,7 @@ def send_user_op_as_session(
 
     Packs (target, value, data) into ERC-7579 executionCalldata and encodes
     SessionHandler.execute(mode, executionCalldata) as the UserOp calldata, fetches a
-    nonce keyed to the installed SessionHandlerModule (so the account routes validation to
+    nonce keyed to the installed SpendingLimitModule (so the account routes validation to
     it), builds an unsigned PackedUserOperation, signs it with the session key via EIP-191,
     and submits it to the EntryPoint via handleOps(). The bundler key from the environment
     signs and sends the outer transaction.
@@ -134,7 +134,45 @@ def send_user_op_as_session(
     @param data           ABI-encoded inner calldata to execute on the target.
     @return               A tuple of (tx_hash, receipt).
     """
+    session_handler, entry_point, calldata, nonce = prepare_execute_call(
+        chat_id, target, value, data
+    )
+    return _submit_user_op(chat_id, key_ciphertext, session_handler, entry_point, calldata, nonce)
 
+
+def send_batch_user_op_as_session(
+    chat_id: int, key_ciphertext: str, executions: list[tuple[str, int, bytes]]
+):
+    """
+    Batch variant of send_user_op_as_session: submits several sub-calls as ONE atomic
+    execute(batchMode, ...) UserOp. Required for any flow that grants an approval —
+    SpendingLimitModule reverts the whole transaction if an approval survives it, so
+    [approve, spend(, approve 0)] must land together.
+
+    @param chat_id        The Telegram chat ID of the user.
+    @param key_ciphertext Vault Transit ciphertext for the session key ('vault:v1:...').
+    @param executions     List of (target_address, value_wei, calldata_bytes) triples, in order.
+    @return               A tuple of (tx_hash, receipt).
+    """
+    session_handler, entry_point, calldata, nonce = prepare_execute_batch_call(
+        chat_id, executions
+    )
+    return _submit_user_op(chat_id, key_ciphertext, session_handler, entry_point, calldata, nonce)
+
+
+def _submit_user_op(
+    chat_id: int,
+    key_ciphertext: str,
+    session_handler,
+    entry_point,
+    calldata: str,
+    nonce: int,
+):
+    """
+    Shared tail of the Anvil/fork UserOp flow: estimates gas, signs the op with the session key,
+    and submits it to the EntryPoint via handleOps() signed by the local bundler key. Everything
+    after calldata construction is identical for single-call and batch ops.
+    """
     # FORK_DEPLOYER_PK is shared across every fork network (mainnet-fork/sepolia-fork/bsc-fork/
     # celo-fork) — deploy_wallet.py's prefund() funds this same key, so it always has gas here.
     w3, chain_id, _ = load_network_config(chat_id)
@@ -142,10 +180,6 @@ def send_user_op_as_session(
         bundler = w3.eth.account.from_key(os.getenv("ANVIL_BUNDLER"))
     else:
         bundler = w3.eth.account.from_key(os.getenv("FORK_DEPLOYER_PK"))
-
-    session_handler, entry_point, calldata, nonce = prepare_execute_call(
-        chat_id, target, value, data
-    )
 
     print("\n[1/3] Creating transaction  ...")
     user_op, gas_limit, gas_price = create_unsigned_user_op(

@@ -3,15 +3,17 @@ pragma solidity ^0.8.24;
 
 import {IEntryPoint} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
 import {AccountERC7579Hooked} from "@openzeppelin/contracts/account/extensions/draft-AccountERC7579Hooked.sol";
-import {MODULE_TYPE_VALIDATOR, MODULE_TYPE_HOOK} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
-import {Mode} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
+import {MODULE_TYPE_HOOK, Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
+import {ERC7579Utils, Mode, CallType} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {SHOracle} from "./SHOracle.sol";
 import {SHRegistry} from "./SHRegistry.sol";
-import {SessionHandlerModule} from "./SessionHandlerModule.sol";
+import {SpendingLimitModule} from "./SpendingLimitModule.sol";
 import {IReputationRegistry} from "./interfaces/IReputationRegistry.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 import {Context} from "@openzeppelin/contracts/utils/Context.sol";
@@ -20,12 +22,17 @@ import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Cont
 /**
  * @title SessionHandler
  * @author Conrad Japhet
- * @notice ERC-7579 smart account with delegated, spending-limited session-key permissions.
- *         Session-key state and USD-value enforcement live entirely in the installed
- *         SessionHandlerModule (installed as both validator and hook); this contract only keeps
- *         the account-level concerns that aren't session-key specific (ownership, ETH/ERC20
- *         withdrawal, pausing, protocol fee charging, and the ERC-8004 identity/reputation
- *         lookups).
+ * @notice ERC-7579 smart account guarded by a USD-denominated spending cap. The cap and all
+ *         USD-value enforcement live entirely in the installed SpendingLimitModule (installed as
+ *         a hook); this contract keeps only the account-level concerns that aren't cap-specific
+ *         (ownership, ETH/ERC20 withdrawal, pausing, spending-cap configuration passthroughs, and
+ *         the ERC-8004 identity/reputation lookups).
+ * @dev Session-key auth is built into the account itself: it validates its own UserOps via
+ *      {_rawSignatureValidation}, accepting a UserOp signed by the owner OR by any address on the
+ *      `allowedSession` allowlist (managed with {addSession}/{removeSession}). No separate validator
+ *      module is installed -- SpendingLimitModule is a hook (module type 4) ONLY, enforcing the USD
+ *      spending cap on every execution. A session key is a BARE signer with no per-key target/
+ *      selector scope or expiry; the spending cap is its only on-chain guardrail (see {addSession}).
  * @dev Deliberate deviation from stock AccountERC7579Hooked: `execute`, `installModule`, and
  *      `uninstallModule` are normally `onlyEntryPointOrSelf` -- an EOA owner cannot call them
  *      directly. This contract reopens that direct-owner path (see the three overrides below) so
@@ -41,8 +48,22 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     error SessionHandler_InvalidRecipient();
     error SessionHandler_NotEnoughBalance();
     error SessionHandler_ExecutionFailed();
-    /// @dev Thrown when the protocol fee ETH transfer to the treasury fails.
-    error SessionHandler_FeeTransferFailed();
+    /// @dev Thrown when address(0) is passed as a session key to addSession.
+    error SessionHandler_InvalidSessionKey();
+    /// @dev Thrown when a session-key (non-owner) execution targets the account's own admin surface
+    ///      (address(this) or the spending-limit module), which would let a key escape the cap.
+    error SessionHandler_SessionRestrictedTarget(address target);
+    /// @dev Thrown when a session-key (non-owner) execution uses delegatecall, which runs arbitrary
+    ///      code in the account's context and so could reach the admin surface regardless of target.
+    error SessionHandler_SessionDelegateCallForbidden();
+
+    /*//////////////////////////////////////////////////////////////
+                                    EVENTS
+    //////////////////////////////////////////////////////////////*/
+    /// @notice Emitted when the owner authorizes a session key.
+    event SessionAdded(address indexed sessionKey);
+    /// @notice Emitted when the owner revokes a session key.
+    event SessionRemoved(address indexed sessionKey);
 
     /*//////////////////////////////////////////////////////////////
                              STATE VARIABLES
@@ -58,14 +79,20 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     address public IDENTITY_REGISTRY;
     SHRegistry public REGISTRY;
     uint256 public WALLET_ID;
-    /// @dev Installed as both MODULE_TYPE_VALIDATOR and MODULE_TYPE_HOOK in initialize().
-    SessionHandlerModule public SH_MODULE;
+    /// @dev Installed as MODULE_TYPE_HOOK in initialize(); enforces the account's USD spending cap.
+    SpendingLimitModule public SH_MODULE;
 
-    
+    /// @notice Session keys authorized to sign UserOps for this account (the owner is always
+    ///         authorized separately, in {_rawSignatureValidation}). A bare allowlist: an allowed
+    ///         key may drive ANY execute() call, bounded only by the SpendingLimitModule spending
+    ///         cap. Managed via {addSession}/{removeSession}.
+    mapping(address sessionKey => bool allowed) public allowedSession;
+
+
     /*//////////////////////////////////////////////////////////////
                                 Constructor
     //////////////////////////////////////////////////////////////*/
-    
+
     constructor() {
         _disableInitializers();
     }
@@ -79,7 +106,10 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         address identityRegistry,
         address registry,
         uint256 walletId,
-        address spendingLimitModule
+        address spendingLimitModule,
+        int256 dailyLimitUsd,
+        uint256 windowDuration,
+        address[] calldata watchedTokens
     )  external initializer {
         __Ownable_init(owner);
         ENTRY_POINT = entryPointAddress;
@@ -87,10 +117,22 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         IDENTITY_REGISTRY = identityRegistry;
         REGISTRY = SHRegistry(registry);
         WALLET_ID = walletId;
-        SH_MODULE = SessionHandlerModule(spendingLimitModule);
+        SH_MODULE = SpendingLimitModule(spendingLimitModule);
 
-        _installModule(MODULE_TYPE_VALIDATOR, spendingLimitModule, "");
-        _installModule(MODULE_TYPE_HOOK, spendingLimitModule, "");
+        // Install the spending-limit module as a HOOK only (it is not a validator). Its onInstall
+        // decodes exactly this (dailyLimitUsd, windowDuration, watchedTokens) tuple, so the config
+        // must be non-empty and valid: windowDuration > 0, dailyLimitUsd >= 0, and every watched
+        // token already priced by the oracle.
+        _installModule(
+            MODULE_TYPE_HOOK, spendingLimitModule, abi.encode(dailyLimitUsd, windowDuration, watchedTokens)
+        );
+
+        // Trust the registry's canonical DEX router by default so unpriced-token approvals to it
+        // (e.g. an LP token in removeLiquidity) are permitted -- the no-standing-approval rule still
+        // forces every such approval to zero within its own transaction. Skipped when no router is
+        // configured for this chain. The owner can add/remove trusted spenders later.
+        address router = REGISTRY.router();
+        if (router != address(0)) SH_MODULE.addTrustedSpender(router);
     }
 
     function entryPoint() public view override returns (IEntryPoint) {
@@ -114,10 +156,10 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /**
      * @notice Executes on behalf of the account. Callable by the EntryPoint, the account itself
      *         (via an installed executor), or directly by the owner without a UserOp.
-     * @dev Charges a flat protocol fee when this call was driven by a session key through the
-     *      EntryPoint. SessionHandlerModule.pendingSessionKey reflects whatever validateUserOp
-     *      flagged for this account this transaction; it stays address(0) for owner-initiated
-     *      calls, so no fee is charged for those.
+     * @dev The installed SpendingLimitModule hook wraps this call: its preCheck/postCheck enforce
+     *      the account's USD spending cap around whatever runs here. For non-owner (session-key)
+     *      executions, {_guardSessionExecution} additionally blocks any sub-call to the account's own
+     *      admin surface, so a session key cannot uninstall the hook or raise the cap to escape it.
      */
     function execute(bytes32 mode, bytes calldata executionCalldata)
         public
@@ -126,16 +168,11 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         whenNotPaused
         onlyEntryPointOrSelfOrOwner
     {
-        bool isSessionKeyExecution =
-            msg.sender == address(entryPoint()) && SH_MODULE.pendingSessionKey(address(this), keccak256(msg.data)) != address(0);
-
-        _execute(Mode.wrap(mode), executionCalldata);
-
-        uint256 fee = REGISTRY.protocolFee();
-        if (isSessionKeyExecution && fee > 0) {
-            (bool feeSuccess,) = payable(REGISTRY.treasury()).call{value: fee}("");
-            if (!feeSuccess) revert SessionHandler_FeeTransferFailed();
-        }
+        Mode execMode = Mode.wrap(mode);
+        // Owner-initiated calls are unrestricted; any other path (a session-key UserOp via the
+        // EntryPoint, or a self-call) must not be able to reach the account's own admin surface.
+        if (msg.sender != owner()) _guardSessionExecution(execMode, executionCalldata);
+        _execute(execMode, executionCalldata);
     }
 
     /// @notice Installs an ERC-7579 module. Callable by the EntryPoint, the account itself, or the owner.
@@ -157,63 +194,150 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     }
 
     /*//////////////////////////////////////////////////////////////
-              SESSION-KEY MANAGEMENT (passthrough to the module)
+           SPENDING-LIMIT CONFIG (owner-only passthrough to module)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Each setter below calls the module AS this account, so the module keys the config under
+    ///      this account's address. Kept owner-only on purpose: a session key must never be able to
+    ///      raise its own cap or reshape the watched list (see SpendingLimitModule's NatSpec).
+
+    /// @notice Sets the account's max USD spend per window (18 decimals). Forwards to SH_MODULE.setDailyLimit.
+    function setDailyLimit(int256 dailyLimitUsd) external onlyOwner {
+        SH_MODULE.setDailyLimit(dailyLimitUsd);
+    }
+
+    /// @notice Sets the account's spending-window length in seconds. Forwards to SH_MODULE.setWindowDuration.
+    function setWindowDuration(uint256 windowDuration) external onlyOwner {
+        SH_MODULE.setWindowDuration(windowDuration);
+    }
+
+    /// @notice Adds a token to the account's watched (value-metered) list. Forwards to SH_MODULE.addWatchedToken.
+    function addWatchedToken(address token) external onlyOwner {
+        SH_MODULE.addWatchedToken(token);
+    }
+
+    /// @notice Removes a token from the account's watched list. Forwards to SH_MODULE.removeWatchedToken.
+    function removeWatchedToken(address token) external onlyOwner {
+        SH_MODULE.removeWatchedToken(token);
+    }
+
+    /// @notice Returns the account's full spending-limit config from the module.
+    function getConfig() external view returns (SpendingLimitModule.Config memory) {
+        return SH_MODULE.getConfig(address(this));
+    }
+
+    /// @notice Returns whether a token is on the account's watched list.
+    function isWatched(address token) external view returns (bool) {
+        return SH_MODULE.isWatched(address(this), token);
+    }
+
+    /// @notice Returns the account's remaining USD budget for the current window (18 decimals).
+    function getRemainingBudget() external view returns (int256) {
+        return SH_MODULE.getRemainingBudget(address(this));
+    }
+
+    /// @notice Trusts a spender so it may be approved even for unpriced tokens (e.g. the DEX router,
+    ///         for removeLiquidity's LP-token approval). Forwards to SH_MODULE.addTrustedSpender.
+    /// @dev Owner-only: a trusted spender can pull an unpriced token within a single transaction, so
+    ///      only grant it to contracts you trust (the canonical router is auto-trusted at deploy).
+    function addTrustedSpender(address spender) external onlyOwner {
+        SH_MODULE.addTrustedSpender(spender);
+    }
+
+    /// @notice Stops trusting a spender. Forwards to SH_MODULE.removeTrustedSpender.
+    function removeTrustedSpender(address spender) external onlyOwner {
+        SH_MODULE.removeTrustedSpender(spender);
+    }
+
+    /// @notice Returns whether a spender is trusted for this account.
+    function isTrustedSpender(address spender) external view returns (bool) {
+        return SH_MODULE.isTrustedSpender(address(this), spender);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       SESSION-KEY AUTH (owner-managed)
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Registers a new delegated session key. Forwards to SH_MODULE.addSessionKey,
-     *         calling it as this account (so the module records the session under this account's address).
-     * @dev See SessionHandlerModule for the actual validation and storage.
+     * @notice Authorizes `sessionKey` to sign UserOps for this account.
+     * @dev SECURITY: a session key is a BARE signer -- once authorized it can drive ANY execute()
+     *      call to external targets, gated by the SpendingLimitModule USD spending cap and by
+     *      {_guardSessionExecution} (which blocks it from the account's own admin surface). It is
+     *      NOT scoped to particular external targets or selectors, and has no expiry; grant keys
+     *      only to agents trusted to stay within the cap. Scoped keys (target/selector/expiry) are
+     *      a deliberate future step.
+     * @param sessionKey The signer address to authorize. Must not be address(0).
      */
-    function addSessionKey(
-        address sessionKey,
-        address target,
-        bytes4[] calldata selectors,
-        uint48 validFrom,
-        uint48 validUntil,
-        uint256 spendingLimit
-    ) external onlyOwner{
-
-        SH_MODULE.addSessionKey(sessionKey, target, selectors, validFrom, validUntil, spendingLimit);
+    function addSession(address sessionKey) external onlyOwner {
+        if (sessionKey == address(0)) revert SessionHandler_InvalidSessionKey();
+        allowedSession[sessionKey] = true;
+        emit SessionAdded(sessionKey);
     }
 
     /**
-     * @notice Registers a session key exempt from USD-value pricing (e.g. for calling contracts
-     *         SHOracle has no price for). Forwards to SH_MODULE.addUnpricedSessionKey.
+     * @notice Revokes a previously authorized session key. No-op if it was not authorized.
+     * @param sessionKey The signer address to revoke.
      */
-    function addUnpricedSessionKey(
-        address sessionKey,
-        address target,
-        bytes4[] calldata selectors,
-        uint48 validFrom,
-        uint48 validUntil
-    ) external onlyOwner {
-        SH_MODULE.addUnpricedSessionKey(sessionKey, target, selectors, validFrom, validUntil);
+    function removeSession(address sessionKey) external onlyOwner {
+        allowedSession[sessionKey] = false;
+        emit SessionRemoved(sessionKey);
     }
 
-    /// @notice Revokes a session key. Forwards to SH_MODULE.revokeSessionKey.
-    function revokeSessionKey(address sessionKey) external onlyOwner {
-        SH_MODULE.revokeSessionKey(sessionKey);
+    /**
+     * @dev UserOp signature validation for this account. Reached via {Account-_validateUserOp}, the
+     *      fallback path AccountERC7579 takes whenever the nonce's validator module isn't installed
+     *      -- which is always here, since this account installs no validator module. Returns true iff
+     *      the op is signed by the owner or by an authorized session key.
+     *
+     *      `hash` is {Account-_signableUserOpHash} (the raw userOpHash by default). The bot and the
+     *      Foundry helper sign the EIP-191 envelope of it (toEthSignedMessageHash /
+     *      eth_account.encode_defunct), so it is re-wrapped here before recovery. Uses tryRecover so
+     *      a malformed signature returns SIG_VALIDATION_FAILED instead of reverting validation.
+     */
+    function _rawSignatureValidation(bytes32 hash, bytes calldata signature)
+        internal
+        view
+        override
+        returns (bool)
+    {
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(hash);
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecoverCalldata(digest, signature);
+        if (err != ECDSA.RecoverError.NoError) return false;
+        return signer == owner() || allowedSession[signer];
     }
 
-    /// @notice Returns the full Session struct for a given session key on this account.
-    function getSession(address sessionKey) external view returns (SessionHandlerModule.Session memory) {
-        return SH_MODULE.getSession(address(this), sessionKey);
+    /**
+     * @dev Blocks a non-owner (session-key or self) execution from reaching the account's own admin
+     *      surface. Session keys may act on external protocols under the USD cap, but must never be
+     *      able to reconfigure or remove the cap itself:
+     *        - single / batch: reverts if any sub-call targets address(this) or address(SH_MODULE);
+     *        - delegatecall: reverts outright, since delegated code runs in this account's context
+     *          and could reach the admin surface regardless of the encoded target.
+     *      address(this) is restricted because execute(address(this), ...) self-calls installModule/
+     *      uninstallModule/addSession/withdraw/the cap setters with msg.sender == the account, which
+     *      those functions accept; SH_MODULE is restricted because its cap setters key by msg.sender.
+     */
+    function _guardSessionExecution(Mode mode, bytes calldata executionCalldata) internal view {
+        (CallType callType,,,) = ERC7579Utils.decodeMode(mode);
+
+        if (callType == ERC7579Utils.CALLTYPE_SINGLE) {
+            (address target,,) = ERC7579Utils.decodeSingle(executionCalldata);
+            _requireUnrestrictedTarget(target);
+        } else if (callType == ERC7579Utils.CALLTYPE_BATCH) {
+            Execution[] calldata batch = ERC7579Utils.decodeBatch(executionCalldata);
+            for (uint256 i = 0; i < batch.length; i++) {
+                _requireUnrestrictedTarget(batch[i].target);
+            }
+        } else if (callType == ERC7579Utils.CALLTYPE_DELEGATECALL) {
+            revert SessionHandler_SessionDelegateCallForbidden();
+        }
     }
 
-    /// @notice Returns whether a session key is currently active on this account.
-    function isSessionActive(address sessionKey) external view returns (bool) {
-        return SH_MODULE.isSessionActive(address(this), sessionKey);
-    }
-
-    /// @notice Returns the remaining USD spending budget for a session key on this account.
-    function getRemainingBudget(address sessionKey) external view returns (uint256) {
-        return SH_MODULE.getRemainingBudget(address(this), sessionKey);
-    }
-
-    /// @notice Checks whether a proposed spend is within the session's remaining budget.
-    function isSpendingWithinBudget(address sessionKey, address token, uint256 amount) external view returns (bool) {
-        return SH_MODULE.isSpendingWithinBudget(address(this), sessionKey, token, amount);
+    /// @dev Reverts if `target` is the account itself or its spending-limit module. See {_guardSessionExecution}.
+    function _requireUnrestrictedTarget(address target) internal view {
+        if (target == address(this) || target == address(SH_MODULE)) {
+            revert SessionHandler_SessionRestrictedTarget(target);
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -250,9 +374,9 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
                              VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Returns the current USD price of a token by querying the registered SHOracle.
-    function getPrice(address token) public view returns (uint256 price, uint8 decimals) {
-        return SHOracle(REGISTRY.priceOracle()).getPrice(token);
+    /// @notice Returns the USD value (18 decimals) of `amount` of `token`, via the registered SHOracle.
+    function getUsdValue(address token, uint256 amount) public view returns (int256) {
+        return SHOracle(REGISTRY.priceOracle()).getPrice(token, amount);
     }
 
     function getAgentId() public view returns (uint256) {

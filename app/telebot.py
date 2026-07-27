@@ -1,6 +1,5 @@
 import os
 import asyncio
-from datetime import date
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,33 +13,47 @@ from tools import get_all_sessions
 
 telegram_token = os.getenv("TELEGRAM_TOKEN")
 
+# Warn when less than this fraction of the window spending cap remains.
+BUDGET_ALERT_THRESHOLD = 0.10
 
-async def session_expiry_alert(context: ContextTypes.DEFAULT_TYPE):
+
+async def budget_alert(context: ContextTypes.DEFAULT_TYPE):
     """
-    Job callback that checks all sessions for a user and sends a Telegram
-    message for any session expiring within the next 24 hours.
+    Job callback that checks the user's wallet spending-cap status and warns them when the
+    session key is inactive or the remaining USD budget for the current window has dropped
+    below BUDGET_ALERT_THRESHOLD of the cap.
 
-    Scheduled via JobQueue — not triggered by a user message.
-    Uses context.job.chat_id to identify the user.
+    Replaces the old per-token session-expiry alert: session keys no longer expire, and spending
+    is bounded by a single wallet-wide USD cap per rolling window. Scheduled via JobQueue — not
+    triggered by a user message. Uses context.job.chat_id to identify the user.
     """
     chat_id = context.job.chat_id
-    sessions = get_all_sessions.func(chat_id)
-    if not sessions:
+    try:
+        status = get_all_sessions.func(chat_id)
+    except Exception:
+        # No wallet deployed for this chat yet (load_session_handler raises) — nothing to report.
         return
 
-    today = date.today()
-    for s in sessions:
-        end_date = date.fromisoformat(s["end_time"])
-        days_remaining = (end_date - today).days
-        if days_remaining <= 1:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⚠️ Your {s['target'].upper()} session key is expiring "
-                    f"{'today' if days_remaining <= 0 else 'tomorrow'}. "
-                    f"Please renew it to continue making transactions."
-                ),
-            )
+    if not status.get("session_active"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ Your wallet's session key is not currently authorized. "
+                "New transactions will be rejected until it is re-added."
+            ),
+        )
+        return
+
+    limit = status.get("daily_limit_usd") or 0
+    remaining = status.get("remaining_usd") or 0
+    if limit > 0 and remaining < BUDGET_ALERT_THRESHOLD * limit:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ Low spending budget: only ${remaining:,.2f} of your ${limit:,.2f} "
+                f"per-window cap remains. It refills when the current window rolls over."
+            ),
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,7 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in current_jobs:
         job.schedule_removal()
     context.job_queue.run_repeating(
-        session_expiry_alert,
+        budget_alert,
         interval=86400,  # every 24 hours
         first=10,  # first run 10 seconds after /start
         chat_id=chat_id,

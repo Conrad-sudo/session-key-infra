@@ -160,12 +160,4 @@ contract SHTreasury is Ownable, ReentrancyGuard {
     function setUniswapRouter(address newRouter) external onlyOwner {
         SHRegistry(REGISTRY).setUniswapRouter(newRouter);
     }
-
-    /**
-     * @notice Updates the SHValueInterpreter used by all SessionHandler wallets. Only callable by the owner.
-     * @param newInterpreter The new SHValueInterpreter address. Must not be address(0).
-     */
-    function setCallValueInterpreter(address newInterpreter) external onlyOwner {
-        SHRegistry(REGISTRY).setCallValueInterpreter(newInterpreter);
-    }
 }

@@ -9,9 +9,6 @@ UNISWAP_V2_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 SEPOLIA_UNISWAP_V2_FACTORY = "0xF62c03E08ada871A0bEb309762E260a7a6a880E6"
 PANCAKE_V2_FACTORY = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 UBESWAP_V2_FACTORY = "0x62d5b84bE28a183aBB507E125B384122D2C25fAE"
-HEARTBEAT_1H = 3_600
-HEARTBEAT_23H = 82_800
-HEARTBEAT_24H = 86_400
 
 # The ticker of the chain's actual wrapped-native-asset contract — the one *ETH*-suffixed
 # router functions and deposit()/withdraw() calls operate against. WETH on Ethereum/Sepolia/

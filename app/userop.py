@@ -13,10 +13,12 @@ from network_config import load_network_config
 from contracts import (
     load_session_handler,
     load_entry_point,
-    load_session_handler_module,
+    load_spending_limit_module,
     pack_execution_calldata,
+    encode_batch_execution_calldata,
     session_key_nonce_key,
     ERC7579_SINGLE_CALL_MODE,
+    ERC7579_BATCH_CALL_MODE,
 )
 import db
 from vault_signer import encrypt_key, decrypt_key
@@ -57,7 +59,7 @@ def prepare_execute_call(
     Builds the shared inputs for a session-key UserOp, identical across both backends:
     the bound SessionHandler and EntryPoint contracts, the ABI-encoded
     SessionHandler.execute(mode, executionCalldata) calldata, and a nonce keyed to the
-    installed SessionHandlerModule (so the account routes validation to it). The caller
+    installed SpendingLimitModule (so the account routes validation to it). The caller
     layers its own gas estimation and submission on top.
 
     @param chat_id  The Telegram chat ID of the user.
@@ -67,12 +69,42 @@ def prepare_execute_call(
     @return         (session_handler, entry_point, calldata_hex, nonce).
     """
     session_handler = load_session_handler(chat_id=chat_id)
-    module = load_session_handler_module(chat_id=chat_id)
+    module = load_spending_limit_module(chat_id=chat_id)
 
     execution_calldata = pack_execution_calldata(target, value, data)
     calldata = session_handler.encode_abi(
         abi_element_identifier="execute",
         args=[ERC7579_SINGLE_CALL_MODE, execution_calldata],
+    )
+
+    entry_point = load_entry_point(chat_id=chat_id)
+    nonce = entry_point.functions.getNonce(
+        session_handler.address, session_key_nonce_key(module.address)
+    ).call()
+
+    return session_handler, entry_point, calldata, nonce
+
+
+def prepare_execute_batch_call(
+    chat_id: int, executions: list[tuple[str, int, bytes]]
+) -> tuple[Contract, Contract, str, int]:
+    """
+    Batch variant of prepare_execute_call: builds SessionHandler.execute(batchMode,
+    abi.encode(Execution[])) calldata for several sub-calls that must land atomically in ONE
+    transaction — the only way an approval can be granted and consumed without tripping
+    SpendingLimitModule's no-standing-approval rule.
+
+    @param chat_id     The Telegram chat ID of the user.
+    @param executions  List of (target_address, value_wei, calldata_bytes) triples, in order.
+    @return            (session_handler, entry_point, calldata_hex, nonce).
+    """
+    session_handler = load_session_handler(chat_id=chat_id)
+    module = load_spending_limit_module(chat_id=chat_id)
+
+    execution_calldata = encode_batch_execution_calldata(executions)
+    calldata = session_handler.encode_abi(
+        abi_element_identifier="execute",
+        args=[ERC7579_BATCH_CALL_MODE, execution_calldata],
     )
 
     entry_point = load_entry_point(chat_id=chat_id)
@@ -91,7 +123,8 @@ def create_signed_user_op(
 
     Fetches the userOpHash from the EntryPoint, wraps it in the Ethereum signed
     message envelope via encode_defunct (matching toEthSignedMessageHash in
-    SessionHandler._validateSignature), and returns the op with the signature attached.
+    SessionHandler._rawSignatureValidation, the account's own UserOp signature check —
+    the module is not a validator), and returns the op with the signature attached.
 
     The raw private key is decrypted from Vault transiently and wiped from memory
     immediately after signing.

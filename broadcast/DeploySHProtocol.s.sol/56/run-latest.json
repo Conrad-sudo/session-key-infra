@@ -148,7 +148,7 @@
       "transactionType": "CALL",
       "contractName": "SHFactory",
       "contractAddress": "0xb043840696e008fb5313d2c7e713f70fb13cd37c",
-      "function": "setSpendingLimitModule(address)",
+      "function": "setSessionHandlerModule(address)",
       "arguments": [
         "0x68fDE22dd34599Add2c2d18A7392610f019f2253"
       ],

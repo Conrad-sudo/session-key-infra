@@ -25,11 +25,15 @@ _factory_cache: dict[int, Contract] = {}
 _sh_factory_cache: dict[int, Contract] = {}
 _pair_cache: dict[tuple[int, str, str], Contract] = {}
 _reputation_registry_cache: dict[int, Contract] = {}
-_session_handler_module_cache: dict[int, Contract] = {}
+_spending_limit_module_cache: dict[int, Contract] = {}
 
-# ERC-7579 single-call, default-execution-type mode — the only mode SessionHandler's
-# installed SessionHandlerModule validator accepts for session-key UserOps.
+# ERC-7579 single-call, default-execution-type mode (CALLTYPE_SINGLE = 0x00 in the top byte).
 ERC7579_SINGLE_CALL_MODE = b"\x00" * 32
+
+# ERC-7579 batch, default-execution-type mode (CALLTYPE_BATCH = 0x01 in the top byte).
+# Batches are how approvals stay legal under SpendingLimitModule's no-standing-approval rule:
+# [approve, spend(, approve 0)] must all land in ONE transaction so nothing is left standing.
+ERC7579_BATCH_CALL_MODE = b"\x01" + b"\x00" * 31
 
 
 
@@ -42,7 +46,7 @@ def invalidate_cache(chat_id: int) -> None:
     _factory_cache.pop(chat_id, None)
     _sh_factory_cache.pop(chat_id, None)
     _reputation_registry_cache.pop(chat_id, None)
-    _session_handler_module_cache.pop(chat_id, None)
+    _spending_limit_module_cache.pop(chat_id, None)
     for key in [k for k in _erc20_cache if k[0] == chat_id]:
         del _erc20_cache[key]
     for key in [k for k in _pair_cache if k[0] == chat_id]:
@@ -66,24 +70,26 @@ def load_session_handler(chat_id: int) -> Contract:
     return _session_handler_cache[chat_id]
 
 
-def load_session_handler_module(chat_id: int) -> Contract:
+def load_spending_limit_module(chat_id: int) -> Contract:
     """
-    Loads the SessionHandlerModule contract ABI, bound to the address the wallet reports
+    Loads the SpendingLimitModule contract ABI, bound to the address the wallet reports
     via its public SH_MODULE getter.
 
-    The module (not SessionHandler itself) is where session-key state lives and where
-    SessionAdded/SessionRevoked are emitted, and its address is what session-key UserOps
-    need to encode into the nonce key (see session_key_nonce_key below).
+    The module is the ERC-7579 HOOK that enforces the wallet's global USD spending cap
+    (net-value metering + no-standing-approvals). It is NOT a validator and holds no session-key
+    state — session keys are an allowlist on the SessionHandler account itself
+    (allowedSession/addSession), and SessionAdded/SessionRemoved are emitted there. This loader
+    is used mainly to read the module's cap config/events.
 
     @param chat_id  The Telegram chat ID of the user.
-    @return         A web3.py Contract instance pointing to the installed SessionHandlerModule.
+    @return         A web3.py Contract instance pointing to the installed SpendingLimitModule.
     """
-    if chat_id not in _session_handler_module_cache:
+    if chat_id not in _spending_limit_module_cache:
         w3, _, _ = load_network_config(chat_id)
-        abi = get_json("./out/SessionHandlerModule.sol/SessionHandlerModule.json")["abi"]
+        abi = get_json("./out/SpendingLimitModule.sol/SpendingLimitModule.json")["abi"]
         address = load_session_handler(chat_id).functions.SH_MODULE().call()
-        _session_handler_module_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
-    return _session_handler_module_cache[chat_id]
+        _spending_limit_module_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
+    return _spending_limit_module_cache[chat_id]
 
 
 def load_entry_point(chat_id: int) -> Contract:
@@ -121,16 +127,33 @@ def pack_execution_calldata(target: str, value: int, data: bytes) -> bytes:
 
 def session_key_nonce_key(module_address: str) -> int:
     """
-    Builds the ERC-4337 nonce key that routes UserOp validation to the given validator module.
+    Builds the ERC-4337 nonce key used for session-key UserOps.
 
-    SessionHandler (via OZ's AccountERC7579) reads the top 20 bytes of the nonce's 192-bit
-    key as the address of the validator module to dispatch to. Mirrors Solidity's
-    uint192(uint160(module)) << 32 — the low 32 bits are free sub-key space, left as 0 here.
+    SessionHandler (via OZ's AccountERC7579) reads the top 20 bytes of the nonce's 192-bit key
+    as a validator-module address. SpendingLimitModule is now a HOOK only — it is never
+    installed as a validator — so whatever address the key encodes, the account falls through to
+    its own _rawSignatureValidation (owner OR allowedSession signer). Keeping the module-derived
+    key preserves nonce continuity for wallets that already submitted ops under it; any key
+    value (including 0) validates identically.
 
-    @param module_address  Checksummed hex address of the installed SessionHandlerModule.
+    @param module_address  Checksummed hex address of the installed SpendingLimitModule.
     @return                The nonce key to pass as EntryPoint.getNonce's second argument.
     """
     return int(module_address, 16) << 32
+
+
+def encode_batch_execution_calldata(executions: list[tuple[str, int, bytes]]) -> bytes:
+    """
+    ABI-encodes an ERC-7579 batch: Execution[] where Execution = (address target, uint256 value,
+    bytes callData). This is a normal abi.encode of the struct array (matching OZ's
+    ERC7579Utils.encodeBatch/decodeBatch), unlike the single-call packed form.
+
+    @param executions  List of (target_address, value_wei, calldata_bytes) triples.
+    @return            The ABI-encoded executionCalldata for ERC7579_BATCH_CALL_MODE.
+    """
+    from eth_abi import encode
+
+    return encode(["(address,uint256,bytes)[]"], [executions])
 
 
 def load_ierc20(chat_id: int, token: str, uniswap_pair=False) -> Contract:

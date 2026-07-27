@@ -3,7 +3,6 @@ import os
 import sqlite3
 import threading
 from web3 import Web3
-from datetime import datetime, timezone
 from constants import (
     CHAIN_ID_ANVIL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA, WEI_PER_ETH,
 )
@@ -53,32 +52,19 @@ def init_db():
     """
     db = get_db()
     db.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            chat_id        INTEGER NOT NULL,
-            target         TEXT NOT NULL,
-            spending_limit REAL NOT NULL,
-            end_time       DATE NOT NULL,
-            PRIMARY KEY (chat_id, target)
-        );
+        -- Vestigial tables from the per-target session-key design (dropped so `make db` cleans an
+        -- existing wallet.db). The module now enforces ONE global USD spending cap: there are no
+        -- per-target sessions and no on-chain (target, selector) allowlists to store.
+        DROP TABLE IF EXISTS sessions;
+        DROP TABLE IF EXISTS erc20_selectors;
+        DROP TABLE IF EXISTS uniswapv2_selectors;
+        DROP TABLE IF EXISTS reputation_registry_selectors;
 
         CREATE TABLE IF NOT EXISTS contacts (
             chat_id INTEGER NOT NULL,
             name    TEXT NOT NULL,
             address TEXT NOT NULL,
             PRIMARY KEY (chat_id, name)
-        );
-
-        CREATE TABLE IF NOT EXISTS erc20_selectors (
-            name      TEXT PRIMARY KEY,
-            selector TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS uniswapv2_selectors (
-            name      TEXT PRIMARY KEY,
-            selector TEXT NOT NULL
-        );
-         CREATE TABLE IF NOT EXISTS reputation_registry_selectors (
-            name      TEXT PRIMARY KEY,
-            selector TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS chains (
@@ -178,6 +164,22 @@ def seed_reference_data():
                     (chain_id, Web3.to_checksum_address(address)),
                 )
 
+    # Anvil has no real token deployments to hardcode (unlike mainnet/sepolia/bsc/celo in
+    # seed_data.py): HelperConfig.getOrCreateAnvilConfig() deploys fresh ERC20Mock/MockWeth mocks
+    # inside the (broadcast) deploy, at addresses that change every run. Recover ticker->address
+    # from the broadcast's decoded constructor arguments (symbol is arg index 1), e.g.
+    # `new ERC20Mock("Circle USD","USDC",6)` -> ticker "usdc". This is the only writer of anvil_tokens.
+    anvil_broadcast = f"./broadcast/DeploySHProtocol.s.sol/{CHAIN_ID_ANVIL}/run-latest.json"
+    if os.path.exists(anvil_broadcast):
+        for item in get_json(anvil_broadcast)["transactions"]:
+            if item.get("contractName") in ("ERC20Mock", "MockWeth"):
+                args = item.get("arguments") or []
+                if len(args) >= 2 and item.get("contractAddress"):
+                    ticker = str(args[1]).strip().strip('"').lower()
+                    db.execute(
+                        "INSERT OR REPLACE INTO anvil_tokens (ticker, address) VALUES (?, ?)",
+                        (ticker, Web3.to_checksum_address(item["contractAddress"])),
+                    )
 
     db.commit()
     print("Seeding complete.")
@@ -293,99 +295,6 @@ def get_factory_address(chain_id: int) -> str:
 
 
 
-# ── Sessions ──────────────────────────────────────────────────────────────────
-
-
-def save_session(chat_id: int, target: str, spending_limit: int, end_time: int):
-    """
-    Saves a session entry to the sessions table.
-
-    @param chat_id        The Telegram chat ID of the user.
-    @param target         The token ticker symbol the session is scoped to (e.g. "usdc").
-    @param spending_limit The spending limit in wei; converted to whole units before saving.
-    @param end_time       The session expiry as a Unix timestamp; converted to ISO 8601 date.
-    """
-    end_date = datetime.fromtimestamp(end_time, tz=timezone.utc).date().isoformat()
-    limit = spending_limit / WEI_PER_ETH
-    db = get_db()
-    db.execute(
-        "INSERT OR REPLACE INTO sessions (chat_id, target, spending_limit, end_time) VALUES (?, ?, ?, ?)",
-        (chat_id, target, limit, end_date),
-    )
-    db.commit()
-    print(f"Session saved\nTarget: {target}\nSpending Limit: {limit}")
-
-
-def get_session(chat_id: int, target: str) -> tuple[float, str]:
-    """
-    Retrieves the stored session metadata for a given user and token.
-
-    @param chat_id  The Telegram chat ID of the user.
-    @param target   The token ticker symbol the session is scoped to (e.g. "usdc").
-    @return         A tuple of (spending_limit, end_time) where spending_limit is in
-                    whole USD units (e.g. 1000.0) and end_time is an ISO 8601 date string.
-    """
-    row = (
-        get_db()
-        .execute(
-            "SELECT spending_limit, end_time FROM sessions WHERE chat_id = ? AND target = ?",
-            (chat_id, target),
-        )
-        .fetchone()
-    )
-
-    if row is None:
-        raise ValueError(
-            f"No session found for chat_id '{chat_id}' and target '{target}'"
-        )
-
-    return row["spending_limit"], row["end_time"]
-
-
-def get_all_sessions(chat_id: int) -> list[dict]:
-    """
-    Retrieves the stored metadata for all sessions for a given user.
-
-    @param chat_id  The Telegram chat ID of the user.
-    @return         A list of dicts with 'target', 'spending_limit', and 'end_time' keys,
-                    where spending_limit is in whole units (e.g. 1000.0) and end_time is
-                    an ISO 8601 date string.
-    """
-    rows = (
-        get_db()
-        .execute(
-            "SELECT target, spending_limit, end_time FROM sessions WHERE chat_id = ?",
-            (chat_id,),
-        )
-        .fetchall()
-    )
-
-    return [
-        {
-            "target": r["target"],
-            "spending_limit": r["spending_limit"],
-            "end_time": r["end_time"],
-        }
-        for r in rows
-    ]
-
-
-def delete_session(chat_id: int, target: str):
-    """
-    Deletes a session entry from the sessions table.
-
-    @param chat_id  The Telegram chat ID of the user.
-    @param target   The token ticker symbol the session is scoped to (e.g. "usdc").
-    @return         A confirmation string.
-    """
-    db = get_db()
-    db.execute(
-        "DELETE FROM sessions WHERE chat_id = ? AND target = ?",
-        (chat_id, target),
-    )
-    db.commit()
-
-
 # ── Session keys ─────────────────────────────────────────────────────────────
 
 
@@ -471,55 +380,6 @@ def get_chain_name_from_id(chain_id: int) -> str | None:
         .fetchone()
     )
     return row["name"] if row else None
-
-
-# ──  Selectors ───────────────────────────────────────────────────────────
-
-
-def get_erc20_selectors() -> list[dict]:
-    """
-    Returns all rows from the erc20_selectors table.
-
-    @return  A list of dicts with 'name' and 'selector' keys
-             (e.g. [{"name": "transfer", "selector": "0xa9059cbb"}, ...]).
-    """
-    rows = (
-        get_db()
-        .execute("SELECT name, selector FROM erc20_selectors ORDER BY name ASC")
-        .fetchall()
-    )
-    return [{"name": row["name"], "selector": row["selector"]} for row in rows]
-
-
-def get_uniswapv2_selectors() -> list[dict]:
-    """
-    Returns all rows from the uniswapv2_selectors table.
-
-    @return  A list of dicts with 'name' and 'selector' keys
-             (e.g. [{"name": "transfer", "selector": "0xa9059cbb"}, ...]).
-    """
-    rows = (
-        get_db()
-        .execute("SELECT name, selector FROM uniswapv2_selectors ORDER BY name ASC")
-        .fetchall()
-    )
-    return [{"name": row["name"], "selector": row["selector"]} for row in rows]
-
-
-
-def get_reputation_registry_selectors() -> list[dict]:
-    """
-    Returns all rows from the reputation_registry_selectors table.
-
-    @return  A list of dicts with 'name' and 'selector' keys
-             (e.g. [{"name": "updateReputation", "selector": "0x12345678"}, ...]).
-    """
-    rows = (
-        get_db()
-        .execute("SELECT name, selector FROM reputation_registry_selectors ORDER BY name ASC")
-        .fetchall()
-    )
-    return [{"name": row["name"], "selector": row["selector"]} for row in rows]
 
 
 # ── Tokens (supported list) ───────────────────────────────────────────────────

@@ -6,42 +6,30 @@ The `app/` directory bridges the AI agent to the on-chain contracts. It is built
 
 ```
 app/
-├── constants.py           ← Chain IDs, DEX factory addresses, ETH sentinel, heartbeat constants, native-wrapped ticker map
+├── constants.py           ← Chain IDs, DEX factory addresses, ETH sentinel, native-wrapped ticker map
 ├── db.py                  ← SQLite data layer (all reads/writes to wallet.db)
-├── seed_data.py           ← Static reference data (selectors, chains, RPCs, tokens) seeded by make db
+├── seed_data.py           ← Static reference data (chains, RPCs, token addresses) seeded by make db
 ├── network_config.py      ← Web3 connection factory
 ├── contracts.py           ← Contract loading with per-chat_id caching; ERC-7579 calldata/nonce helpers
-├── anvil.py               ← Session key management and UserOp execution (local/fork)
-├── live_network.py        ← UserOp execution via Alchemy bundler (live networks)
+├── anvil.py               ← UserOp execution (local/fork) — single + batch, via direct handleOps
+├── live_network.py        ← UserOp execution via Alchemy bundler (live networks) — single + batch
 ├── vault_signer.py        ← HashiCorp Vault Transit encrypt/decrypt wrapper
-├── deploy_wallet.py       ← Deployment and session registration scripts
+├── deploy_wallet.py       ← Per-user wallet deployment + single session-key registration
 ├── tools.py               ← LangChain tool wrappers for the AI agent
 ├── smart_wallet_agent.py  ← LangChain agent and system prompt
 ├── telebot.py             ← Telegram bot front end
 ├── agent_card.json        ← ERC-8004/v1 agent card (hosted publicly, referenced by tokenURI)
-└── artifacts/
-    ├── IEntryPoint.json           ← ABI for EntryPoint
-    ├── IReputationRegistry.json   ← ABI for ERC-8004 ReputationRegistry
-    ├── IERC20Extended.json        ← ABI for ERC20 tokens
-    ├── IWETH.json                 ← ABI for WETH/WBNB
-    ├── IUniswapV2Router02.json    ← ABI for Uniswap/PancakeSwap V2 Router (identical ABI, shared artifact)
-    ├── IUniswapV2Factory.json     ← ABI for Uniswap/PancakeSwap V2 Factory
-    ├── IUniswapV2Pair.json        ← ABI for Uniswap/PancakeSwap V2 Pair
-    └── ERC20Mock.json             ← ABI for ERC20Mock (Anvil)
+└── artifacts/             ← JSON ABIs for EntryPoint, ERC20, WETH, Uniswap V2 router/factory/pair, mocks
 ```
 
-> **Celo support is partial.** `celo_tokens` has a full seeded table and `constants.py`/`deploy_wallet.py` handle `"celo"`/`"celo-fork"` as network names (including a Ubeswap V2 factory address), but there is no Solidity-side deployment path yet — `HelperConfig.s.sol` has no Celo chain ID branch, so `DeploySHProtocol.s.sol` cannot deploy the shared infrastructure to Celo until that's added (see [docs/contracts.md](contracts.md#helperconfigssol)).
+> **Celo support is partial.** `celo_tokens` has a seeded table and the network routing handles `"celo"`/`"celo-fork"`, but there is no Solidity-side deployment path yet, and Celo is intentionally excluded from `deploy_wallet.py`'s default watched-token map (see [docs/contracts.md](contracts.md#helperconfigssol)).
 
 ## Module Dependency Flow
 
 ```
 telebot.py ──────────► smart_wallet_agent.py ──► tools.py ──► contracts.py ──► network_config.py ──► db.py
-                                                  tools.py ──► anvil.py ─────► vault_signer.py
-                                                                          ─────► network_config.py
-                                                                          ─────► db.py
-                                                  tools.py ──► live_network.py ► vault_signer.py
-                                                                                ► network_config.py
-                                                                                ► contracts.py
+                                                  tools.py ──► anvil.py ─────► userop.py ──► vault_signer.py
+                                                  tools.py ──► live_network.py ► userop.py ──► vault_signer.py
                                                   tools.py ──► db.py
 deploy_wallet.py ───────────────────────────────────────────────────────────────────────────────────► db.py
 ```
@@ -66,46 +54,22 @@ UNISWAP_V2_FACTORY  = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 SEPOLIA_UNISWAP_V2_FACTORY = "0xF62c03E08ada871A0bEb309762E260a7a6a880E6"
 PANCAKE_V2_FACTORY  = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 UBESWAP_V2_FACTORY  = "0x62d5b84bE28a183aBB507E125B384122D2C25fAE"
-HEARTBEAT_1H        = 3_600
-HEARTBEAT_23H       = 82_800
-HEARTBEAT_24H       = 86_400
 ```
 
-`NATIVE_WRAPPED_TICKER` maps each chain ID to the ticker of its wrapped-native-asset contract — `"weth"` on Ethereum/Sepolia/Anvil, `"wbnb"` on BSC, and `"celo"` on Celo (CELO is natively an ERC-20 there, so this refers to the plain token, not a wrap/unwrap target — Ubeswap has no `WETH()`-equivalent function). `get_native_wrapped_ticker(chain_id)` resolves this, raising `ValueError` for unconfigured chains.
+`NATIVE_WRAPPED_TICKER` maps each chain ID to its wrapped-native ticker — `"weth"` on Ethereum/Sepolia/Anvil, `"wbnb"` on BSC, `"celo"` on Celo. `get_native_wrapped_ticker(chain_id)` and `get_native_asset_ticker(chain_id)` resolve these, raising `ValueError` for unconfigured chains.
 
-Everything else that varies per network or per deployment — the EntryPoint, router, ERC-8004 registry addresses, token addresses, Chainlink feed addresses — is resolved from the database (`db.py`) rather than hardcoded here, since those addresses change per chain and per redeploy.
+> The old per-feed `HEARTBEAT_*` constants were removed — heartbeats are a Solidity-side (`Constants.s.sol` / `HelperConfig`) concern; the Python app no longer registers feeds.
 
 ---
 
 ## `db.py`
 
-The data persistence layer. All SQLite reads and writes go through this module — no other module accesses the database directly. It has no web3 or blockchain dependency, making it independently testable.
-
-**Connection management:** Each thread gets its own SQLite connection via `threading.local()` to support the Telegram bot's async/multi-threaded environment.
-
-**Network prefix mapping:**
-
-```python
-_NETWORK_DB_PREFIX = {
-    "anvil": "anvil",
-    "mainnet": "mainnet", "mainnet-fork": "mainnet",
-    "sepolia": "sepolia", "sepolia-fork": "sepolia",
-    "bsc": "bsc", "bsc-fork": "bsc",
-    "celo": "celo", "celo-fork": "celo",
-}
-```
+The data persistence layer. All SQLite reads and writes go through this module. It has no web3 dependency, making it independently testable. Each thread gets its own connection via `threading.local()`.
 
 **Schema (`wallet.db`):**
 
 ```sql
--- Per-user session key metadata
-CREATE TABLE sessions (
-    chat_id INTEGER NOT NULL, target TEXT NOT NULL,
-    spending_limit REAL NOT NULL, end_time DATE NOT NULL,
-    PRIMARY KEY (chat_id, target)
-);
-
--- Per-user encrypted session key storage
+-- Per-user encrypted session key storage (one key per wallet; `target` = the wallet address)
 CREATE TABLE session_keys (
     chat_id INTEGER NOT NULL, target TEXT NOT NULL,
     key_address TEXT NOT NULL, key_ciphertext TEXT NOT NULL,  -- 'vault:v1:...'
@@ -114,7 +78,7 @@ CREATE TABLE session_keys (
 
 CREATE TABLE contacts (chat_id INTEGER NOT NULL, name TEXT NOT NULL, address TEXT NOT NULL, PRIMARY KEY (chat_id, name));
 CREATE TABLE session_handlers (chat_id INTEGER PRIMARY KEY, address TEXT NOT NULL);
-CREATE TABLE factory (chain_id INTEGER PRIMARY KEY, address TEXT NOT NULL);  -- SHFactory address, read from the Forge broadcast file by `make db`
+CREATE TABLE factory (chain_id INTEGER PRIMARY KEY, address TEXT NOT NULL);  -- SHFactory address, from the Forge broadcast
 CREATE TABLE chains (name TEXT NOT NULL, chain_id INTEGER NOT NULL, PRIMARY KEY (name, chain_id));
 CREATE TABLE rpcs (name TEXT PRIMARY KEY, rpc_url TEXT NOT NULL);
 CREATE TABLE user_network (chat_id INTEGER PRIMARY KEY, chain_name TEXT NOT NULL);
@@ -124,29 +88,26 @@ CREATE TABLE mainnet_tokens (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE sepolia_tokens (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE bsc_tokens     (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
 CREATE TABLE celo_tokens    (ticker TEXT PRIMARY KEY, address TEXT NOT NULL);
-
-CREATE TABLE erc20_selectors               (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
-CREATE TABLE uniswapv2_selectors           (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
-CREATE TABLE reputation_registry_selectors (name TEXT PRIMARY KEY, selector TEXT NOT NULL);
 ```
 
-**Initialisation:** Run `make db` once to create all tables and seed from the static data in `seed_data.py`, plus the `factory` table from the Forge broadcast file written by `make deploy`. Re-running is safe — it uses `INSERT OR REPLACE`. The `sepolia` row in `rpcs` is taken from `SEPOLIA_RPC_URL` in `.env` (falling back to a keyless public endpoint), so API-keyed RPC URLs stay out of source control.
+> **Removed with the design overhaul:** the `sessions`, `erc20_selectors`, `uniswapv2_selectors`, and `reputation_registry_selectors` tables. `init_db()` issues `DROP TABLE IF EXISTS` on all four so `make db` migrates an existing `wallet.db`. Per-target session metadata and on-chain selector allowlists no longer exist — there's one global USD cap and one bare session key, both read on-chain.
+
+**Token seeding.** Mainnet/Sepolia/BSC/Celo token addresses are static (`seed_data.py`). **Anvil tokens are recovered from the Forge broadcast file** (`broadcast/DeploySHProtocol.s.sol/31337/run-latest.json`): the mocks are deployed at fresh addresses every run, so `seed_reference_data()` reads each `ERC20Mock`/`MockWeth` deployment's decoded constructor arguments (symbol = arg index 1) and maps ticker → address. This is the only writer of `anvil_tokens`.
+
+**Initialisation:** run `make db` once to create tables and seed. Re-running is safe (`INSERT OR REPLACE`, plus the drops above). The `sepolia` RPC row comes from `SEPOLIA_RPC_URL` in `.env`, keeping API-keyed URLs out of source control.
 
 ---
 
 ## `vault_signer.py`
 
-Thin wrapper around the [hvac](https://hvac.readthedocs.io/) Vault client. Exposes two functions used by `anvil.py` and `live_network.py`:
+Thin wrapper around the [hvac](https://hvac.readthedocs.io/) Vault client (unchanged by the overhaul):
 
 ```python
-def encrypt_key(raw_key: bytes) -> str:
-    # Base64-encodes raw_key, sends to Vault Transit, returns 'vault:v1:...' ciphertext
-
-def decrypt_key(ciphertext: str) -> bytes:
-    # Sends ciphertext to Vault, returns raw 32-byte key material
+def encrypt_key(raw_key: bytes) -> str:   # → 'vault:v1:...' ciphertext
+def decrypt_key(ciphertext: str) -> bytes # → raw 32-byte key
 ```
 
-Authentication uses AppRole (`VAULT_ROLE_ID` + `VAULT_SECRET_ID`). A fresh authenticated client is created per call — tokens expire after 1 hour. The Transit key (`session-keys`) lives inside Vault and is never exported.
+Authentication uses AppRole (`VAULT_ROLE_ID` + `VAULT_SECRET_ID`); an authenticated client is cached and re-logged in only near token expiry. The Transit key (`session-keys`) lives inside Vault and is never exported. See [docs/vault-security.md](vault-security.md).
 
 ---
 
@@ -155,361 +116,180 @@ Authentication uses AppRole (`VAULT_ROLE_ID` + `VAULT_SECRET_ID`). A fresh authe
 Resolves Web3 connections from the database.
 
 ```python
-def load_network_config(chat_id: int) -> tuple[Web3, int, str]
-    # Looks up user's current network → returns (Web3, chain_id, chain_name)
-
-def load_network_config_by_name(chain_name: str) -> tuple[Web3, int]
-    # Bypasses user lookup — used in deployment scripts before user_network is set
+def load_network_config(chat_id: int) -> tuple[Web3, int, str]        # (Web3, chain_id, chain_name)
+def load_network_config_by_name(chain_name: str) -> tuple[Web3, int]  # bypasses user lookup (deploy scripts)
 ```
 
 ---
 
 ## `contracts.py`
 
-Contract loading with module-level caching. Every loader checks a per-`chat_id` dict before doing any work. On first call it hits the database and RPC; every subsequent call within the same process returns the cached instance immediately.
+Contract loading with per-`chat_id` caching, plus the ERC-7579 calldata/nonce helpers used by `userop.py`, `anvil.py`, and `live_network.py` so the packing logic lives in one place.
 
 ```python
-def load_session_handler(chat_id: int) -> Contract
-def load_session_handler_module(chat_id: int) -> Contract   # reads the module's address off SessionHandler.SH_MODULE()
-def load_entry_point(chat_id: int) -> Contract               # reads the EntryPoint address off SessionHandler.ENTRY_POINT()
-def load_ierc20(chat_id: int, token: str, uniswap_pair: bool = False) -> Contract  # uses IWETH ABI for "weth"/"wbnb"
-def load_iuniswap_router(chat_id: int) -> Contract
-def load_iuniswap_factory(chat_id: int) -> Contract           # resolves UNISWAP_V2_FACTORY / SEPOLIA_UNISWAP_V2_FACTORY / PANCAKE_V2_FACTORY / UBESWAP_V2_FACTORY by chain_id
-def load_iuniswap_pair(chat_id: int, token_a: str, token_b: str) -> Contract
-def load_factory(chat_id: int) -> Contract                    # SHFactory — used by deploy_wallet.py
-def load_reputation_registry(chat_id: int) -> Contract
-def load_calldata(instance: Contract, fn_name: str, args: list) -> bytes
-def invalidate_cache(chat_id: int) -> None                    # call after a redeploy
+def load_session_handler(chat_id) -> Contract
+def load_spending_limit_module(chat_id) -> Contract   # the spending-cap HOOK, read off SessionHandler.SH_MODULE()
+def load_entry_point(chat_id) -> Contract
+def load_ierc20(chat_id, token, uniswap_pair=False) -> Contract  # uniswap_pair=True binds a raw address (LP tokens)
+def load_iuniswap_router(chat_id) -> Contract
+def load_iuniswap_factory(chat_id) -> Contract
+def load_iuniswap_pair(chat_id, token_a, token_b) -> Contract
+def load_factory(chat_id) -> Contract
+def load_reputation_registry(chat_id) -> Contract
+def load_calldata(instance, fn_name, args) -> bytes
+def invalidate_cache(chat_id) -> None
+
+# ERC-7579 mode words + calldata/batch helpers
+ERC7579_SINGLE_CALL_MODE = b"\x00" * 32           # CALLTYPE_SINGLE
+ERC7579_BATCH_CALL_MODE  = b"\x01" + b"\x00"*31   # CALLTYPE_BATCH
+
+def pack_execution_calldata(target, value, data) -> bytes            # abi.encodePacked(target, value, data)
+def encode_batch_execution_calldata(executions) -> bytes            # abi.encode((address,uint256,bytes)[])
+def session_key_nonce_key(module_address) -> int                    # uint192(uint160(module)) << 32
 ```
 
-**ERC-7579 calldata/nonce helpers**, used by `anvil.py`, `live_network.py`, and `deploy_wallet.py` so the packing logic exists in exactly one place:
-
-```python
-ERC7579_SINGLE_CALL_MODE = b"\x00" * 32   # mode selecting single-call, default-execution-type
-
-def pack_execution_calldata(target: str, value: int, data: bytes) -> bytes:
-    # Mirrors Solidity's abi.encodePacked(target, value, data): raw 20-byte address +
-    # raw 32-byte big-endian value + inner calldata — no ABI offset/length words.
-
-def session_key_nonce_key(module_address: str) -> int:
-    # Mirrors uint192(uint160(module)) << 32 — the nonce key whose top 20 bytes route
-    # UserOp validation to the given SessionHandlerModule instance.
-```
-
-> The cache is process-scoped. Restart the bot process to invalidate after a contract redeploy.
+> **On the nonce key:** the module is a hook, never a validator, so no matter what address the nonce key encodes, the account falls through to its own `_rawSignatureValidation`. `session_key_nonce_key` is kept (any key value validates identically) for continuity with wallets that already submitted ops under it. The batch mode + `encode_batch_execution_calldata` are new — they're how the swap/liquidity tools grant and consume an approval in a single atomic transaction (the module reverts any approval left standing).
 
 ---
 
-## `anvil.py`
+## `anvil.py` / `live_network.py`
 
-The blockchain execution layer for **local and fork networks** (Anvil, mainnet-fork, sepolia-fork, bsc-fork, celo-fork). Handles session key management and the full ERC-4337 UserOp lifecycle by calling `handleOps()` directly — no external bundler required.
-
-### Session Key Management
+The blockchain execution layer. `anvil.py` handles **local and fork networks** by calling `handleOps()` directly (no external bundler); `live_network.py` handles **live networks** (Sepolia, mainnet, BSC) through an Alchemy bundler via JSON-RPC. Both expose a single-call and a batch entry point, sharing one `_submit_user_op` tail:
 
 ```python
-def get_or_create_session_key(chat_id: int, target_address: str) -> tuple[str, str]:
-    # Returns (key_address, vault_ciphertext)
-    # On first call: generates secrets.token_bytes(32), encrypts via Vault Transit,
-    #                stores ciphertext in session_keys, wipes raw key
-    # On subsequent calls: returns stored (address, ciphertext) from DB
+# anvil.py
+send_user_op_as_session(chat_id, key_ciphertext, target, value, data)
+send_batch_user_op_as_session(chat_id, key_ciphertext, executions)     # atomic multi-call
+
+# live_network.py
+send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data)
+send_live_batch_user_op_as_session(chat_id, key_ciphertext, executions)
 ```
 
-**Security properties:**
-- Database breach alone is useless — ciphertexts require Vault to decrypt
-- Vault breach alone is useless — the attacker also needs the DB ciphertexts
-- Per-user, per-target key isolation
-- Raw key exists in process memory only for the milliseconds between `decrypt_key()` and the `finally` wipe
+**UserOp lifecycle (both backends):**
+1. Build `SessionHandler.execute(mode, executionCalldata)` — single-call (`pack_execution_calldata`) or batch (`encode_batch_execution_calldata`).
+2. Fetch a nonce keyed via `session_key_nonce_key()` (validated by the account's own `_rawSignatureValidation`).
+3. Estimate gas (dummy op → `eth_estimateGas` / `eth_estimateUserOperationGas`), then build the real op with a 20% buffer.
+4. **Decrypt the session key from Vault transiently, sign the EIP-191 digest, wipe.**
+5. Submit — `EntryPoint.handleOps` (anvil, signed by `ANVIL_BUNDLER` on plain anvil or `FORK_DEPLOYER_PK` on forks) or `eth_sendUserOperation` (live).
+6. Surface inner-call reverts (`eth_call` replay / bundler reason).
 
-### ERC-4337 UserOp Flow
-
-`send_user_op_as_session()` orchestrates the complete UserOp lifecycle:
-
-1. Pack `(target, value, data)` into ERC-7579 `executionCalldata` via `pack_execution_calldata()`, then ABI-encode `SessionHandler.execute(ERC7579_SINGLE_CALL_MODE, executionCalldata)` as the UserOp `callData`.
-2. Fetch a nonce from `EntryPoint.getNonce()` keyed to the installed `SessionHandlerModule` via `session_key_nonce_key()`, so the account routes validation to it.
-3. Build a signed dummy op, estimate gas via `eth_estimateGas`, then construct the real op with a 20% buffer and live gas price.
-4. Decrypt session key from Vault transiently, sign with EIP-191, wipe.
-5. Submit via `EntryPoint.handleOps([userOp], bundler.address)`, where `bundler` is `ANVIL_BUNDLER` on plain `anvil`, or the shared `FORK_DEPLOYER_PK` on every other (fork) network — the same key `deploy_wallet.py`'s `prefund()` funds, so it always has gas.
-6. On revert: replay via `eth_call` to extract the revert reason.
-
-**Gas constants:**
+### Network routing in `tools.py`
 
 ```python
-DUMMY_INNER_GAS            = 500_000
-DUMMY_PRE_VERIFICATION_GAS = 50_000
-GAS_BUFFER_MULTIPLIER      = 1.2
-PRE_VERIFICATION_GAS       = 50_000
+def send_user_op_as_session(chat_id, key_ciphertext, target, value, data): ...       # → anvil.py or live_network.py
+def send_batch_user_op_as_session(chat_id, key_ciphertext, executions): ...          # batch variant
 ```
-
----
-
-## `live_network.py`
-
-The blockchain execution layer for **live networks** (Sepolia, mainnet, BSC). Submits UserOps through an Alchemy bundler via JSON-RPC — no bundler EOA required from the caller.
-
-### Bundler RPC Flow
-
-`send_live_user_op_as_session()`:
-
-1. Pack and ABI-encode `SessionHandler.execute(ERC7579_SINGLE_CALL_MODE, executionCalldata)`, identically to `anvil.py`.
-2. Fetch a nonce keyed to the installed `SessionHandlerModule`.
-3. Submit a signed dummy op to `eth_estimateUserOperationGas` to get per-component gas limits.
-4. Construct the final op with a 20% buffer and live gas price.
-5. Decrypt session key from Vault transiently, sign, wipe.
-6. Submit via `eth_sendUserOperation` to the Alchemy bundler.
-7. Poll `eth_getUserOperationReceipt` every 2 seconds (timeout: 600s).
-
-**Gas constants:**
-
-```python
-DUMMY_VERIFICATION_GAS       = 150_000
-DUMMY_CALL_GAS               = 500_000
-DUMMY_PRE_VERIFICATION_GAS   = 50_000
-GAS_BUFFER_MULTIPLIER        = 1.2
-USER_OP_RECEIPT_TIMEOUT_SECS = 600
-USER_OP_POLL_INTERVAL_SECS   = 2
-```
-
-> The Alchemy bundler signs and pays for the outer transaction. Bundler private keys in `.env` are not used by `live_network.py`.
-
-### Network Routing in `tools.py`
-
-`send_user_op_as_session()` (in `tools.py`) is the single dispatcher every write `@tool` calls through:
-
-```python
-def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
-    _, _, chain_name = load_network_config(chat_id)
-    if "fork" in chain_name.lower() or "anvil" in chain_name.lower():
-        return _send_user_op_as_session(chat_id, key_ciphertext, target, value, data)   # anvil.py
-    else:
-        return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data)  # live_network.py
-```
-
-`RuntimeError` from either backend is converted to `ToolException` so LangChain's tool error handler can surface it to the agent cleanly.
+`RuntimeError` from either backend is converted to `ToolException` so LangChain surfaces it to the agent cleanly.
 
 ---
 
 ## `deploy_wallet.py`
 
-Per-user wallet deployment and session registration. This module does **not** deploy the shared protocol infrastructure — `EntryPoint`, `SHOracle`, `SHTreasury`/`SHRegistry`, `SHValueInterpreter`, `SessionHandlerModule`, and `SHFactory` are deployed once per chain by the Forge script (`forge script script/DeploySHProtocol.s.sol`, run via `make deploy`) and synced into the DB by `make db`. Everything here assumes that infrastructure already exists and operates strictly on top of it.
+Per-user wallet deployment and single session-key registration. It does **not** deploy the shared infrastructure (the Forge script does, via `make deploy` + `make db`).
 
-**`deploy_wallet(chat_id, chain_name)`** calls `SHFactory.deployWallet()` to create a new `SessionHandler` owned by the deployer key, decodes the `WalletDeployed` event to get the new address, funds it (and the bundler, on fork networks) with 10 ETH via `prefund()`, and persists the resulting address to `wallet.db`. Signing key resolution:
+**Deployment config** (module names in the file):
 
 ```python
-LIVE_PRIVATE_KEY_ENV = {
-    "sepolia": "SEPOLIA_PRIVATE_KEY", "bsc": "BSC_PRIVATE_KEY", "celo": "CELO_PRIVATE_KEY",
-    "sepolia-fork": "SEPOLIA_PRIVATE_KEY", "bsc-fork": "BSC_PRIVATE_KEY", "celo-fork": "CELO_PRIVATE_KEY",
+DEFAULT_DAILY_LIMIT_USD = 50_000 * 10**18   # per-window USD cap (18 decimals)
+DEFAULT_WINDOW_SECS     = 86_400            # 24h window
+DEFAULT_WATCHED_TICKERS = {                 # tokens metered against the cap, per network (each must be oracle-priced)
+    "anvil": ["weth", "usdc", "dai"], "mainnet-fork": ["weth", "usdc", "dai"],
+    "sepolia": ["weth", "usdc", "link"], "sepolia-fork": ["weth", "usdc", "link"],
+    "bsc": ["wbnb", "usdc", "usdt"], "bsc-fork": ["wbnb", "usdc", "usdt"],
+    # Celo omitted — no Solidity NetworkConfig yet
 }
-# falls back to ANVIL_PRIVATE_KEY for plain "anvil"
 ```
 
-Fork networks of a real chain get their real network's key (not the well-known Anvil burner key) — the well-known Anvil/Hardhat accounts have been EIP-7702-delegated to drainer contracts on real Sepolia/BSC/mainnet.
+**`deploy_wallet(chat_id, chain_name)`** calls **`SHFactory.deployWallet(DEFAULT_DAILY_LIMIT_USD, DEFAULT_WINDOW_SECS, watched_tokens)`** — the three args seed the wallet's spending-cap config (`watched_tokens` is `DEFAULT_WATCHED_TICKERS` resolved to addresses). It decodes `WalletDeployed`, funds the wallet (and the bundler, on forks) with 10 ETH via `prefund()`, and persists the address.
 
-**`deploy(chat_id, network)`** is the top-level dispatcher — validates `network` is one of `"anvil"`, `"mainnet-fork"`, `"sepolia-fork"`, `"bsc-fork"`, `"celo-fork"`, `"sepolia"`, `"bsc"`, `"celo"`, then calls `deploy_wallet()`. This is what `make deploy-wallet` invokes via the `__main__` block.
+**`add_default_session(chat_id)`** registers the wallet's **single** session key. It derives one key via `get_or_create_session_key(chat_id, wallet_address)` (Vault-encrypted, keyed to the wallet address), then calls **`SessionHandler.addSession(key)`** as the owner. There are no per-target sessions, selectors, expiries, or budgets to configure — the wallet-wide cap and the admin guard replace all of that. (The old `add_session(targets, functions, ...)` and the `approve()` router-pre-approval helper were removed: standing approvals now revert on-chain, so approvals only ever happen atomically inside the swap/liquidity tools.)
 
-**`add_session(chat_id, targets, functions, session_ends, limits)`** registers one session key per target by calling `addSessionKey()` (or `addUnpricedSessionKey()` for `"reputation_registry"`, which carries no spending limit) as the owner — used internally by `add_default_session()`, but also callable directly for custom session sets. Decodes `SessionAdded` from `SessionHandlerModule` (not `SessionHandler` — the wallet's own ABI no longer declares that event).
+**`deploy(chat_id, network)`** is the top-level dispatcher (validates the network, then calls `deploy_wallet`) — invoked by `make deploy-wallet` via the `__main__` block, which also seeds a demo contact and `add_default_session`.
 
-**`approve(chat_id, token)`** approves the DEX router for `type(uint256).max` of a token from the SessionHandler, calling `execute()` directly as the owner (`ERC7579_SINGLE_CALL_MODE` packing applies here too, even though there's no session key or nonce involved). `add_session()` calls this automatically for every non-ETH, non-router target when deploying on a mainnet/BSC/Celo network, since the router uses `transferFrom` to pull tokens.
-
-**`add_default_session(chat_id)`** registers a default set of session keys via `add_session()`. Sessions vary by network:
-
-**mainnet-fork** (5 sessions):
-
-| Target | Selectors |
-|---|---|
-| `address(0)` (ETH) | None — value transfers only |
-| WETH | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance`, `deposit`, `withdraw` |
-| USDC | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance` |
-| Uniswap V2 Router | all 6 swap functions + `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, `removeLiquidityETH` |
-| Reputation Registry | `giveFeedback` |
-
-**sepolia / sepolia-fork** (5 sessions — Uniswap V2 is officially deployed on Sepolia):
-
-| Target | Selectors |
-|---|---|
-| `address(0)` (ETH) | None — value transfers only |
-| WETH | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance`, `deposit`, `withdraw` |
-| LINK | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance` |
-| Uniswap V2 Router | all 6 swap functions + `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, `removeLiquidityETH` |
-| Reputation Registry | `giveFeedback` |
-
-**bsc / bsc-fork** (5 sessions, mirrors mainnet-fork with WBNB/BNB in place of WETH/ETH):
-
-| Target | Selectors |
-|---|---|
-| `address(0)` (native BNB sentinel) | None — value transfers only |
-| WBNB | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance`, `deposit`, `withdraw` |
-| USDC | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance` |
-| PancakeSwap V2 Router | all 6 swap functions + `addLiquidity`, `addLiquidityETH`, `removeLiquidity`, `removeLiquidityETH` |
-| Reputation Registry | `giveFeedback` |
-
-**celo / celo-fork** (5 sessions — Python-side scaffolding only, no Solidity deployment path yet):
-
-| Target | Selectors |
-|---|---|
-| `address(0)` (native CELO sentinel) | None — value transfers only |
-| CELO (native ERC-20, no wrap step) | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance` (no `deposit`/`withdraw` — CELO has no wrap/unwrap) |
-| USDC | `transfer`, `balanceOf`, `approve`, `transferFrom`, `allowance` |
-| Ubeswap V2 Router | `swapExactTokensForTokens`, `swapTokensForExactTokens`, `addLiquidity`, `removeLiquidity` (no ETH-payable functions — Ubeswap has no `WETH()`) |
-| Reputation Registry | `giveFeedback` |
-
-Each session gets a 50-day validity window and a $50,000 spending limit (`0` for Reputation Registry).
+**Signing-key resolution** (`LIVE_PRIVATE_KEY_ENV`): live networks use their own key (`SEPOLIA_PRIVATE_KEY`, `BSC_PRIVATE_KEY`, `CELO_PRIVATE_KEY`); `sepolia-fork` uses `SEPOLIA_PRIVATE_KEY`, other forks use `FORK_DEPLOYER_PK`; plain `anvil` falls back to `ANVIL_PRIVATE_KEY`. Fork networks of a real chain avoid the well-known Anvil burner key, which has been EIP-7702-delegated to drainers on real Sepolia/BSC/mainnet.
 
 ---
 
 ## `tools.py`
 
-Wraps blockchain operations as LangChain `@tool`-decorated functions. Each tool has a structured docstring the LLM uses to decide when and how to call it.
+Wraps blockchain operations as LangChain `@tool`-decorated functions; each docstring tells the LLM when/how to call it. `get_tools()` is the factory. All write tools route through `send_user_op_as_session()` / `send_batch_user_op_as_session()`.
 
-**`get_tools()`** is the tool factory.
+**One key, one budget.** `get_session_keys(chat_id, <anything>)` always returns the wallet's single session key — the argument is kept for tool-API compatibility but selects nothing. Spending is bounded by one wallet-wide USD cap per window, read on-chain.
 
-All write tools route through the central `send_user_op_as_session()` dispatcher (see `live_network.py` section above).
-
-### Database tools
+### Session / budget / pricing tools
 
 | Tool | Description |
 |---|---|
-| `get_supported_tokens(chat_id)` | Returns supported token tickers for the user's network |
-| `get_all_sessions(chat_id)` | Returns active session metadata, pruning expired ones |
-| `save_contact(chat_id, name, address)` | Persists a new named contact |
-| `get_contact(chat_id, name)` | Resolves a contact name to an Ethereum address |
-| `get_all_contacts(chat_id)` | Returns the full contact list |
-| `delete_contact(chat_id, name)` | Removes a contact |
+| `get_all_sessions(chat_id)` | On-chain wallet status: `{session_active, daily_limit_usd, spent_usd, remaining_usd, window_hours, watched_tokens}` (reads `getConfig`/`getRemainingBudget`/`allowedSession`) |
+| `get_session_keys(chat_id, token)` | Returns `(key_address, vault_ciphertext)` for the wallet's session key |
+| `check_session_validity(chat_id, token)` | Whether the session key is on the `allowedSession` allowlist |
+| `check_remaining_budget(chat_id)` | Remaining USD budget this window (no token arg — the cap is global) |
+| `check_spending_within_budget(chat_id, token, amount)` | Prices `amount` via the oracle and compares to remaining budget |
+| `preflight_check(chat_id, token, amount)` | Session validity + budget check + USD value in one call (no `is_uniswap` arg) |
+| `get_price(chat_id, token)` / `get_usd_value(chat_id, token, amount)` | Unit price / USD value via `SHOracle.getPrice` |
 
-### Blockchain read tools
+### Read / quote / sufficiency tools
 
-| Tool | Description |
-|---|---|
-| `get_eth_balance(chat_id)` | Wallet native-asset balance in whole units |
-| `get_erc20_balance(chat_id, token)` | Wallet token balance in whole units |
-| `get_contact_erc20_balance(chat_id, contact_name, token)` | Token balance of a saved contact |
-| `get_erc20_allowance(chat_id, token, spender)` | Approved allowance for a contact |
-| `get_session_keys(chat_id, token)` | Returns `(key_address, vault_ciphertext)` — creates a new key if none exists |
-| `get_price(chat_id, token)` | Current USD price from SHOracle |
-| `get_usd_value(chat_id, token, amount)` | Converts a token amount to USD |
-| `preflight_check(chat_id, token, amount, is_uniswap)` | Validates session, budget, and USD value in one call |
-| `check_session_validity(chat_id, token)` | Checks if the session key is still active |
-| `check_remaining_budget(chat_id, token)` | Remaining USD spending budget |
-| `check_spending_within_budget(chat_id, token, amount)` | Validates amount against budget |
-| `get_quote_in(chat_id, token_in, token_out, amount_out)` | Cost to acquire exact `amount_out` via `getAmountsIn` |
-| `get_quote_out(chat_id, token_in, token_out, amount_in)` | Expected output for exact `amount_in` via `getAmountsOut` |
-| `get_pool_quote(chat_id, token_a, token_b, amount_a)` | Proportional `token_b` for a given `amount_a` deposit, from live reserves |
-| `get_lp_amounts(chat_id, token_a, token_b, lp_amount)` | Token amounts redeemable by burning `lp_amount` LP tokens |
-| `get_liquidity_token_balance(chat_id, token_a, token_b)` | Wallet LP token balance for a pair |
-| `get_agent_id(chat_id)` | Returns the agent's ERC-8004 token ID |
+`get_eth_balance`, `get_erc20_balance`, `get_contact_erc20_balance`, `get_erc20_allowance` (≈always 0 by design), `get_quote_in`, `get_quote_out`, `get_pool_quote`, `get_lp_amounts`, `get_liquidity_token_balance`, `is_derived_input_sufficient`, `is_exact_input_sufficient`, `is_liquidity_sufficient`, `is_liquidity_removal_sufficient`, plus contacts (`save_contact`/`get_contact`/`get_all_contacts`/`delete_contact`) and `get_supported_tokens`, `get_native_asset`.
 
-### Balance sufficiency tools
+### Write tools
 
 | Tool | Description |
 |---|---|
-| `is_derived_input_sufficient(chat_id, token_in, token_out, amount_out, slippage_bps)` | Exact-output swaps: derives required input via `getAmountsIn` and checks balance |
-| `is_exact_input_sufficient(chat_id, token_in, amount_in)` | Exact-input swaps: compares balance against spend amount |
-| `is_liquidity_sufficient(chat_id, token_a, amount_a, token_b)` | `addLiquidity`: derives required `token_b` from reserves and checks both balances |
-| `is_liquidity_removal_sufficient(chat_id, token_a, token_b, lp_amount)` | `removeLiquidity`: checks LP token balance |
+| `send_eth(...)` | Sends native ETH/BNB/CELO (metered — native value counts against the cap) |
+| `transfer_erc20(...)` | Sends tokens (metered if watched) |
+| `transferFrom_erc20(...)` | Transfers from an approved sender |
+| `wrap_eth(...)` | Wraps native → WETH/WBNB |
+| `swap_*` (all six variants) | Uniswap/PancakeSwap V2 swaps — **approve + swap sent as one atomic batch** |
+| `add_liquidity(...)` / `add_liquidity_eth(...)` | Add liquidity — approvals batched and residuals zeroed atomically |
+| `remove_liquidity(...)` / `remove_liquidity_eth(...)` | Remove liquidity — the pool's **LP token** is approved by address to the auto-trusted router and consumed in one batch |
 
-### Blockchain write tools
-
-| Tool | Description |
-|---|---|
-| `send_eth(chat_id, session_key_ciphertext, recipient, amount_eth)` | Sends native ETH/BNB/CELO |
-| `transfer_erc20(chat_id, session_key_ciphertext, token, recipient, amount)` | Sends tokens |
-| `approve_erc20(chat_id, session_key_ciphertext, token, spender, amount)` | Approves a spender |
-| `transferFrom_erc20(chat_id, session_key_ciphertext, token, sender, recipient, amount)` | Transfers from approved sender |
-| `wrap_eth(chat_id, session_key_ciphertext, amount_eth)` | Wraps native ETH/BNB to WETH/WBNB (no-op path for CELO, which is natively an ERC-20) |
-| `swap_ETH_for_exact_tokens(...)` | `swapETHForExactTokens` |
-| `swap_exact_tokens_for_ETH(...)` | `swapExactTokensForETH` |
-| `swap_tokens_for_exact_ETH(...)` | `swapTokensForExactETH` |
-| `swap_exact_ETH_for_tokens(...)` | `swapExactETHForTokens` |
-| `swap_exact_tokens_for_tokens(...)` | `swapExactTokensForTokens` |
-| `swap_tokens_for_exact_tokens(...)` | `swapTokensForExactTokens` |
-| `add_liquidity(...)` | Add liquidity to a Uniswap/PancakeSwap/Ubeswap V2 pool |
-| `add_liquidity_eth(...)` | Add liquidity to a token/native-asset pool |
-| `remove_liquidity(...)` | Remove liquidity; credits budget back |
-| `remove_liquidity_eth(...)` | Remove liquidity from a token/native-asset pool; credits budget back |
-
-All write tools accept `session_key_ciphertext: str` — the opaque Vault ciphertext from `get_session_keys`. Never decrypted or logged at the tool layer.
+> **There is no `approve_erc20` tool.** Standing approvals revert on-chain (the module forbids leaving an allowance outstanding), so a standalone approval can never succeed. The swap and liquidity tools grant and consume the router approval atomically via `_submit_router_call(..., approvals=[(token_ref, amount)])`, where `token_ref` is a ticker or a raw address (for LP tokens). Exact-output flows also zero any residual in the same transaction (`reset_approvals=True`).
 
 ### ERC-8004 tools
 
-| Tool | Description |
-|---|---|
-| `get_agent_identity(chat_id)` | Returns the agent's ERC-8004 `token_id` and `card_uri` |
-| `get_agent_reputation(chat_id)` | Returns `average_score` and `feedback_count` from the ReputationRegistry |
-| `post_reputation_feedback(chat_id, session_key_ciphertext, score, tags)` | Posts `giveFeedback` via the `reputation_registry` session key |
+`get_agent_identity`, `get_agent_reputation`, `post_reputation_feedback` (`giveFeedback` via the session key). All write tools accept `session_key_ciphertext` — the opaque Vault ciphertext; never decrypted or logged at the tool layer.
 
 ---
 
 ## Section 3 — LangChain Agent
 
-`app/smart_wallet_agent.py` wraps the blockchain tools in a LangChain ReAct agent powered by Anthropic's Claude.
-
-**Default model:** `claude-sonnet-4-6`. Swappable for any [LangChain-supported provider](https://python.langchain.com/docs/integrations/chat/) by changing the `llm` initialisation.
-
-### Architecture
+`app/smart_wallet_agent.py` wraps the tools in a LangChain agent powered by Claude (`claude-sonnet-4-6` by default, swappable).
 
 ```python
 def init_agent():
-    tools = get_tools()
-    agent = create_agent(
-        model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, checkpointer=memory
-    )
+    agent = create_agent(model=llm, tools=get_tools(), system_prompt=SYSTEM_PROMPT, checkpointer=_checkpointer, middleware=[...])
 ```
 
-Called once at startup — by `main()` for CLI mode and by the bot's `post_init` callback.
+`AsyncSqliteSaver` persists message history keyed by `thread_id` (the `chat_id`), so each user has an isolated, restart-surviving conversation.
 
-`AsyncSqliteSaver` persists the full message history to SQLite, keyed by `thread_id`. Each Telegram user gets an isolated, persistent conversation context that survives bot restarts.
+### System prompt
 
-### System Prompt
+The `SYSTEM_PROMPT` teaches the agent the new model up front:
 
-The `SYSTEM_PROMPT` instructs the agent on:
+- **One session key, one global USD budget** per rolling window — no per-token limits, no expiry. `get_all_sessions` reports cap/spent/remaining/watched tokens.
+- **Watched tokens and native value count against the cap;** only unwatched tokens move freely. A swap is charged its **net** value change, not the gross input.
+- **Approvals are automatic** — there is no approve step or tool; swap/liquidity tools batch them atomically. A "please approve X" request should be declined with an explanation.
+- **Removing liquidity is free** against the cap (it returns value — a net inflow).
+- One **`preflight_check(token, amount)`** before any spend; **never** estimate swap amounts from prices (`get_quote_in`/`get_quote_out` only); resolve the wrapped-native ticker per chain; never invent addresses; always confirm before an on-chain write; never expose the ciphertext.
 
-- **Hard rule:** Never estimate swap quantities from prices — always call `get_quote_in` or `get_quote_out`. Price-based estimates ignore pool depth and fees.
-- Multi-step workflows for every operation type (transfers, swaps, liquidity).
-- Chain-aware wording: resolve the wrapped-native ticker (`"weth"` vs `"wbnb"`) via `get_supported_tokens` before assuming which one applies.
-- Safety rules: never invent addresses; always resolve names via `get_contact` first; never expose `session_key_ciphertext` in responses.
-- Token validation: always call `get_supported_tokens` before any on-chain action.
-- How to extract `chat_id` from the `[chat_id: <number>]` message prefix.
-
-### Per-User Memory
-
-```python
-config={"configurable": {"thread_id": str(chat_id)}}
-```
-
-### `chat()` Function
-
-```python
-def chat(chat_id: int, user_input: str) -> str:
-    response = agent.invoke(
-        {"messages": [HumanMessage(content=f"[chat_id: {chat_id}] {user_input}")]},
-        config={"configurable": {"thread_id": str(chat_id)}},
-    )
-    return response["messages"][-1].content
-```
-
-The `chat_id` is embedded in the `HumanMessage` content because Anthropic's API does not allow multiple non-consecutive system messages.
+The `chat_id` is embedded in each `HumanMessage` as a `[chat_id: <n>]` prefix (Anthropic's API disallows multiple non-consecutive system messages). `chat(chat_id, user_input)` is the synchronous entry point.
 
 ---
 
 ## Section 4 — Telegram Bot
 
-`app/telebot.py` exposes the AI agent as a Telegram bot using [python-telegram-bot v20](https://docs.python-telegram-bot.org/).
-
-### Handlers
+`app/telebot.py` exposes the agent as a Telegram bot ([python-telegram-bot v20](https://docs.python-telegram-bot.org/)).
 
 | Handler | Trigger | Action |
 |---|---|---|
-| `/start` | `/start` command | Sends welcome message and schedules daily session expiry check |
-| `/help` | `/help` command | Sends help menu |
-| `start_chat` | Any text message | Routes to AI agent via `asyncio.to_thread` and replies |
+| `/start` | `/start` | Welcome message; schedules the daily budget alert |
+| `/help` | `/help` | Help menu |
+| `start_chat` | Any text | Routes to the agent via `asyncio.to_thread` and replies |
 
-### `post_init` Callback
+### Budget alerts
 
-Runs once before polling starts: opens the checkpointer and calls `init_agent()`.
+A daily **`budget_alert`** job (registered per user on `/start`, replacing the old session-expiry alert since keys no longer expire) reads the wallet's on-chain status via `get_all_sessions` and warns the user when the session key is inactive, or when the remaining budget has dropped below **10%** (`BUDGET_ALERT_THRESHOLD`) of the window cap.
 
-### Session Expiry Alerts
-
-A daily `session_expiry_alert` job is registered per user on `/start`. Every 24 hours it checks all sessions and sends a warning if any expires within the next day.
-
-### Async and Thread Safety
-
-`invoke()` is synchronous and is offloaded via `asyncio.to_thread()` to avoid blocking the event loop. SQLite thread safety is handled in `db.py` via `threading.local()`.
+`post_init` opens the checkpointer and calls `init_agent()` once before polling. `invoke()` is synchronous and offloaded via `asyncio.to_thread()`; SQLite thread safety is handled in `db.py` via `threading.local()`.

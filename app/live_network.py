@@ -3,7 +3,7 @@ import requests
 from dotenv import load_dotenv
 from web3.contract import Contract
 from network_config import load_network_config
-from userop import create_signed_user_op, prepare_execute_call
+from userop import create_signed_user_op, prepare_execute_call, prepare_execute_batch_call
 
 load_dotenv()
 
@@ -200,7 +200,7 @@ def send_live_user_op_as_session(
 
     Packs (target, value, data) into ERC-7579 executionCalldata and encodes
     SessionHandler.execute(mode, executionCalldata) as the UserOp calldata, fetches a
-    nonce keyed to the installed SessionHandlerModule (so the account routes validation to
+    nonce keyed to the installed SpendingLimitModule (so the account routes validation to
     it), estimates gas via the bundler, builds and signs a PackedUserOperation, submits it
     via eth_sendUserOperation, and polls for inclusion via eth_getUserOperationReceipt.
 
@@ -215,12 +215,47 @@ def send_live_user_op_as_session(
                           is 1 on success, matching the return shape of anvil.py for
                           compatibility with tools.py callers.
     """
-    w3, _, _ = load_network_config(chat_id)
-    rpc_url = str(w3.provider.endpoint_uri)
-
     session_handler, entry_point, calldata, nonce = prepare_execute_call(
         chat_id, target, value, data
     )
+    return _submit_user_op(chat_id, key_ciphertext, session_handler, entry_point, calldata, nonce)
+
+
+def send_live_batch_user_op_as_session(
+    chat_id: int, key_ciphertext: str, executions: list[tuple[str, int, bytes]]
+):
+    """
+    Batch variant of send_live_user_op_as_session: submits several sub-calls as ONE atomic
+    execute(batchMode, ...) UserOp via the bundler. Required for any flow that grants an
+    approval — SpendingLimitModule reverts the whole transaction if an approval survives it,
+    so [approve, spend(, approve 0)] must land together.
+
+    @param chat_id        The Telegram chat ID of the user.
+    @param key_ciphertext Vault Transit ciphertext for the session key ('vault:v1:...').
+    @param executions     List of (target_address, value_wei, calldata_bytes) triples, in order.
+    @return               A tuple of (user_op_hash_bytes, receipt), same shape as the single-call flow.
+    """
+    session_handler, entry_point, calldata, nonce = prepare_execute_batch_call(
+        chat_id, executions
+    )
+    return _submit_user_op(chat_id, key_ciphertext, session_handler, entry_point, calldata, nonce)
+
+
+def _submit_user_op(
+    chat_id: int,
+    key_ciphertext: str,
+    session_handler,
+    entry_point,
+    calldata: str,
+    nonce: int,
+):
+    """
+    Shared tail of the live-bundler UserOp flow: estimates gas via the bundler, signs the op
+    with the session key, submits via eth_sendUserOperation, and polls for the receipt.
+    Everything after calldata construction is identical for single-call and batch ops.
+    """
+    w3, _, _ = load_network_config(chat_id)
+    rpc_url = str(w3.provider.endpoint_uri)
 
     print("\n[1/3] Creating transaction  ...")
     user_op = create_unsigned_user_op(

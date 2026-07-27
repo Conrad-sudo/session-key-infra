@@ -8,15 +8,18 @@ from db import (
     get_contact as _get_contact,
     get_all_contacts as _get_all_contacts,
     delete_contact as _delete_contact,
-    get_all_sessions as _get_all_sessions,
-    delete_session,
-   
 )
 from network_config import load_network_config
-from anvil import send_user_op_as_session as _send_user_op_as_session
+from anvil import (
+    send_user_op_as_session as _send_user_op_as_session,
+    send_batch_user_op_as_session as _send_batch_user_op_as_session,
+)
 from userop import get_or_create_session_key
 
-from live_network import send_live_user_op_as_session as _send_live_user_op_as_session
+from live_network import (
+    send_live_user_op_as_session as _send_live_user_op_as_session,
+    send_live_batch_user_op_as_session as _send_live_batch_user_op_as_session,
+)
 
 from constants import ETH_SENTINEL, WEI_PER_ETH, get_native_wrapped_ticker, get_native_asset_ticker
 
@@ -57,7 +60,35 @@ def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
             return _send_live_user_op_as_session(chat_id, key_ciphertext, target, value, data)
         except RuntimeError as e:
             raise ToolException(str(e))
-        
+
+
+def send_batch_user_op_as_session(chat_id, key_ciphertext, executions):
+    """
+    Batch counterpart of send_user_op_as_session: routes an atomic multi-call UserOperation
+    (ERC-7579 batch mode) to the right backend. Used by every flow that grants an approval,
+    since SpendingLimitModule reverts any transaction that leaves an approval standing —
+    [approve, spend(, approve 0)] must land together in one UserOp.
+
+    @param chat_id        The Telegram chat ID of the user making the request.
+    @param key_ciphertext Vault Transit ciphertext for the session key ('vault:v1:...').
+    @param executions     List of (target_address, value_wei, calldata_bytes) triples, in order.
+    @return               A tuple of (tx_hash_bytes, receipt_dict).
+    @raises ToolException If the UserOperation fails or the bundler rejects the submission.
+    """
+    _, _, chain_name = load_network_config(chat_id)
+
+    if "fork" in chain_name.lower() or "anvil" in chain_name.lower():
+        try:
+            return _send_batch_user_op_as_session(chat_id, key_ciphertext, executions)
+        except RuntimeError as e:
+            raise ToolException(str(e))
+    else:
+        try:
+            return _send_live_batch_user_op_as_session(chat_id, key_ciphertext, executions)
+        except RuntimeError as e:
+            raise ToolException(str(e))
+
+
 
 
 
@@ -79,27 +110,91 @@ DEFAULT_SLIPPAGE_BPS = 50  # 0.5%
 SWAP_DEADLINE_SECS = 600  # 10 minutes
 
 
-def _submit_router_call(chat_id, session_key_ciphertext, router, fn_name, args, value=0):
+def _submit_router_call(
+    chat_id,
+    session_key_ciphertext,
+    router,
+    fn_name,
+    args,
+    value=0,
+    approvals=None,
+    reset_approvals=False,
+):
     """Encode a Uniswap/PancakeSwap V2 router call and submit it as a session-key UserOp.
 
     Shared by every swap and liquidity @tool so the encode + submit + status-check boilerplate
     lives in one place; each tool still builds its own quote, slippage bounds, and args list.
     Returns (tx_hash, receipt); raises ToolException if the UserOp did not succeed.
 
-    @param router  Bound router Contract (its .address is the UserOp target).
-    @param fn_name Router function name for load_calldata (e.g. "swapExactTokensForTokens").
-    @param args    Positional args for that router function, in ABI order.
-    @param value   Native wei to forward (0 for token-in calls; the ETH/BNB amount for
-                   ETH-funded swaps and addLiquidityETH).
+    When `approvals` are given, the whole thing goes out as ONE atomic ERC-7579 batch:
+    [approve(router, amount) per token] + [router call] (+ [approve(router, 0) per token] when
+    reset_approvals is True). This is mandatory under SpendingLimitModule's
+    no-standing-approval rule — an approval that survives its own transaction reverts it, so
+    pre-approving in a separate transaction is impossible. Use reset_approvals=True whenever
+    the router may pull LESS than approved (exact-output swaps, addLiquidity), so the residual
+    is zeroed in the same transaction instead of tripping the module.
+
+    Each approval entry's first field is a token REFERENCE — either a ticker ("usdc") for a
+    listed token, or a raw 0x address for one with no ticker (a pool's LP token in removeLiquidity).
+    The LP-token case only clears the module's approval check because the router is a trusted
+    spender (auto-trusted at wallet deploy), so an unpriced-token approval to it is permitted.
+
+    @param router          Bound router Contract (its .address is the UserOp target).
+    @param fn_name         Router function name for load_calldata (e.g. "swapExactTokensForTokens").
+    @param args            Positional args for that router function, in ABI order.
+    @param value           Native wei to forward (0 for token-in calls; the ETH/BNB amount for
+                           ETH-funded swaps and addLiquidityETH).
+    @param approvals       Optional list of (token_ref, amount_base) to approve for the router in
+                           the same transaction. token_ref is a ticker or a raw 0x token address.
+    @param reset_approvals Also append approve(router, 0) for each approved token after the
+                           router call, clearing any residual allowance.
     """
     data = load_calldata(instance=router, fn_name=fn_name, args=args)
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=router.address,
-        value=value,
-        data=data,
-    )
+
+    if not approvals:
+        tx_hash, receipt = send_user_op_as_session(
+            chat_id=chat_id,
+            key_ciphertext=session_key_ciphertext,
+            target=router.address,
+            value=value,
+            data=data,
+        )
+    else:
+
+        def _load_approval_token(ref):
+            # A raw 0x address (e.g. an LP-token/pair) is bound directly; a ticker is resolved
+            # through the token tables. uniswap_pair=True makes load_ierc20 treat ref as the address.
+            if isinstance(ref, str) and ref.startswith("0x") and len(ref) == 42:
+                return load_ierc20(chat_id=chat_id, token=ref, uniswap_pair=True)
+            return load_ierc20(chat_id=chat_id, token=ref)
+
+        executions = []
+        for token_ref, amount_base in approvals:
+            erc20 = _load_approval_token(token_ref)
+            executions.append(
+                (
+                    erc20.address,
+                    0,
+                    load_calldata(instance=erc20, fn_name="approve", args=[router.address, amount_base]),
+                )
+            )
+        executions.append((router.address, value, data))
+        if reset_approvals:
+            for token_ref, _ in approvals:
+                erc20 = _load_approval_token(token_ref)
+                executions.append(
+                    (
+                        erc20.address,
+                        0,
+                        load_calldata(instance=erc20, fn_name="approve", args=[router.address, 0]),
+                    )
+                )
+        tx_hash, receipt = send_batch_user_op_as_session(
+            chat_id=chat_id,
+            key_ciphertext=session_key_ciphertext,
+            executions=executions,
+        )
+
     if receipt["status"] != 1:
         raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
     return tx_hash, receipt
@@ -155,33 +250,59 @@ def get_native_asset(chat_id: int) -> str:
     return get_native_asset_ticker(chain_id)
 
 
-@tool
-def get_all_sessions(chat_id: int) -> list[dict]:
-    """
-    Retrieves all active sessions for a given user.
+def _addresses_to_tickers(chat_id: int, addresses: list) -> list:
+    """Best-effort reverse map of token addresses to their supported tickers, falling back to the
+    raw address for anything not in the network's token table."""
+    reverse = {}
+    for ticker in _get_supported_tokens(chat_id):
+        try:
+            reverse[load_ierc20(chat_id=chat_id, token=ticker).address.lower()] = ticker
+        except Exception:
+            pass
+    return [reverse.get(a.lower(), a) for a in addresses]
 
-    Use this tool when the user wants to see an overview of all their session keys,
-    including which tokens they are scoped to, their spending limits, and when they expire.
+
+@tool
+def get_all_sessions(chat_id: int) -> dict:
+    """
+    Reports the wallet's session-key and USD spending-cap status — the modern replacement for
+    per-token sessions.
+
+    This wallet authorizes ONE session key for every action, bounded by a single wallet-wide USD
+    spending cap per rolling window (there are no per-token limits, and the key does not expire).
+    Use this whenever the user asks about their session, spending limit, remaining budget, or how
+    much they can still spend.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
 
     Returns:
-        A list of dicts, each with 'target' (token ticker), 'spending_limit' (in whole units,
-        e.g. 1000.0), and 'end_time' (ISO 8601 date string). Raises ValueError if no sessions
-        exist for the user.
+        A dict with:
+          - session_active (bool): whether the wallet's session key is currently authorized.
+          - daily_limit_usd (float): the per-window spending cap, in whole USD.
+          - spent_usd (float): net USD value spent so far in the current window.
+          - remaining_usd (float): USD still spendable in the current window.
+          - window_hours (float): length of the spending window, in hours.
+          - watched_tokens (list): ERC20 tickers whose value movements count against the cap. The
+            native asset (ETH/BNB) is ALWAYS metered and is not on this list; only unwatched ERC20s
+            move freely and are not metered.
     """
     print("Running get_all_sessions")
-    rows = _get_all_sessions(chat_id)
     session_handler = load_session_handler(chat_id)
-    active = []
-    for row in rows:
-        session_key, _ = get_session_keys.func(chat_id, row["target"])
-        if session_handler.functions.isSessionActive(session_key).call():
-            active.append(row)
-        else:
-            delete_session(chat_id, row["target"])
-    return active
+    session_key, _ = get_session_keys.func(chat_id, "wallet")
+    # Config tuple: (installed, windowStart, windowDuration, dailyLimitUsd, spentInWindow,
+    #                watchedTokens, trustedSpenders)
+    cfg = session_handler.functions.getConfig().call()
+    remaining = session_handler.functions.getRemainingBudget().call()
+
+    return {
+        "session_active": session_handler.functions.allowedSession(session_key).call(),
+        "daily_limit_usd": cfg[3] / WEI_PER_ETH,
+        "spent_usd": cfg[4] / WEI_PER_ETH,
+        "remaining_usd": remaining / WEI_PER_ETH,
+        "window_hours": cfg[2] / 3600,
+        "watched_tokens": _addresses_to_tickers(chat_id, cfg[5]),
+    }
 
 
 @tool
@@ -373,16 +494,12 @@ def get_session_keys(chat_id: int, token: str) -> tuple[str, str]:
     """
     print("Running get_session_keys")
 
-    if token == "uniswapv2_router":
-        target_address = load_session_handler(chat_id).functions.getRouter().call()
-    elif token == "eth":
-        target_address = ETH_SENTINEL
-    elif token == "reputation_registry":
-        target_address = load_reputation_registry(chat_id).address
-    else:
-        target_address = load_ierc20(chat_id=chat_id, token=token).address
-
-    return get_or_create_session_key(chat_id, target_address)
+    # The account now authorizes ONE bare session key for the whole wallet (allowedSession
+    # allowlist) rather than per-target scoped keys — every token/router/registry operation
+    # signs with the same key, bounded by the wallet's global USD spending cap. The `token`
+    # parameter is kept for tool-API compatibility but no longer selects a different key.
+    wallet_address = load_session_handler(chat_id).address
+    return get_or_create_session_key(chat_id, wallet_address)
 
 
 @tool
@@ -404,67 +521,67 @@ def check_session_validity(chat_id: int, token: str) -> bool:
     print("Running check_session_validity")
     session_key, _ = get_session_keys.func(chat_id, token)
     session_handler = load_session_handler(chat_id)
-    return session_handler.functions.isSessionActive(session_key).call()
+    return session_handler.functions.allowedSession(session_key).call()
 
 
 @tool
-def check_remaining_budget(chat_id: int, token: str) -> float:
+def check_remaining_budget(chat_id: int) -> float:
     """
-    Returns the remaining spending budget for a session key.
+    Returns the wallet's remaining USD spending budget for the current window.
 
-    Use this tool when the user wants to know how much budget is left on their
-    session key for a given token.
+    The wallet has a single USD spending cap per rolling window, shared across every token and
+    venue (there is no per-token budget). Use this when the user asks how much they can still spend.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        token: The token ticker symbol to check the session for (e.g. "usdc").
 
     Returns:
-        The remaining budget in whole USD units (e.g. 500.0 for $500 remaining).
+        The remaining budget in whole USD units (e.g. 500.0 for $500 remaining this window).
     """
     print("Running check_remaining_budget")
-    session_key, _ = get_session_keys.func(chat_id, token)
     session_handler = load_session_handler(chat_id)
-    budget = session_handler.functions.getRemainingBudget(session_key).call()
+    budget = session_handler.functions.getRemainingBudget().call()
     return budget / WEI_PER_ETH
 
 
 @tool
-def check_spending_within_budget(
-    chat_id: int, token: str, amount: int, is_uniswap=False
-) -> bool:
+def check_spending_within_budget(chat_id: int, token: str, amount: int) -> bool:
     """
-    Checks if a proposed transaction amount is within the remaining budget of the session key.
+    Checks whether spending `amount` of `token` fits within the wallet's remaining USD budget for
+    the current window.
 
-    Use this tool before attempting a transfer to ensure that the amount being sent does not exceed the session's spending limit.
-    Note: the comparison is done in USD — the token amount is converted to its USD value via a price
-    oracle and checked against the remaining budget, which is also tracked in USD, not in token units.
+    The comparison is done in USD: the token amount is priced via the oracle and compared against
+    the single wallet-wide remaining budget. Native value (ETH/BNB) is metered too — pass "eth"/"bnb"
+    to check a native send. For a swap, pass the token being SOLD (the value leaving the wallet) —
+    this is a conservative upper bound, since a swap is actually charged only its NET portfolio value
+    change, not the gross input.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        token: The token ticker symbol used to price the amount (e.g. "usdc"). For Uniswap swaps,
-               pass the token being sold (swapExactTokensForTokens) or the token being acquired
-               (swapTokensForExactTokens) as a USD proxy.
-        amount: The proposed transaction amount in whole token units (e.g. 100 for 100 USDC).
-        is_uniswap: Set to True when checking budget for a Uniswap swap. Fetches the
-                    "uniswapv2_router" session key instead of a token-scoped one. Defaults to False.
+        token: The token ticker symbol used to price the amount (e.g. "usdc", or "eth"/"bnb" for native).
+        amount: The proposed amount in whole token units (e.g. 100 for 100 USDC).
 
     Returns:
-        True if the proposed amount is within the remaining budget, False otherwise.
+        True if the USD value of the amount is within the remaining budget, False otherwise.
     """
     print("Running check_spending_within_budget")
     session_handler = load_session_handler(chat_id)
 
-    if is_uniswap:
-        session_key, _ = get_session_keys.func(chat_id, "uniswapv2_router")
+    # The cap is wallet-wide net-value metering: convert the amount to USD via the oracle and
+    # compare against the remaining window budget. Native value (ETH/BNB) is metered too, so it is
+    # priced through the address(0) sentinel; watched ERC20s are priced by their token address.
+    # (A swap's real charge is its NET value change, so pricing the gross amount here is a
+    # conservative upper bound for the check.)
+    if token.lower() in ("eth", "bnb"):
+        token_address = ETH_SENTINEL
+        base_units = _to_base_units(amount, 18)
     else:
-        session_key, _ = get_session_keys.func(chat_id, token)
-
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
-    decimals = erc20.functions.decimals().call()
-    return session_handler.functions.isSpendingWithinBudget(
-        session_key, erc20.address, _to_base_units(amount, decimals)
-    ).call()
+        erc20 = load_ierc20(chat_id=chat_id, token=token)
+        token_address = erc20.address
+        base_units = _to_base_units(amount, erc20.functions.decimals().call())
+    usd_value = session_handler.functions.getUsdValue(token_address, base_units).call()
+    remaining = session_handler.functions.getRemainingBudget().call()
+    return usd_value <= remaining
 
 
 @tool
@@ -485,15 +602,18 @@ def get_price(chat_id: int, token: str) -> float:
     """
     print("Running get_price")
 
-    token_address = (
-        ETH_SENTINEL
-        if token.lower() == "eth"
-        else load_ierc20(chat_id=chat_id, token=token).address
-    )
+    if token.lower() in ("eth", "bnb"):
+        token_address = ETH_SENTINEL
+        decimals = 18
+    else:
+        erc20 = load_ierc20(chat_id=chat_id, token=token)
+        token_address = erc20.address
+        decimals = erc20.functions.decimals().call()
     print(f"Getting price for token: {token}, address: {token_address}")
     session_handler = load_session_handler(chat_id)
-    price, decimals = session_handler.functions.getPrice(token_address).call()
-    return price / (10**decimals)
+    # getUsdValue(token, one whole token) returns the unit price with 18 decimals.
+    usd_value = session_handler.functions.getUsdValue(token_address, 10**decimals).call()
+    return usd_value / WEI_PER_ETH
 
 
 @tool
@@ -519,57 +639,43 @@ def get_usd_value(chat_id: int, token: str, amount: float) -> float:
 
 
 @tool
-def preflight_check(
-    chat_id: int,
-    token: str,
-    amount: float,
-    is_uniswap: bool = False,
-) -> dict:
+def preflight_check(chat_id: int, token: str, amount: float) -> dict:
     """
-    Runs all pre-transaction checks in a single call: session validity, budget check,
-    and USD value conversion. Call this instead of check_session_validity,
-    check_spending_within_budget, and get_usd_value separately before any on-chain action.
+    Runs all pre-transaction checks in one call: session validity, budget check, and USD value.
+    Call this instead of check_session_validity, check_spending_within_budget, and get_usd_value
+    separately before any on-chain action. It applies to every operation — plain transfers and
+    swaps alike — because the wallet has a single session key and a single USD spending cap.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        token: The token ticker to check (e.g. "usdc"). For Uniswap swaps, pass the token
-               being sold (exact-in) or acquired (exact-out) as the USD proxy. Pass "eth" for a
-               native ETH/BNB send — the budget check is skipped (the native asset is not an
-               ERC20) and usd_value reflects the native amount at the current price.
+        token: The token ticker to price for the budget check (e.g. "usdc"). For a swap, pass the
+               token being SOLD (the value leaving the wallet). Pass "eth"/"bnb" for a native send —
+               native value is metered against the cap too, so it is priced and budget-checked like
+               any other spend.
         amount: The proposed amount in whole token units (e.g. 100 for 100 USDC).
-        is_uniswap: Set to True for Uniswap swaps so the router session key is used for
-                    the budget check. Defaults to False.
 
     Returns:
         A dict with:
-          - "session_active" (bool): True if the session key is valid and active.
-          - "within_budget" (bool): True if the amount is within the remaining budget.
+          - "session_active" (bool): True if the wallet's session key is authorized.
+          - "within_budget" (bool): True if the amount fits the remaining USD budget.
           - "usd_value" (float): The USD equivalent of `amount` at the current price.
-        If "session_active" is False, abort and notify the user. If "within_budget" is
-        False, abort and notify the user. Only proceed if both are True.
+        If "session_active" is False, abort and notify the user. If "within_budget" is False,
+        abort and notify the user. Only proceed if both are True.
     """
     print("Running preflight_check")
-    session_key_token = "uniswapv2_router" if is_uniswap else token
-    session_key, _ = get_session_keys.func(chat_id, session_key_token)
+    session_key, _ = get_session_keys.func(chat_id, token)
     session_handler = load_session_handler(chat_id)
 
-    session_active = session_handler.functions.isSessionActive(session_key).call()
-
-    if token.lower() == "eth":
-
-        decimals = 18
-        within_budget = session_handler.functions.isSpendingWithinBudget(
-            session_key, ETH_SENTINEL, _to_base_units(amount, decimals)
-        ).call()
-
-    else:
-        erc20 = load_ierc20(chat_id=chat_id, token=token)
-        decimals = erc20.functions.decimals().call()
-        within_budget = session_handler.functions.isSpendingWithinBudget(
-            session_key, erc20.address, _to_base_units(amount, decimals)
-        ).call()
+    session_active = session_handler.functions.allowedSession(session_key).call()
 
     usd_value = get_price.func(chat_id, token) * amount
+    remaining = session_handler.functions.getRemainingBudget().call() / WEI_PER_ETH
+
+    # Native value (ETH/BNB) is metered against the cap just like watched ERC20s — get_price prices
+    # it through the address(0) sentinel — so every spend is compared in USD against the wallet-wide
+    # remaining window budget. Gross value is a conservative bound: swaps are actually charged only
+    # their NET portfolio value change on-chain.
+    within_budget = usd_value <= remaining
 
     return {
         "session_active": session_active,
@@ -632,15 +738,18 @@ def get_erc20_allowance(chat_id: int, token: str, spender: str) -> float:
     """
     Retrieves the smart wallet's ERC20 token allowance for a specified spender.
 
-    Use this tool when the user wants to check how many tokens the wallet has approved
-    for a particular spender before making a transferFrom or similar operation.
+    Use this tool when the user wants to check how many tokens the wallet has approved for a
+    particular spender. NOTE: this wallet almost always returns 0. Its spending-limit module
+    forbids standing allowances — approvals are only ever granted and consumed within a single
+    transaction (inside swaps/liquidity), so nothing remains approved afterwards. A non-zero
+    result would be unusual.
 
     Args:
         token: The token ticker symbol to check (e.g. "usdc").
         spender: The name of the contact who is the spender (e.g. "Sandy"). Must be a saved contact.
 
     Returns:
-        The token allowance approved for the spender in whole units (e.g. 100.0 for 100 USDC).
+        The token allowance approved for the spender in whole units (typically 0.0 by design).
     """
     print("Running get_erc20_allowance")
     erc20 = load_ierc20(chat_id=chat_id, token=token)
@@ -731,52 +840,6 @@ def transfer_erc20(
     data = load_calldata(
         instance=erc20, fn_name="transfer", args=[recipient_addr, value]
     )
-    target = erc20.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
-    return f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}"
-
-
-@tool
-def approve_erc20(
-    chat_id: int, session_key_ciphertext: str, token: str, spender: str, amount: float
-):
-    """
-    Approves a spender to transfer ERC20 tokens on behalf of the smart wallet.
-
-    Use this tool when the user wants to grant permission for a spender to transfer
-    tokens from the wallet. The spender must already be saved as a contact — if they
-    are not, call save_contact first. The session_key_ciphertext must match the token
-    being approved — retrieve it by calling get_session_keys with the token ticker. Specify
-    the amount in whole token units (e.g. 100 for 100 USDC), not in raw base units.
-
-    Args:
-        chat_id: The Telegram chat ID of the user making the request.
-        session_key_ciphertext: The Vault ciphertext for the session key authorized
-                                for this token. Obtain by calling get_session_keys(token).
-        token: The token ticker symbol to approve (e.g. "usdc").
-        spender: The name of the contact to approve as a spender (e.g. "Sandy").
-                 Must be a saved contact.
-        amount: The amount of tokens to approve in whole units (e.g. 100 for 100 USDC).
-
-    Returns: A string summarizing the transaction result, including the transaction hash and status.
-    """
-    print("Running approve_erc20")
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
-    spender_addr = get_contact.func(chat_id, spender)
-    decimals = erc20.functions.decimals().call()
-    value = _to_base_units(amount, decimals)
-
-    data = load_calldata(instance=erc20, fn_name="approve", args=[spender_addr, value])
     target = erc20.address
 
     tx_hash, receipt = send_user_op_as_session(
@@ -1431,6 +1494,8 @@ def swap_exact_tokens_for_tokens(
             load_session_handler(chat_id).address,
             deadline,
         ],
+        # Exact-input swap: the router pulls exactly amount_in, consuming the approval to zero.
+        approvals=[(token_in, quote["amount_in_base"])],
     )
 
     return (
@@ -1497,6 +1562,10 @@ def swap_tokens_for_exact_tokens(
             load_session_handler(chat_id).address,
             deadline,
         ],
+        # Exact-output swap: the router may pull LESS than amount_in_max, so the residual
+        # allowance must be zeroed in the same transaction (reset_approvals).
+        approvals=[(token_in, amount_in_max)],
+        reset_approvals=True,
     )
 
     return (
@@ -1563,6 +1632,8 @@ def swap_exact_tokens_for_ETH(
         router,
         "swapExactTokensForETH",
         [quote["amount_in_base"], amount_out_min, quote["path"], to, deadline],
+        # Exact-input swap: the router pulls exactly amount_in, consuming the approval to zero.
+        approvals=[(token_in, quote["amount_in_base"])],
     )
 
     return (
@@ -1631,6 +1702,10 @@ def swap_tokens_for_exact_ETH(
         router,
         "swapTokensForExactETH",
         [quote["amount_out_base"], amount_in_max, quote["path"], to, deadline],
+        # Exact-output swap: the router may pull LESS than amount_in_max, so the residual
+        # allowance must be zeroed in the same transaction (reset_approvals).
+        approvals=[(token_in, amount_in_max)],
+        reset_approvals=True,
     )
 
     return (
@@ -1781,6 +1856,13 @@ def add_liquidity(
             load_session_handler(chat_id).address,
             deadline,
         ],
+        # addLiquidity pulls at most the desired amounts and may pull less (pool ratio), so
+        # both approvals are granted and their residuals zeroed in the same transaction.
+        approvals=[
+            (token_a, quote["amount_a_base"]),
+            (token_b, quote["amount_b_desired_base"]),
+        ],
+        reset_approvals=True,
     )
 
     return (
@@ -1864,6 +1946,10 @@ def add_liquidity_eth(
             deadline,
         ],
         value=quote["amount_b_desired_base"],
+        # addLiquidityETH may pull less than the desired token amount (pool ratio), so the
+        # approval is granted and its residual zeroed in the same transaction.
+        approvals=[(token, quote["amount_a_base"])],
+        reset_approvals=True,
     )
 
     return (
@@ -1889,17 +1975,16 @@ def remove_liquidity(
     Slippage is applied downward to compute amountAMin and amountBMin.
 
     Use this tool when the user wants to withdraw liquidity from a Uniswap V2 pool and
-    receive both tokens back. The session key must be authorized for the Uniswap router.
-    Retrieve it by calling get_session_keys("uniswapv2_router") before calling this tool.
-    The LP token allowance for the router must already be set.
+    receive both tokens back. Retrieve the session key with get_session_keys (any argument
+    resolves to the wallet's single session key). The router approval for the pool's LP token
+    is granted and consumed automatically inside this call — no separate approval is needed.
 
-    Note: removeLiquidity credits the session budget back rather than charging it, so no
-    preflight budget check is required — only session validity needs to be confirmed.
+    Note: removing liquidity returns value to the wallet, so it registers as a net inflow and
+    costs nothing against the spending cap — no budget check is required, only session validity.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        session_key_ciphertext: The Vault ciphertext for the session key authorized for the
-                                Uniswap router. Obtain via get_session_keys("uniswapv2_router").
+        session_key_ciphertext: The Vault ciphertext for the wallet's session key.
         token_a: The ticker symbol of the first token in the pair (e.g. "dai").
         lp_amount: The amount of LP tokens to burn, in whole units (e.g. 0.5 for 0.5 LP tokens).
                    The tool converts this to base units using the pair's decimals internally.
@@ -1922,6 +2007,7 @@ def remove_liquidity(
 
     router = load_iuniswap_router(chat_id)
     lp = get_lp_amounts.func(chat_id, token_a, token_b, lp_amount)
+    pair_address = load_iuniswap_pair(chat_id, token_a, token_b).address
 
     amount_a_min = int(
         lp["expected_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
@@ -1945,6 +2031,10 @@ def remove_liquidity(
             load_session_handler(chat_id).address,
             deadline,
         ],
+        # removeLiquidity pulls exactly `liquidity` LP tokens, consuming this approval to zero.
+        # The LP token is unpriced, so the approval only clears SpendingLimitModule because the
+        # router is a trusted spender (auto-trusted at wallet deploy).
+        approvals=[(pair_address, lp["liquidity"])],
     )
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
@@ -1972,17 +2062,17 @@ def remove_liquidity_eth(
     identically on every supported network.
 
     Use this tool when the user wants to remove liquidity from a token/native-asset pool and
-    receive the ERC20 token and the raw native asset back. The session key must be authorized
-    for the router. Retrieve it by calling get_session_keys("uniswapv2_router") before calling
-    this tool. The LP token allowance for the router must already be set.
+    receive the ERC20 token and the raw native asset back. Retrieve the session key with
+    get_session_keys (any argument resolves to the wallet's single session key). The router
+    approval for the pool's LP token is granted and consumed automatically — no separate
+    approval is needed.
 
-    Note: removeLiquidityETH credits the session budget back rather than charging it, so no
-    preflight budget check is required — only session validity needs to be confirmed.
+    Note: removing liquidity returns value to the wallet, so it registers as a net inflow and
+    costs nothing against the spending cap — no budget check is required, only session validity.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
-        session_key_ciphertext: The Vault ciphertext for the session key authorized for the
-                                router. Obtain via get_session_keys("uniswapv2_router").
+        session_key_ciphertext: The Vault ciphertext for the wallet's session key.
         token: The ticker symbol of the ERC20 token in the pair (e.g. "dai"). The other
                side of the pair is always the chain's native asset.
         lp_amount: The amount of LP tokens to burn, in whole units (e.g. 0.5 for 0.5 LP
@@ -2004,6 +2094,7 @@ def remove_liquidity_eth(
 
     router = load_iuniswap_router(chat_id)
     lp = get_lp_amounts.func(chat_id, token, native_wrapped, lp_amount)
+    pair_address = load_iuniswap_pair(chat_id, token, native_wrapped).address
 
     amount_token_min = int(
         lp["expected_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
@@ -2184,7 +2275,6 @@ def get_tools():
         remove_liquidity_eth,
         get_liquidity_token_balance,
         transfer_erc20,
-        approve_erc20,
         transferFrom_erc20,
         # ERC-8004 tools
         get_agent_identity,

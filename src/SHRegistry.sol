@@ -7,8 +7,8 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
  * @title SHRegistry
  * @author Conrad Japhet
  * @notice Central configuration registry for the SessionHandler Protocol. Stores the
- *         protocol fee, treasury address, price oracle, agent identity, Uniswap router,
- *         and call-value interpreter used across all deployed SessionHandler wallets.
+ *         protocol fee, treasury address, price oracle, agent identity, and Uniswap router
+ *         used across all deployed SessionHandler wallets.
  * @dev SessionHandler wallets read all protocol parameters from this contract at
  *      execution time rather than storing them as immutables, so any update here
  *      propagates instantly to every deployed wallet without redeployment.
@@ -29,8 +29,6 @@ contract SHRegistry is Ownable {
     error SHRegistry_InvalidPriceOracle();
     /// @dev thrown when agentId is 0
     error SHRegistry_InvalidAgentId();
-    /// @dev Thrown when address(0) is passed as the call value interpreter.
-    error SHRegistry_InvalidCallValueInterpreter();
 
     /*//////////////////////////////////////////////////////////////
                              STATE VARIABLES
@@ -54,9 +52,6 @@ contract SHRegistry is Ownable {
     /// @notice Uniswap V2 Router address used for swap and liquidity calldata parsing.
     /// @dev May be address(0) on chains where Uniswap V2 is not deployed.
     address public router;
-
-    /// @notice SHValueInterpreter used by all SessionHandler wallets to compute USD spend values.
-    address public callValueInterpreter;
 
     /*//////////////////////////////////////////////////////////////
                                   EVENTS
@@ -86,11 +81,6 @@ contract SHRegistry is Ownable {
     /// @param oldRouter The previous router address.
     /// @param newRouter The new router address.
     event UniswapRouterUpdated(address indexed oldRouter, address indexed newRouter);
-
-    /// @notice Emitted when the call value interpreter address is updated.
-    /// @param oldInterpreter The previous interpreter address.
-    /// @param newInterpreter The new interpreter address.
-    event CallValueInterpreterUpdated(address indexed oldInterpreter, address indexed newInterpreter);
 
     /*//////////////////////////////////////////////////////////////
                                CONSTRUCTOR
@@ -180,17 +170,5 @@ contract SHRegistry is Ownable {
         address old = router;
         router = newRouter;
         emit UniswapRouterUpdated(old, newRouter);
-    }
-
-    /**
-     * @notice Updates the SHValueInterpreter used by all SessionHandler wallets. Only callable by the owner.
-     * @dev Existing wallets will use the new interpreter on their next execution — no redeployment needed.
-     * @param newInterpreter The new SHValueInterpreter address. Must not be address(0).
-     */
-    function setCallValueInterpreter(address newInterpreter) external onlyOwner {
-        if (newInterpreter == address(0)) revert SHRegistry_InvalidCallValueInterpreter();
-        address old = callValueInterpreter;
-        callValueInterpreter = newInterpreter;
-        emit CallValueInterpreterUpdated(old, newInterpreter);
     }
 }
