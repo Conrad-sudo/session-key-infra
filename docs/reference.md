@@ -25,8 +25,8 @@
 | `make vault` | Configure Vault and refresh `.env` credentials |
 | `make db` | Initialise SQLite database and run migrations |
 | `make deploy-wallet [ARGS=<network>]` | Deploy a per-user `SessionHandler` (seeded with its USD spending cap) and register its single session key |
-| `make agent` | Start the agent in interactive CLI mode |
-| `make bot` | Start the Telegram bot |
+| `make agent` | Start the agent in interactive CLI mode (no Telegram needed) |
+| `make bot` | Start the Telegram bot — **optional**; the only target that needs `TELEGRAM_TOKEN` and `python-telegram-bot` |
 | `make setup ARGS=<network>` | Runs `deploy` → `fund` → `db` → `deploy-wallet` → `agent` in sequence for `<network>`, stopping on first failure. Assumes Vault is already running and configured (`make vault`) — not part of this chain since it persists across redeploys. Safe for all six networks (live `sepolia`/`bsc` included — `fund` no-ops on those). See `docs/setup.md`'s "Shortcut" callouts |
 
 > **`make ubeswap-test` is currently broken.** It points at `test/fork/SHUbeswapV2Test.t.sol`, which doesn't exist yet (Celo has no Solidity deployment path — see above).
@@ -80,6 +80,8 @@ sh-protocol/
 │   ├── seed_data.py
 │   ├── network_config.py
 │   ├── contracts.py
+│   ├── toolkits.py                  ← per-chat_id langchain-erc20 / langchain-uniswap-v2 toolkits
+│   ├── userop.py                    ← shared UserOp construction/signing (both backends)
 │   ├── anvil.py
 │   ├── live_network.py
 │   ├── vault_signer.py
@@ -88,19 +90,12 @@ sh-protocol/
 │   ├── smart_wallet_agent.py
 │   ├── telebot.py
 │   ├── agent_card.json
-│   ├── wallet.db                    ← not committed
-│   └── artifacts/
-│       ├── IEntryPoint.json
-│       ├── IReputationRegistry.json
-│       ├── IERC20Extended.json
-│       ├── IWETH.json
-│       ├── IUniswapV2Router02.json
-│       ├── IUniswapV2Factory.json
-│       ├── IUniswapV2Pair.json
-│       └── ERC20Mock.json
+│   ├── abi.py                       ← IEntryPoint, IERC20Extended, IReputationRegistry, mocks
+│   └── wallet.db                    ← not committed
 ├── docs/
 │   ├── contracts.md
 │   ├── app.md
+│   ├── langchain-packages-migration.md
 │   ├── vault-security.md
 │   ├── setup.md
 │   └── reference.md
@@ -128,7 +123,7 @@ sh-protocol/
 | `eth-infinitism/account-abstraction` | ERC-4337 `IAccount`, `EntryPoint`, `PackedUserOperation` |
 | `OpenZeppelin Contracts` | `AccountERC7579Hooked`, ERC-7579 module interfaces/utils (`draft-`), `ECDSA`, `Ownable`, `ReentrancyGuard`, `Pausable`, `SafeERC20`, `IERC20Metadata`, `ERC721`, `ERC721URIStorage`, `EIP712` |
 | `chainlink-brownie-contracts` | `AggregatorV3Interface` for `SHOracle`'s Chainlink price feeds |
-| `Uniswap v2-core / v2-periphery` | `IUniswapV2Router01/02`, `IUniswapV2Factory`, `IUniswapV2Pair` interfaces (shared by both Uniswap V2 on mainnet and PancakeSwap V2 on BSC, which expose the same ABI) |
+| `Uniswap v2-core / v2-periphery` | `IUniswapV2Router01/02`, `IUniswapV2Factory`, `IUniswapV2Pair` interfaces (shared by both Uniswap V2 on mainnet and PancakeSwap V2 on BSC, which expose the same ABI). Solidity side only — the Python app gets its router/pair ABIs from `langchain-uniswap-v2` |
 | `forge-std` | Foundry testing and scripting utilities |
 | ERC-8004 canonical registries (external) | `IIdentityRegistry`, `IReputationRegistry` — deployed on Sepolia and mainnet; `MockIdentityRegistry` / `MockReputationRegistry` used on Anvil |
 
@@ -140,12 +135,14 @@ sh-protocol/
 |---|---|
 | `web3` | Ethereum JSON-RPC client |
 | `eth-account` | Key management and EIP-191 message signing |
+| `langchain-erc20` | ERC20 balances, allowances, transfers and native wrap/unwrap, as execution plans. Pinned exactly — pre-1.0 |
+| `langchain-uniswap-v2` | Uniswap V2 quotes, liquidity previews and swap/liquidity execution plans, including approval sequencing. Pinned exactly — pre-1.0 |
 | `hvac` | HashiCorp Vault Python client (Transit encrypt/decrypt) |
 | `requests` | HTTP client for bundler JSON-RPC calls |
 | `langchain` | Tool definitions and agent framework |
 | `langchain-anthropic` | Default Claude LLM integration — swappable for any [LangChain-supported provider](https://python.langchain.com/docs/integrations/chat/) |
 | `langgraph` | Stateful agent execution with `AsyncSqliteSaver` checkpointer |
-| `python-telegram-bot[job-queue]` | Telegram Bot API client (v20 async) with APScheduler |
+| `python-telegram-bot[job-queue]` | Telegram Bot API client (v20 async) with APScheduler — only used by `make bot`; not needed for the CLI agent |
 | `python-dotenv` | `.env` file loading |
 
 ### Infrastructure

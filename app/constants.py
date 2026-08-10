@@ -5,10 +5,11 @@ CHAIN_ID_BSC = 56
 CHAIN_ID_CELO = 42220
 WEI_PER_ETH = 10**18
 ETH_SENTINEL = "0x0000000000000000000000000000000000000000"
-UNISWAP_V2_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
-SEPOLIA_UNISWAP_V2_FACTORY = "0xF62c03E08ada871A0bEb309762E260a7a6a880E6"
-PANCAKE_V2_FACTORY = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-UBESWAP_V2_FACTORY = "0x62d5b84bE28a183aBB507E125B384122D2C25fAE"
+
+# The V2 factory address is no longer hardcoded per chain: langchain-uniswap-v2 reads
+# router.factory() off the router the wallet itself reports via getRouter(), so pair lookups
+# can never drift from the router SpendingLimitModule trusts, and chains with no hardcoded
+# entry (Anvil) work without one.
 
 # The ticker of the chain's actual wrapped-native-asset contract — the one *ETH*-suffixed
 # router functions and deposit()/withdraw() calls operate against. WETH on Ethereum/Sepolia/

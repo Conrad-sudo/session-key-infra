@@ -23,7 +23,7 @@ contract SHFactory is Ownable, Pausable {
     address public immutable IMPLEMENTATION;
 
     /// @notice Total number of wallets deployed. Doubles as the next walletId to assign.
-    uint256 public totalWallets=1;
+    uint256 public totalWallets = 1;
     /// @notice Maps each sequential walletId to its deployed wallet address.
     mapping(uint256 => address) public wallets;
 
@@ -43,17 +43,19 @@ contract SHFactory is Ownable, Pausable {
      * @param _reputationRegistry The Reputation Registry address.
      * @param _identityRegistry   The ERC-8004 Identity Registry address.
      */
-    constructor(address _entryPoint, address _feeRegistry, address _reputationRegistry, address _identityRegistry,address _module)
-        Ownable(msg.sender)
-    {
+    constructor(
+        address _entryPoint,
+        address _feeRegistry,
+        address _reputationRegistry,
+        address _identityRegistry,
+        address _module
+    ) Ownable(msg.sender) {
         ENTRY_POINT = _entryPoint;
         REGISTRY = _feeRegistry;
         REPUTATION_REGISTRY = _reputationRegistry;
         IDENTITY_REGISTRY = _identityRegistry;
         spendingLimitModule = _module;
         IMPLEMENTATION = address(new SessionHandler());
-
-
     }
 
     /// @notice Pauses the contract, disabling execute(). Only callable by the owner.
@@ -91,18 +93,19 @@ contract SHFactory is Ownable, Pausable {
 
         uint256 walletId = totalWallets;
         address walletInstance = Clones.clone(IMPLEMENTATION);
-        SessionHandler(payable(walletInstance)).initialize(
-            msg.sender,
-            ENTRY_POINT,
-            REPUTATION_REGISTRY,
-            IDENTITY_REGISTRY,
-            REGISTRY,
-            walletId,
-            spendingLimitModule,
-            dailyLimitUsd,
-            windowDuration,
-            watchedTokens
-        );
+        SessionHandler(payable(walletInstance))
+            .initialize(
+                msg.sender,
+                ENTRY_POINT,
+                REPUTATION_REGISTRY,
+                IDENTITY_REGISTRY,
+                REGISTRY,
+                walletId,
+                spendingLimitModule,
+                dailyLimitUsd,
+                windowDuration,
+                watchedTokens
+            );
 
         wallets[walletId] = walletInstance;
         totalWallets = walletId + 1;

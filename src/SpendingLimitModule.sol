@@ -8,8 +8,9 @@ import {
     MODULE_TYPE_HOOK
 } from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
 import {ERC7579Utils, Mode, CallType} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Extended, IERC20} from "./interfaces/IERC20Extended.sol";
 import {SHOracle} from "./SHOracle.sol";
+import {SHRegistry} from "./SHRegistry.sol";
 
 /**
  * @title SpendingLimitModule
@@ -19,9 +20,13 @@ import {SHOracle} from "./SHOracle.sol";
  *      `account` (msg.sender in preCheck/postCheck). See usd-spending-limit-module-roadmap.md
  *      for the full design rationale. The spec this implements:
  *
- *      preCheck:  (1) collect any `approve` sub-calls (rejecting unlimited approvals and unpriced
- *                     tokens up front); snapshot the account's native balance and the raw balance of
- *                     every watched token (no oracle calls yet).
+ *      preCheck:  (0) reject outright any execution that tries to reconfigure THIS module through
+ *                     the account's execute path (see _isAdminCallDataExec) — checked first, so a
+ *                     blocked transaction pays for nothing below it.
+ *                 (1) collect any allowance-granting sub-calls — `approve` and legacy
+ *                     `increaseAllowance` (rejecting unlimited approvals and unpriced tokens up
+ *                     front); snapshot the account's native balance and the raw balance of every
+ *                     watched token (no oracle calls yet).
  *      postCheck: (2) budget (net-value) — compare the account's native balance and each watched
  *                     token's current balance to their preCheck snapshots; only balances that
  *                     actually changed are priced via the oracle, and any net USD *decrease* across
@@ -37,6 +42,16 @@ import {SHOracle} from "./SHOracle.sol";
  *      through this hook (SHOracle.isPriced gates both); stale oracle data reverts. Staleness
  *      is enforced by SHOracle itself via each feed's own Chainlink-published heartbeat, not a
  *      per-account setting — see SHOracle's NatSpec for why that's the correct place for it.
+ *
+ *      The oracle is resolved per call from SHRegistry.priceOracle() rather than fixed at
+ *      construction, so an oracle bug can be fixed for every already-deployed account at once
+ *      without redeploying this module or any wallet. The cost of that reach is a trust
+ *      assumption: whoever owns SHRegistry (SHTreasury, and through it the protocol operator)
+ *      can repoint every installed account's oracle in one transaction. An oracle that priced
+ *      everything near zero would make netOutflowUsd collapse and silently stop the cap from
+ *      binding protocol-wide; one whose isPriced() always returned true would defeat the
+ *      unpriced-token approval guard. The registry owner is therefore trusted for spending-cap
+ *      integrity — see THREAT_MODEL.md §3.8. Only the registry address itself is immutable here.
  *
  *      Design notes worth knowing:
  *      - Net-value metering, not gross-outflow. postCheck measures the net USD change of the
@@ -92,11 +107,22 @@ import {SHOracle} from "./SHOracle.sol";
  *        run arbitrary code in the account's own context, so there is no reliable "selector" to
  *        inspect the way there is for a plain call). The net-value cap in postCheck still applies
  *        regardless of call type, since it never needs to understand what ran.
- *      - Config setters (limit, window, watched list, trusted-spender list) are assumed reachable
- *        only by the account owner, not by an untrusted session key — Smart Sessions scopes which
- *        functions a key may call (roadmap §4). Without that scoping a key that can drive arbitrary
- *        account executions could raise its own limit, reshape the watched list, or trust a malicious
- *        spender mid-transaction; that assumption, not this hook, is what keeps the cap meaningful.
+ *      - Config setters (limit, window, watched list, trusted-spender list) must stay out of reach
+ *        of an untrusted session key: a key that could raise its own limit, reshape the watched list,
+ *        or trust a malicious spender mid-transaction would make the cap meaningless. This module no
+ *        longer merely *assumes* that — preCheck's step (0) refuses any execution that targets this
+ *        module's own admin surface, so the setters cannot be driven through execute at all, on any
+ *        host account. That guard cannot distinguish an owner from a session key (msg.sender is the
+ *        account either way), so it blocks the owner's execute path too; the owner's supported route
+ *        is a DIRECT call in which the account itself is msg.sender (SessionHandler's owner-only
+ *        passthroughs), which never passes through this hook. Scoping WHICH functions a key may call
+ *        at all (Smart Sessions, roadmap §4) remains future work and stays the host's job.
+ *      - Both `approve` and the legacy non-standard `increaseAllowance` are recognized as
+ *        allowance-granting calls. OpenZeppelin removed increaseAllowance in v5, so this only
+ *        matters for tokens still carrying it — but recognizing it is what stops such a token being
+ *        used to grant an allowance the no-standing-approval rule would otherwise never see.
+ *      - SpendMetered is emitted only when a transaction actually consumed budget (net outflow > 0).
+ *        A net-neutral or net-inflow transaction is silent by design: nothing was metered.
  *      - Native ETH/BNB IS metered, unconditionally. preCheck snapshots the account's native
  *        balance and postCheck prices its net change (via the address(0) sentinel feed) alongside
  *        the watched tokens. This is required for correct accounting of native-involving swaps — a
@@ -151,6 +177,17 @@ contract SpendingLimitModule is IERC7579Hook {
     /// @param dailyLimitUsd The account's configured per-window cap (18 decimals).
     error SpendingLimitModule_BudgetExceeded(int256 spentUsd, int256 dailyLimitUsd);
 
+    /// @notice Thrown when an execution routed through the account's execute/executeFromExecutor path
+    ///         targets this module's own admin surface (a config setter, onInstall, or onUninstall).
+    ///         Applies to every caller including the account owner — see {_isAdminCallDataExec} for
+    ///         why the hook cannot tell them apart, and which owner path is supported instead.
+    error SpendingLimitModule_AdminExecution();
+    /// @notice Thrown at construction when the supplied registry reports no price oracle, which also
+    ///         catches the likelier mistake of passing the SHOracle address itself instead of the
+    ///         SHRegistry: a non-registry address has no priceOracle() to call, so it reverts here
+    ///         rather than bricking every hook call after deployment.
+    error SpendingLimitModule_OracleNotSet();
+
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -164,9 +201,11 @@ contract SpendingLimitModule is IERC7579Hook {
     ///      (the canonical router, plus a handful of venues at most).
     uint256 internal constant MAX_TRUSTED_SPENDERS = 16;
 
-    /// @dev Shared oracle every installed account prices tokens through. Fixed at construction —
-    ///      see SHOracle's own NatSpec for why an upgradeable registry indirection wasn't added.
-    SHOracle public immutable ORACLE;
+    /// @notice The SHRegistry this module resolves its price oracle from on every valuation.
+    /// @dev Immutable — the registry ADDRESS can never change, but the oracle it points at can. That
+    ///      indirection is the whole point (fix an oracle bug for every deployed account at once) and
+    ///      it is also the module's one trust assumption; see the contract-level NatSpec.
+    address public immutable REGISTRY;
 
     /// @dev Per-account settings and running spend state. One entry per installing account.
     /// @dev Field order is chosen for storage packing: `installed` + the two uint48 window fields
@@ -194,6 +233,13 @@ contract SpendingLimitModule is IERC7579Hook {
     ///      list exists only so onUninstall can clear these entries.
     mapping(address account => mapping(address spender => bool)) private _isTrustedSpender;
 
+    /// @dev The module's own admin selectors (config setters + onInstall/onUninstall), populated once
+    ///      in the constructor. preCheck rejects any execute-routed sub-call that pairs one of these
+    ///      with address(this) as its target. A mapping rather than a chain of comparisons so the cost
+    ///      of adding a selector is constant, and so the lookup is skipped entirely (short-circuited by
+    ///      the target check) for the overwhelming majority of sub-calls, which aim elsewhere.
+    mapping(bytes4 => bool) private _isAdminSelector;
+
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -218,14 +264,36 @@ contract SpendingLimitModule is IERC7579Hook {
     /// @param spender The spender no longer trusted.
     event TrustedSpenderRemoved(address indexed account, address indexed spender);
 
+    /// @notice Emitted by postCheck when a transaction consumed budget. Not emitted when the
+    ///         transaction was net-neutral or a net inflow, since nothing was metered.
+    /// @param account The account that spent.
+    /// @param netOutflowUsd Net USD value (18 decimals) that left the metered portfolio in THIS
+    ///        transaction — native delta plus every watched token that moved.
+    /// @param spentInWindow The account's running window total AFTER adding netOutflowUsd, so a
+    ///        consumer can track remaining budget without reading state.
+    event SpendMetered(address indexed account, int256 netOutflowUsd, int256 spentInWindow);
+
     /**
-     * @notice Deploys the module and permanently wires it to a price oracle.
-     * @dev The oracle is immutable: every account that ever installs this module prices tokens
-     *      through this one address, and it can never be changed.
-     * @param oracle Address of the deployed SHOracle used for all USD valuations.
+     * @notice Deploys the module and wires it to the registry it resolves its price oracle from.
+     * @dev Also registers this module's own admin selectors, which preCheck uses to refuse
+     *      execute-routed reconfiguration of itself. Reverts if `registry` reports no price oracle —
+     *      which is also what catches the easy mistake of passing the SHOracle address here (the
+     *      parameter is a bare `address`, so the compiler cannot): an address with no priceOracle()
+     *      reverts on the call, failing loudly at deploy instead of after every wallet is live.
+     * @param registry Address of the deployed SHRegistry — the protocol's single source of truth for
+     *        the current price oracle. NOT the SHOracle address itself.
      */
-    constructor(address oracle) {
-        ORACLE = SHOracle(oracle);
+    constructor(address registry) {
+        if (SHRegistry(registry).priceOracle() == address(0)) revert SpendingLimitModule_OracleNotSet();
+        REGISTRY = registry;
+        _isAdminSelector[this.setDailyLimit.selector] = true;
+        _isAdminSelector[this.setWindowDuration.selector] = true;
+        _isAdminSelector[this.addWatchedToken.selector] = true;
+        _isAdminSelector[this.removeWatchedToken.selector] = true;
+        _isAdminSelector[this.addTrustedSpender.selector] = true;
+        _isAdminSelector[this.removeTrustedSpender.selector] = true;
+        _isAdminSelector[this.onInstall.selector] = true;
+        _isAdminSelector[this.onUninstall.selector] = true;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -351,7 +419,6 @@ contract SpendingLimitModule is IERC7579Hook {
         uint256 length = config.watchedTokens.length;
         for (uint256 i = 0; i < length; i++) {
             if (config.watchedTokens[i] == token) {
-
                 config.watchedTokens[i] = config.watchedTokens[length - 1];
                 config.watchedTokens.pop();
                 break;
@@ -424,7 +491,8 @@ contract SpendingLimitModule is IERC7579Hook {
 
     /// @dev Shared add logic. No-op if already watched; reverts if the token is unpriced or the list is full.
     function _addWatchedToken(address account, address token) internal {
-        if(token==address(0)|| !ORACLE.isPriced(token)) revert SpendingLimitModule_TokenNotPriced(token);
+        // Same short-circuit idiom as _validateApproval: address(0) rejects before the registry read.
+        if (token == address(0) || !_getOracle().isPriced(token)) revert SpendingLimitModule_TokenNotPriced(token);
         if (_isWatched[account][token]) return;
 
         Config storage config = _configs[account];
@@ -439,29 +507,41 @@ contract SpendingLimitModule is IERC7579Hook {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Collects any `approve` sub-calls, then snapshots the account's native balance and the
-     *         raw balance of every watched token for postCheck to diff -- no oracle calls happen here.
+     * @notice Rejects any attempt to reconfigure this module through execute, collects the
+     *         transaction's allowance-granting sub-calls, then snapshots the account's native balance
+     *         and the raw balance of every watched token for postCheck to diff -- no oracle calls
+     *         happen here.
      * @dev `msg.sender` is the installing account itself (it calls its installed hook directly).
      *      The two leading interface parameters (original caller and msg.value) are unused here.
      *      First rolls the spending window if it has expired. Only `execute` and
-     *      `executeFromExecutor` calldata is decoded to find approvals; any other calldata skips
-     *      that but still gets a balance snapshot so postCheck can meter the outflow. Approvals are
-     *      only recorded here (unlimited/unpriced ones rejected up front) — postCheck reverts the
-     *      whole transaction if any of them is left STANDING once the calls ran.
+     *      `executeFromExecutor` calldata is decoded; any other calldata skips that but still gets a
+     *      balance snapshot so postCheck can meter the outflow.
+     *
+     *      Order matters: the admin-surface check ({_isAdminCallDataExec}) runs BEFORE approvals are
+     *      collected, so an execution that this hook is going to refuse never pays for the approval
+     *      arrays or their oracle lookups. Both decode the same calldata independently, which is a
+     *      deliberate trade — the duplicated decode costs on the order of 100 gas against preCheck's
+     *      ~25k, and keeping the admin guard standalone keeps it separately readable and testable.
+     *
+     *      Allowance grants (`approve` / legacy `increaseAllowance`) are only RECORDED here, with
+     *      unlimited and unpriced-to-untrusted ones rejected up front — postCheck reverts the whole
+     *      transaction if any of them is left STANDING once the calls ran.
      * @param msgData The account's full outer calldata, from which the execution(s) are decoded.
      * @return hookData ABI-encoded snapshot handed straight back to postCheck: the account's native
      *         balance, every watched token's address and its raw balance, plus the (token, spender)
      *         pairs approved in this transaction.
      */
-    function preCheck(address, uint256 , bytes calldata msgData) external returns (bytes memory hookData) {
+    function preCheck(address, uint256, bytes calldata msgData) external returns (bytes memory hookData) {
         address account = msg.sender;
-        uint256 nativeTokenBalanceBefore=account.balance ;
+        uint256 nativeTokenBalanceBefore = account.balance;
         Config storage config = _configs[account]; // loads the config of the specific account
         if (!config.installed) revert SpendingLimitModule_NotInstalled();
-
         _rollWindowIfNeeded(config);
 
         (bool isExecute, Mode mode, bytes calldata executionCalldata) = _decodeExecuteCalldata(msgData);
+
+        if (_isAdminCallDataExec(isExecute, mode, executionCalldata)) revert SpendingLimitModule_AdminExecution();
+
         (address[] memory approvedTokens, address[] memory approvedSpenders) =
             _collectApprovals(account, isExecute, mode, executionCalldata);
 
@@ -480,8 +560,9 @@ contract SpendingLimitModule is IERC7579Hook {
      *          balance differs from the preCheck snapshot, price the difference via the oracle (a
      *          balance that didn't move is never priced, so never touches the oracle at all); sum
      *          the signed differences across native + all watched tokens and add any net *decrease*
-     *          to the window tally, reverting if that pushes past the daily limit. A net increase
-     *          adds nothing and never banks credit for later. Gas is excluded from the native delta:
+     *          to the window tally, reverting if that pushes past the daily limit, and emitting
+     *          {SpendMetered} once it is known the spend stands. A net increase adds nothing, never
+     *          banks credit for later, and emits nothing. Gas is excluded from the native delta:
      *          the ERC-4337 prefund is paid before preCheck and the refund returns to the EntryPoint
      *          deposit after postCheck, so the snapshot difference reflects only value the calls moved.
      *      (2) No standing approvals — any allowance approved in this transaction must be fully
@@ -497,10 +578,12 @@ contract SpendingLimitModule is IERC7579Hook {
      */
     function postCheck(bytes calldata hookData) external {
         address account = msg.sender;
+
         Config storage config = _configs[account];
         if (!config.installed) return;
 
-        (   uint256 nativeTokenBalanceBefore,
+        (
+            uint256 nativeTokenBalanceBefore,
             address[] memory watchedTokens,
             uint256[] memory balancesBefore,
             address[] memory approvedTokens,
@@ -510,31 +593,32 @@ contract SpendingLimitModule is IERC7579Hook {
         // (1) Net-value spend: only price a watched token if its balance actually changed, then
         //     add any net USD decrease across all of them to the window tally.
         int256 netOutflowUsd;
-        uint256 nativeTokenBalanceAfter= account.balance;
+        uint256 nativeTokenBalanceAfter = account.balance;
+        SHOracle oracle = _getOracle();
 
-
-        if (nativeTokenBalanceBefore>nativeTokenBalanceAfter ){
-            netOutflowUsd += ORACLE.getPrice(address(0),nativeTokenBalanceBefore-nativeTokenBalanceAfter );
+        if (nativeTokenBalanceBefore > nativeTokenBalanceAfter) {
+            netOutflowUsd += oracle.getPrice(address(0), nativeTokenBalanceBefore - nativeTokenBalanceAfter);
+        } else if (nativeTokenBalanceBefore < nativeTokenBalanceAfter) {
+            netOutflowUsd -= oracle.getPrice(address(0), nativeTokenBalanceAfter - nativeTokenBalanceBefore);
         }
-        else if (nativeTokenBalanceBefore<nativeTokenBalanceAfter ){
-            netOutflowUsd -= ORACLE.getPrice(address(0),nativeTokenBalanceAfter-nativeTokenBalanceBefore );
 
-        }
-       
         for (uint256 i = 0; i < watchedTokens.length; i++) {
-            uint256 balanceAfter = IERC20(watchedTokens[i]).balanceOf(account);
+            uint256 balanceAfter = IERC20Extended(watchedTokens[i]).balanceOf(account);
             if (balanceAfter == balancesBefore[i]) continue; // unchanged -- skip the oracle call entirely
             if (balanceAfter < balancesBefore[i]) {
-                netOutflowUsd += ORACLE.getPrice(watchedTokens[i], balancesBefore[i] - balanceAfter);
+                netOutflowUsd += oracle.getPrice(watchedTokens[i], balancesBefore[i] - balanceAfter);
             } else {
-                netOutflowUsd -= ORACLE.getPrice(watchedTokens[i], balanceAfter - balancesBefore[i]);
+                netOutflowUsd -= oracle.getPrice(watchedTokens[i], balanceAfter - balancesBefore[i]);
             }
         }
         if (netOutflowUsd > 0) {
             config.spentInWindow += netOutflowUsd;
+
             if (config.spentInWindow > config.dailyLimitUsd) {
                 revert SpendingLimitModule_BudgetExceeded(config.spentInWindow, config.dailyLimitUsd);
             }
+
+            emit SpendMetered(account, netOutflowUsd, config.spentInWindow);
         }
 
         // (2) No standing approvals: any allowance approved in this transaction must be fully
@@ -542,7 +626,7 @@ contract SpendingLimitModule is IERC7579Hook {
         //     transaction reverts. Size and remaining budget are irrelevant here — a standing
         //     allowance of any amount is disallowed outright.
         for (uint256 i = 0; i < approvedTokens.length; i++) {
-            uint256 residual = IERC20(approvedTokens[i]).allowance(account, approvedSpenders[i]);
+            uint256 residual = IERC20Extended(approvedTokens[i]).allowance(account, approvedSpenders[i]);
             if (residual > 0) {
                 revert SpendingLimitModule_StandingApprovalNotAllowed(approvedTokens[i], approvedSpenders[i], residual);
             }
@@ -554,8 +638,9 @@ contract SpendingLimitModule is IERC7579Hook {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Scans the transaction's decoded calls for `approve` sub-calls and returns the (token,
-     *      spender) pairs so postCheck can later revert if anything is left STANDING on any of them.
+     * @dev Scans the transaction's decoded calls for allowance-granting sub-calls (`approve` and
+     *      legacy `increaseAllowance`) and returns the (token, spender) pairs so postCheck can later
+     *      revert if anything is left STANDING on any of them.
      *      Rejects unlimited approvals, and unpriced-token approvals to UNTRUSTED spenders, up front
      *      (those never depend on the residual). Returns empty arrays for non-execute calldata,
      *      delegatecalls (no reliable selector), and transactions with no approvals.
@@ -588,7 +673,7 @@ contract SpendingLimitModule is IERC7579Hook {
             Execution[] calldata batch = ERC7579Utils.decodeBatch(executionCalldata);
             // First pass: count approvals with the CHEAP pure classifier (no oracle/allowlist reads)
             // so the arrays can be sized exactly. The count matches the second pass for any
-            // transaction that doesn't revert: every non-zero, non-unlimited approve counted here is
+            // transaction that doesn't revert: every non-zero, non-unlimited grant counted here is
             // one _validateApproval either records (priced token, OR trusted spender) or reverts the
             // whole transaction on (unpriced token to an untrusted spender) — so any survivor of the
             // transaction is always both counted and recorded.
@@ -618,32 +703,40 @@ contract SpendingLimitModule is IERC7579Hook {
      *      Mirrors _validateApproval's early-outs (selector, zero, unlimited) but deliberately omits
      *      the oracle `isPriced` call and the trusted-spender lookup, so the counting pass costs no
      *      external calls or storage reads. Its count agrees with _validateApproval's tracked-approval
-     *      count on every transaction that does not revert: a candidate here (approve selector, amount
-     *      in (0, max)) is exactly what _validateApproval records, unless the token is unpriced AND its
-     *      spender is untrusted — in which case _validateApproval reverts the whole transaction anyway,
-     *      so the transient count mismatch is never observable.
+     *      count on every transaction that does not revert: a candidate here (an `approve` or
+     *      `increaseAllowance` selector with amount in (0, max)) is exactly what _validateApproval
+     *      records, unless the token is unpriced AND its spender is untrusted — in which case
+     *      _validateApproval reverts the whole transaction anyway, so the transient count mismatch is
+     *      never observable. The two MUST recognize the same selector set for that to hold: adding a
+     *      selector to one without the other would silently mis-size these arrays.
      * @param callData The sub-call's calldata, expected to start with a 4-byte selector.
-     * @return True if this looks like a trackable non-zero, non-unlimited `approve` call.
+     * @return True if this looks like a trackable non-zero, non-unlimited allowance grant.
      */
     function _isApproveCandidate(bytes calldata callData) internal pure returns (bool) {
         if (callData.length < 4) return false;
-        if (bytes4(callData[:4]) != IERC20.approve.selector) return false;
+        if (
+            bytes4(callData[:4]) != IERC20.approve.selector
+                && bytes4(callData[:4]) != IERC20Extended.increaseAllowance.selector
+        ) return false;
         (, uint256 amount) = abi.decode(callData[4:], (address, uint256));
         return amount != 0 && amount != type(uint256).max;
     }
 
     /**
-     * @dev Classifies one sub-call: returns (true, spender) if it is a trackable non-zero `approve`.
-     *      Rejects unlimited (type(uint256).max) approvals outright — those can never be fully
-     *      consumed down to zero. The approved token must be priced by the oracle UNLESS `spender` is
-     *      on `account`'s trusted-spender list (e.g. the canonical DEX router): that exemption is what
+     * @dev Classifies one sub-call: returns (true, spender) if it is a trackable non-zero allowance
+     *      grant — `approve` or legacy `increaseAllowance`, which share the (address,uint256) shape so
+     *      one decode covers both. Rejects unlimited (type(uint256).max) grants outright: those can
+     *      never be consumed down to zero (and as an increaseAllowance DELTA, max would overflow in
+     *      the token regardless). The token must be priced by the oracle UNLESS `spender` is on
+     *      `account`'s trusted-spender list (e.g. the canonical DEX router): that exemption is what
      *      lets an LP-token approval through for removeLiquidity, since the no-standing-approval rule
      *      in postCheck still forces the allowance to exactly zero within the same transaction.
-     *      Returns (false, ...) for zero approvals, non-approve calls, and calldata too short for a selector.
+     *      Returns (false, ...) for zero-amount grants, non-approval calls, and calldata too short for
+     *      a selector. Must recognize exactly the selectors {_isApproveCandidate} does — see there.
      * @param account The installing account whose trusted-spender list is consulted.
-     * @param token The address the sub-call is aimed at (the token, for an approve).
+     * @param token The address the sub-call is aimed at (the token, for an approval).
      * @param callData The sub-call's calldata, expected to start with a 4-byte selector.
-     * @return isApproval True if this is a trackable non-zero approval (priced token or trusted spender).
+     * @return isApproval True if this is a trackable non-zero grant (priced token or trusted spender).
      * @return spender The approved spender (only meaningful when isApproval is true).
      */
     function _validateApproval(address account, address token, bytes calldata callData)
@@ -652,18 +745,85 @@ contract SpendingLimitModule is IERC7579Hook {
         returns (bool isApproval, address spender)
     {
         if (callData.length < 4) return (false, address(0));
-        if (bytes4(callData[:4]) != IERC20.approve.selector) return (false, address(0));
+        if (
+            bytes4(callData[:4]) != IERC20Extended.increaseAllowance.selector
+                && bytes4(callData[:4]) != IERC20.approve.selector
+        ) return (false, address(0));
 
         uint256 amount;
         (spender, amount) = abi.decode(callData[4:], (address, uint256));
         if (amount == 0) return (false, address(0)); // nothing granted; nothing to track
         if (amount == type(uint256).max) revert SpendingLimitModule_UnlimitedApprovalRejected();
         // Unpriced tokens are allowed ONLY when the spender is explicitly trusted; every other
-        // approval must be on a token the oracle can price.
-        if (!_isTrustedSpender[account][spender] && !ORACLE.isPriced(token)) {
+        // approval must be on a token the oracle can price. `_getOracle()` sits inside the `&&` on
+        // purpose: a trusted spender short-circuits it, so the common router-approval path costs no
+        // registry read at all.
+        if (!_isTrustedSpender[account][spender] && !_getOracle().isPriced(token)) {
             revert SpendingLimitModule_TokenNotPriced(token);
         }
         isApproval = true;
+    }
+
+    /**
+     * @dev Reports whether this transaction's execution tries to reconfigure THIS module through the
+     *      account's execute path — i.e. any sub-call whose target is the module itself (address(this))
+     *      and whose selector is one of the config setters registered in `_isAdminSelector`. preCheck
+     *      reverts when this returns true, so the module's own setters can never be driven via
+     *      execute/executeFromExecutor. This is defense-in-depth that holds even on a host account
+     *      without an admin-surface guard: the legitimate owner path reaches the setters by a DIRECT
+     *      call to the module (msg.sender == account, never wrapped in execute, so this is never hit),
+     *      whereas a session key can only reach the module through execute, which this blocks.
+     *
+     *      It blocks the OWNER's execute path too, and that is intentional rather than a limitation.
+     *      By the time preCheck runs, msg.sender is the account whether the owner called execute
+     *      directly or a session key drove it through the EntryPoint, so no owner/key distinction is
+     *      available here — and inventing one (say, trusting an argument the account passes in) would
+     *      hand the decision back to the very surface this is meant to protect. Nothing legitimate is
+     *      lost: every selector registered here is reachable by the owner another way, the six config
+     *      setters through the host's owner-only passthroughs (SessionHandler.setDailyLimit and
+     *      friends) and onInstall/onUninstall through installModule/uninstallModule, whose outer
+     *      calldata is not an execute selector and so never reaches this check.
+     *
+     *      Scope and limitations:
+     *      - Only calls TARGETED at address(this) are flagged; a selector collision on some unrelated
+     *        contract is not blocked, since target is checked alongside the selector.
+     *      - It protects only the module's OWN surface. The account's admin surface (its config
+     *        passthroughs, session management, module install/uninstall) is the host account's
+     *        responsibility, not this hook's.
+     *      - CALLTYPE_DELEGATECALL is not decoded (no reliable selector), matching _collectApprovals;
+     *        a host that allows session-key delegatecalls must block that itself.
+     * @param isExecute Whether msgData decoded to an execute/executeFromExecutor call worth scanning.
+     * @param mode The ERC-7579 execution mode word (encodes single / batch / delegatecall).
+     * @param executionCalldata The inner execution payload to decode per call type.
+     * @return isAdminCall True if any decoded sub-call reconfigures this module; false otherwise.
+     */
+    function _isAdminCallDataExec(bool isExecute, Mode mode, bytes calldata executionCalldata)
+        internal
+        view
+        returns (bool isAdminCall)
+    {
+        if (!isExecute) return false;
+
+        (CallType callType,,,) = ERC7579Utils.decodeMode(mode);
+
+        if (callType == ERC7579Utils.CALLTYPE_SINGLE) {
+            (address target,, bytes calldata callData) = ERC7579Utils.decodeSingle(executionCalldata);
+
+            return target == address(this) && callData.length >= 4 && _isAdminSelector[bytes4(callData[:4])];
+        }
+
+        if (callType == ERC7579Utils.CALLTYPE_BATCH) {
+            Execution[] calldata batch = ERC7579Utils.decodeBatch(executionCalldata);
+
+            for (uint256 i = 0; i < batch.length; i++) {
+                if (
+                    batch[i].target == address(this) && batch[i].callData.length >= 4
+                        && _isAdminSelector[bytes4(batch[i].callData[:4])]
+                ) return true;
+            }
+        }
+
+        return false; // DELEGATECALL / anything else: not decoded, same limitation as _collectApprovals
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -691,7 +851,7 @@ contract SpendingLimitModule is IERC7579Hook {
         for (uint256 i = 0; i < length; i++) {
             address token = config.watchedTokens[i];
             tokens[i] = token;
-            balances[i] = IERC20(token).balanceOf(account);
+            balances[i] = IERC20Extended(token).balanceOf(account);
         }
     }
 
@@ -760,6 +920,20 @@ contract SpendingLimitModule is IERC7579Hook {
         uint256 dataLen = uint256(bytes32(args[dataOffset:dataOffset + 32]));
         executionCalldata = args[dataOffset + 32:dataOffset + 32 + dataLen];
         isExecute = true;
+    }
+
+    /**
+     * @dev Resolves the protocol's CURRENT price oracle from the registry. Called at the point of use
+     *      rather than cached in a local, so every call site pays for it only when it actually prices
+     *      something: callers put it inside a short-circuiting `&&` or behind their early returns (see
+     *      {_validateApproval} and {_addWatchedToken}) so a path that never needs a valuation makes no
+     *      registry read at all. Re-reading it per use is cheap after the first — the registry account
+     *      and its slot are warm for the rest of the transaction (~200 gas, not the 2.6k cold cost).
+     * @return The SHOracle currently registered in SHRegistry. Can differ between transactions if the
+     *         registry owner repoints it; the contract-level NatSpec covers what that implies.
+     */
+    function _getOracle() internal view returns (SHOracle) {
+        return SHOracle(SHRegistry(REGISTRY).priceOracle());
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -16,7 +16,7 @@ src/
 ├── SpendingLimitModule.sol   ← ERC-7579 Hook (type 4 only) — global USD spending cap (net-value metering)
 ├── interfaces/
 │   ├── IWETH.sol                 ← WETH interface (extends IERC20Extended)
-│   ├── IERC20Extended.sol        ← IERC20 + IERC20Metadata combined interface
+│   ├── IERC20Extended.sol        ← IERC20 + IERC20Metadata, plus legacy increaseAllowance (for selector matching only)
 │   ├── AggregatorV3Interface.sol ← Vendored Chainlink price-feed interface (used by SHOracle)
 │   ├── IIdentityRegistry.sol     ← ERC-8004 IIdentityRegistry interface
 │   └── IReputationRegistry.sol   ← ERC-8004 IReputationRegistry interface
@@ -35,8 +35,8 @@ script/
 
 test/
 ├── unit/
-│   ├── SHProtocolTest.t.sol            ← Core unit suite: deploy, module lifecycle, metering, approvals, trusted spenders (60 tests)
-│   ├── SessionGuardTest.t.sol          ← End-to-end guard + session-key auth proof via the real EntryPoint (13 tests)
+│   ├── SHProtocolTest.t.sol            ← Core unit suite: deploy, module lifecycle, metering, approvals, trusted spenders (61 tests)
+│   ├── SessionGuardTest.t.sol          ← End-to-end guard + session-key auth proof via the real EntryPoint (14 tests)
 │   └── SpendingLimitModuleHarness.sol ← Test harness exposing the module's internal calldata/approval helpers
 ├── fork/
 │   ├── SHForkTestBase.sol              ← Shared abstract fork suite (10 tests) parameterized per network
@@ -62,7 +62,7 @@ The `SHRegistry` is the central configuration store. Deployed `SessionHandler` w
 |---|---|---|
 | `protocolFee` | `uint256` | Flat ETH fee config (capped at `MAX_PROTOCOL_FEE = 0.001 ether`). **Retained but no longer charged** — `SessionHandler.execute` does not collect a per-execution fee in the current design. |
 | `treasury` | `address` | `SHTreasury` — fee sink and registry owner |
-| `priceOracle` | `address` | Canonical `SHOracle` address for USD accounting |
+| `priceOracle` | `address` | Canonical `SHOracle` address for USD accounting. **Also governs spending-cap enforcement** — `SpendingLimitModule` resolves it from here on every valuation, so changing it changes how every deployed wallet meters spending. See [THREAT_MODEL.md](../THREAT_MODEL.md) §3.8. |
 | `agentId` | `uint256` | ERC-8004 token ID of the registered protocol agent |
 | `router` | `address` | Uniswap V2-compatible router (Uniswap on mainnet/Sepolia, PancakeSwap on BSC); `address(0)` on chains without one. Auto-trusted as a spender on each wallet at deploy. |
 
@@ -176,7 +176,12 @@ The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `A
 
 **Admin-surface guard.** For any non-owner execution (a session-key UserOp through the EntryPoint, or a self-call), `execute` runs `_guardSessionExecution`, which reverts if any single/batch sub-call targets `address(this)` or `address(SH_MODULE)`, and rejects `delegatecall` outright. This is what stops a session key from calling the module's cap setters, self-calling `uninstallModule` to delete the cap, minting more session keys, or delegatecalling arbitrary code. Owner-initiated calls skip the guard.
 
-**Deliberate deviation from stock `AccountERC7579Hooked`:** `execute`, `installModule`, and `uninstallModule` are reopened to the owner via `onlyEntryPointOrSelfOrOwner`, so the owner never has to submit a UserOp for admin actions. Session-key management and cap configuration are plain `onlyOwner`.
+**Deliberate deviation from stock `AccountERC7579Hooked`,** which makes all three `onlyEntryPointOrSelf`. They are *not* reopened the same way:
+
+- `execute` becomes `onlyEntryPointOrSelfOrOwner` — still reachable through the EntryPoint (that is how session keys act at all), with `_guardSessionExecution` restraining non-owner callers.
+- `installModule` / `uninstallModule` become plain `onlyOwner`, which is strictly **tighter** than stock: an owner-signed UserOp arrives as `msg.sender == EntryPoint`, not the owner, so these are reachable only by a direct owner call and by **no UserOp at all**. That closes the path where a session key submits a UserOp aimed straight at `installModule` — bypassing `execute`'s guard entirely, since `execute` is never involved — to install a malicious validator or executor and escape the cap.
+
+Session-key management and cap configuration are plain `onlyOwner`. Note that the module also refuses `execute`-routed calls to its own setters for *every* caller, owner included — see `SpendingLimitModule` below.
 
 **Session keys are a bare allowlist.** `addSession(key)` / `removeSession(key)` — no per-key target/selector scope, no expiry. A session key can drive any external call, bounded by the spending cap and the guard. The registry router is auto-trusted as a spender in `initialize()` so `removeLiquidity`'s LP-token approval works out of the box.
 
@@ -199,8 +204,8 @@ function initialize(
 
 // Execution + module admin (owner escape hatch)
 function execute(bytes32 mode, bytes calldata executionCalldata) public payable override whenNotPaused onlyEntryPointOrSelfOrOwner;
-function installModule(uint256 moduleTypeId, address module, bytes calldata initData) public override onlyEntryPointOrSelfOrOwner;
-function uninstallModule(uint256 moduleTypeId, address module, bytes calldata deInitData) public override onlyEntryPointOrSelfOrOwner;
+function installModule(uint256 moduleTypeId, address module, bytes calldata initData) public override onlyOwner;
+function uninstallModule(uint256 moduleTypeId, address module, bytes calldata deInitData) public override onlyOwner;
 
 // Session-key allowlist (owner-only)
 mapping(address sessionKey => bool allowed) public allowedSession;
@@ -261,17 +266,21 @@ struct Config {
 
 **How metering works (net value, not gross outflow):**
 
-- **`preCheck`** rolls the spending window if expired, collects any `approve` sub-calls (rejecting unlimited approvals and unpriced-to-untrusted approvals up front), and snapshots the raw balance of every watched token. **No oracle calls happen here.**
+- **`preCheck`** rejects any execution that targets the module's own admin surface (see below), rolls the spending window if expired, collects any allowance-granting sub-calls — `approve` and legacy `increaseAllowance` — (rejecting unlimited approvals and unpriced-to-untrusted approvals up front), and snapshots the raw balance of every watched token. **No oracle calls happen here.**
 - **`postCheck`** does two independent checks:
-  1. **Net-value spend.** For each watched token whose balance *changed*, it prices the delta via `SHOracle` and sums the signed differences across the portfolio; any net USD **decrease** is added to `spentInWindow`, reverting `BudgetExceeded` if it crosses `dailyLimitUsd`. A token that didn't move is never priced (so a stale feed on an untouched token can't block a transaction), and a net increase adds nothing and never banks credit for a later transaction.
+  1. **Net-value spend.** For each watched token whose balance *changed*, it prices the delta via `SHOracle` and sums the signed differences across the portfolio; any net USD **decrease** is added to `spentInWindow`, reverting `BudgetExceeded` if it crosses `dailyLimitUsd` and emitting `SpendMetered` once the spend stands. A token that didn't move is never priced (so a stale feed on an untouched token can't block a transaction), and a net increase adds nothing, never banks credit for a later transaction, and emits nothing.
   2. **No standing approvals.** Any allowance approved in this transaction must be consumed to **exactly 0** by the end of it, else revert `StandingApprovalNotAllowed`. This closes deferred-pull risk outright rather than size-bounding it.
 
 Because spending *is* the drop in watched-portfolio USD, the module needs no per-venue swap decoder: a value-neutral swap nets ~0, and a bad-rate or sandwiched swap registers its lost value automatically. Both `execute` and `executeFromExecutor` calldata are decoded for approvals; delegatecalls are not decoded (no reliable selector), but the net-value cap still applies to them.
 
 **Trusted-spender exemption (unpriced approvals).** An `approve` on a token the oracle can't price normally reverts (`TokenNotPriced`) — *unless* the spender is on the account's `trustedSpenders` list. This is the escape hatch that lets a Uniswap V2 **LP token** (which has no Chainlink feed) be approved to the router for `removeLiquidity`. The no-standing-approval and no-unlimited-approval rules still apply in full to trusted spenders — the exemption only skips the price check. The account auto-trusts the registry router at deploy; owners can add/remove others.
 
+**Self-guard on the module's admin surface.** `preCheck` reverts `AdminExecution` if any sub-call of the execution targets the module itself with one of its own selectors (the six config setters, `onInstall`, `onUninstall`). It runs *first*, before approvals are collected, so a refused transaction pays almost nothing. It is defence-in-depth that holds even on a host account with no guard of its own — and it deliberately blocks the **owner's** `execute` path too, because by the time `preCheck` runs `msg.sender` is the account whether an owner or a session key drove it, leaving no way to tell them apart. Nothing legitimate is lost: the owner reaches the six setters through `SessionHandler`'s `onlyOwner` passthroughs (a direct call, so no hook runs), and `onInstall`/`onUninstall` through `installModule`/`uninstallModule`, whose outer calldata is not an `execute` selector and so never reaches the check.
+
+**Where the oracle comes from.** The module stores an immutable `REGISTRY` but resolves the oracle itself from `SHRegistry.priceOracle()` on every valuation, so an oracle bug can be fixed for every already-deployed wallet at once without redeploying the module or migrating any wallet. The trade-off is a trust assumption: the registry owner (`SHTreasury` → the protocol operator) can repoint every wallet's oracle in one transaction — see [THREAT_MODEL.md](../THREAT_MODEL.md) §3.8. Resolution is deliberately per-use rather than cached in a local, so a path that never prices anything (a trusted-spender approval, a watched-token add of `address(0)`) makes no registry read at all; re-reading is cheap after the first, as the registry account and slot stay warm for the rest of the transaction.
+
 ```solidity
-constructor(address oracle);   // SHOracle address (immutable)
+constructor(address registry);  // SHRegistry address — NOT the oracle; reverts OracleNotSet if it reports none
 
 // IERC7579Module
 function onInstall(bytes calldata data) external;    // decodes (int256 dailyLimitUsd, uint256 windowDuration, address[] watchedTokens)
@@ -296,12 +305,19 @@ function isWatched(address account, address token) external view returns (bool);
 function isTrustedSpender(address account, address spender) external view returns (bool);
 function getRemainingBudget(address account) external view returns (int256);
 
+address public immutable REGISTRY;   // oracle is read from REGISTRY.priceOracle() per valuation
+
 event ConfigUpdated(address indexed account);
 event WatchedTokenAdded(address indexed account, address indexed token);
 event WatchedTokenRemoved(address indexed account, address indexed token);
 event TrustedSpenderAdded(address indexed account, address indexed spender);
 event TrustedSpenderRemoved(address indexed account, address indexed spender);
+/// netOutflowUsd = USD that left the metered portfolio this tx; spentInWindow = running total after.
+/// Emitted only when a transaction actually consumed budget (net outflow > 0).
+event SpendMetered(address indexed account, int256 netOutflowUsd, int256 spentInWindow);
 ```
+
+**Errors:** `AlreadyInstalled`, `NotInstalled`, `InvalidDailyLimit`, `InvalidWindowDuration`, `TokenNotPriced(token)`, `TooManyWatchedTokens`, `TooManyTrustedSpenders`, `InvalidTrustedSpender`, `UnlimitedApprovalRejected`, `StandingApprovalNotAllowed(token, spender, residual)`, `BudgetExceeded(spentUsd, dailyLimitUsd)`, `AdminExecution`, `OracleNotSet` — each prefixed `SpendingLimitModule_`.
 
 **Native value IS metered.** preCheck snapshots the account's native balance and postCheck prices its net change through the `address(0)` sentinel feed, alongside the watched tokens — so a native send, and the native leg of a swap (e.g. `swapExactETHForTokens`), count against the cap. Gas is excluded: the ERC-4337 prefund leaves the account before preCheck and the refund settles to the EntryPoint deposit after postCheck, never touching the metered delta.
 
@@ -353,7 +369,7 @@ Orchestrates deployment of all shared infrastructure. Individual `SessionHandler
 2. Deploy `SHOracle(tokens, priceFeeds, heartbeats)`.
 3. Call `IIdentityRegistry.register(AGENT_URI)` to mint the agent NFT and obtain `agentId`.
 4. Deploy `SHTreasury(initialFee, address(oracle), agentId, router)` — its constructor deploys `SHRegistry`.
-5. Deploy `SpendingLimitModule(address(oracle))` — **wired directly to the oracle** (no interpreter, and not the registry).
+5. Deploy `SpendingLimitModule(treasury.REGISTRY())` — wired to the **registry**, from which it resolves the current oracle on every valuation (no interpreter).
 6. Deploy `SHFactory(entryPoint, treasury.REGISTRY(), reputationRegistry, identityRegistry, address(module))` — the factory deploys the `SessionHandler` implementation it clones from internally.
 
 ```solidity
@@ -395,9 +411,9 @@ function generateSignedBatchUserOp(
 
 Totals: **60** unit + **13** guard + **8** invariant (local), and **33** fork (11 × 3 networks). All passing.
 
-**`test/unit/SHProtocolTest.t.sol` (60 tests)** — deploy/factory config, module lifecycle (install/uninstall/reinstall, `isModuleType` hook-only), config setters (limit/window/watched-token cap, non-owner reverts), session-key allowlist, **net-value metering** (transfer pricing, inflow-offset within a tx, no-banked-credit across txs, window roll, per-token staleness isolation), **approvals** (unlimited rejected, standing reverts, consumed-in-same-tx passes, partial reverts, approve-then-zero), **trusted spenders** (Option C: unpriced approval allowed when trusted / reverts when untrusted, unlimited still rejected, standing still reverts, remove reinstates the price gate, uninstall clears), plus the harness calldata/approval-classifier tests. Uses a `MockSpender` to consume allowances mid-batch.
+**`test/unit/SHProtocolTest.t.sol` (61 tests)** — deploy/factory config, module lifecycle (install/uninstall/reinstall, `isModuleType` hook-only), config setters (limit/window/watched-token cap, non-owner reverts), session-key allowlist, **net-value metering** (transfer pricing, inflow-offset within a tx, no-banked-credit across txs, window roll, per-token staleness isolation), **approvals** (unlimited rejected, standing reverts, consumed-in-same-tx passes, partial reverts, approve-then-zero), **trusted spenders** (Option C: unpriced approval allowed when trusted / reverts when untrusted, unlimited still rejected, standing still reverts, remove reinstates the price gate, uninstall clears), plus the harness calldata/approval-classifier tests. Uses a `MockSpender` to consume allowances mid-batch.
 
-**`test/unit/SessionGuardTest.t.sol` (13 tests)** — drives real `EntryPoint.handleOps` end-to-end. Session-key UserOps attempting `uninstallModule`, `setDailyLimit`, `addSession`, or a batch smuggling a restricted target all fail with the admin state asserted **unchanged**; direct EntryPoint-pranked calls prove the exact guard errors (`SessionHandler_SessionRestrictedTarget`, `SessionHandler_SessionDelegateCallForbidden`); owner-direct calls bypass the guard; and unknown/removed signers fail validation with `AA24`.
+**`test/unit/SessionGuardTest.t.sol` (14 tests)** — drives real `EntryPoint.handleOps` end-to-end. Session-key UserOps attempting `uninstallModule`, `setDailyLimit`, `addSession`, or a batch smuggling a restricted target all fail with the admin state asserted **unchanged**; direct EntryPoint-pranked calls prove the exact guard errors (`SessionHandler_SessionRestrictedTarget`, `SessionHandler_SessionDelegateCallForbidden`); owner-direct `execute` bypasses the account's guard but is still refused by the module's own (`SpendingLimitModule_AdminExecution`, single and batch); and unknown/removed signers fail validation with `AA24`.
 
 > **Gotcha:** the vendored account-abstraction is EntryPoint **v0.9**, whose `nonReentrant` requires `tx.origin == msg.sender` — tests must submit `handleOps` with a two-arg `vm.prank(bundler, bundler)` (EOA bundler) or it reverts `Reentrancy()`.
 

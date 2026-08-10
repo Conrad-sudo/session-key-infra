@@ -26,6 +26,7 @@
 
 - The **owner key** is fully trusted — it can call `execute()` directly for arbitrary calls, and install/uninstall modules.
 - **The session key** is partially trusted — it can drive any *external* call, bounded by (a) the wallet-wide USD spending cap per window, and (b) the admin-surface guard that keeps it off the account's own functions and the module. It is **not** scoped to specific targets/selectors and does not expire.
+- The **protocol operator key** (owner of `SHTreasury`, which owns `SHRegistry`) is trusted for **spending-cap integrity across every wallet**, not just for fees. `SpendingLimitModule` resolves its price oracle from `SHRegistry.priceOracle()` on each valuation, so repointing that one address changes how every already-deployed wallet values everything. This is a distinct boundary from the per-wallet owner key: it is protocol-wide and needs no wallet owner's consent. See §3.8.
 - The **AI agent** is an untrusted intermediary — it interprets natural language and decides which tools to call.
 - The **Telegram channel** is an untrusted input surface.
 
@@ -46,13 +47,15 @@
 
 **Inflows offset outflows within a transaction only** (`spentInWindow` never banks credit across transactions), so an incoming payment can never create spending headroom for a later transaction. `removeLiquidity` returns value to the wallet, so it nets as an inflow and costs nothing — no special "credit-back" accounting is needed.
 
-**Residual risk:** The cap is a *bound on net value lost per window*, not a per-swap rate guard — a compromised agent can still burn up to a full window's budget on one bad swap, since nothing blocks a bad rate mid-flight. Best execution stays the agent's job (the DEX router enforces the agent's `amountOutMin`). See §3.5.
+**Residual risk:** The cap is a *bound on net value lost per window*, not a per-swap rate guard — a compromised agent can still burn up to a full window's budget on one bad swap, since nothing blocks a bad rate mid-flight. Best execution stays the agent's job (the DEX router enforces the agent's `amountOutMin`). See §3.11.
 
 ---
 
 ### 3.3 No Standing Approvals
 **Status: Mitigated.**
 `postCheck` reverts (`StandingApprovalNotAllowed`) if any allowance approved in the transaction is not consumed to **exactly zero** by the time the calls finish, and unlimited (`type(uint256).max`) approvals are rejected up front. This closes the deferred-pull vector outright rather than size-bounding it: an approval can never survive its own transaction, so it can't be pulled later. The swap/liquidity flows therefore batch `[approve, spend, approve 0]` atomically. The cost is that no approval may outlive its transaction — but that's the point.
+
+Both `approve` and the legacy non-standard `increaseAllowance` are recognized as allowance-granting calls, so a token still carrying the latter (OpenZeppelin removed it in v5) cannot be used to grant an allowance this rule never sees. Approvals made by signature (Permit2 / EIP-2612 `permit`) are **not** intercepted — they are a documented v1 exclusion, since they never appear as a sub-call in the account's execution calldata.
 
 ---
 
@@ -64,15 +67,22 @@
 ---
 
 ### 3.5 Admin-Surface Guard
-**Status: Mitigated.**
-`SessionHandler.execute` runs `_guardSessionExecution` for every non-owner execution (session-key UserOps and self-calls). It decodes the ERC-7579 execution and reverts if any single/batch sub-call targets `address(this)` or `address(SH_MODULE)`, and rejects `delegatecall` outright. This is load-bearing: without the `address(this)` restriction, a session key could `execute(address(this), uninstallModule(HOOK, module))` — a self-call whose inner `msg.sender == the account` satisfies `onlyEntryPointOrSelfOrOwner` — and delete the cap entirely. Owner-initiated calls skip the guard (the owner reconfigures via the dedicated `onlyOwner` passthroughs). A negative test suite (`SessionGuardTest`) locks in that uninstall/setDailyLimit/addSession attempts by a session key fail with the admin state unchanged.
+**Status: Mitigated, in three independent layers.**
+
+**Layer 1 — the account's guard.** `SessionHandler.execute` runs `_guardSessionExecution` for every non-owner execution (session-key UserOps and self-calls). It decodes the ERC-7579 execution and reverts if any single/batch sub-call targets `address(this)` or `address(SH_MODULE)`, and rejects `delegatecall` outright. This is load-bearing: without the `address(this)` restriction, a session key could `execute(address(this), uninstallModule(HOOK, module))` — a self-call whose inner `msg.sender == the account` satisfies `onlyEntryPointOrSelfOrOwner` — and delete the cap entirely. Owner-initiated calls skip this layer.
+
+**Layer 2 — `installModule` / `uninstallModule` are `onlyOwner`.** Stock `AccountERC7579Hooked` makes them `onlyEntryPointOrSelf`; this account tightens them to `onlyOwner`, which is reachable *only* by a direct owner call and by **no UserOp at all** (an owner-signed UserOp arrives as `msg.sender == EntryPoint`, not the owner). That closes the path where a session key submits a UserOp whose `callData` targets `installModule` directly — bypassing layer 1 entirely, since `execute` is never involved — to install a malicious validator or executor and escape the cap.
+
+**Layer 3 — the module guards itself.** `SpendingLimitModule.preCheck` reverts `SpendingLimitModule_AdminExecution` if the execution contains any sub-call whose target is the module and whose selector is one of its own (the six config setters, `onInstall`, `onUninstall`). This holds even on a host account with no guard of its own, and it is checked *first* in `preCheck`, so a blocked transaction pays almost nothing. It cannot distinguish an owner from a session key — by then `msg.sender` is the account on both paths — so it blocks the **owner's** `execute` path too. Nothing is lost: every guarded selector stays reachable by the owner another way (the six setters via the `onlyOwner` passthroughs, `onInstall`/`onUninstall` via `installModule`/`uninstallModule`, whose outer calldata is not an `execute` selector).
+
+A negative test suite (`SessionGuardTest`) locks all three in: session-key uninstall/setDailyLimit/addSession attempts fail with the admin state unchanged, and owner-driven `execute` at the module reverts `AdminExecution` for both single and batch calls (the batch case also proving atomic rollback of the innocent sibling call).
 
 ---
 
 ### 3.6 Self-Validation / No Validator Module
 **Threat:** The account installs **no** validator module; it validates its own UserOps via `_rawSignatureValidation`, accepting the owner or any `allowedSession` signer.
 **Mitigation in place:** OZ's `AccountERC7579._validateUserOp` falls back to the account's `_rawSignatureValidation` when the nonce-key validator isn't installed — which is always, here. The signer must sign the EIP-191 envelope of the userOpHash; `tryRecover` returns failure (not a revert) on a malformed signature. Any signer not equal to `owner()` and not in `allowedSession` fails validation.
-**Residual risk:** A session key is a *bare* signer with no on-chain scope beyond the cap + guard — scoped keys (Smart Sessions) are a deliberate future step. Until a dedicated validator is added, this self-validation path is the account's only authentication; adding a malicious validator module is an owner-key threat (§3.8), not a session-key one.
+**Residual risk:** A session key is a *bare* signer with no on-chain scope beyond the cap + guard — scoped keys (Smart Sessions) are a deliberate future step. Until a dedicated validator is added, this self-validation path is the account's only authentication; adding a malicious validator module is an owner-key threat (§3.9), not a session-key one.
 
 ---
 
@@ -83,20 +93,31 @@
 
 ---
 
-### 3.8 Owner Key — Full Execution Access
-**Threat:** The owner can call `execute()` directly for any arbitrary call (via `onlyEntryPointOrSelfOrOwner`), reconfigure the cap, manage session keys, and install/uninstall modules. A compromised owner key gives full control of all funds and can install a malicious module.
-**Mitigation in place:** `Ownable`, `Pausable`. Config setters and session management are `onlyOwner`; the admin guard prevents *session keys* from reaching any of this.
+### 3.8 Price Oracle — Mutability via the Registry ⚠️
+**Threat:** `SpendingLimitModule` holds an immutable `REGISTRY` address but resolves the oracle itself from `SHRegistry.priceOracle()` on every valuation, so the oracle is **not** immutable. Whoever owns `SHRegistry` — `SHTreasury`, and through it the protocol operator key — can repoint it for every deployed wallet in a single transaction, with no wallet owner's consent and no redeployment. A malicious or compromised operator key could substitute an oracle that prices everything near zero, collapsing `netOutflowUsd` so the daily cap silently stops binding **protocol-wide**; or one whose `isPriced()` always returns true, defeating the unpriced-token approval guard and letting arbitrary tokens be watched and approved.
+
+**Why it is built this way:** the indirection is what makes an oracle bug fixable. With the oracle fixed at construction, a bad feed registration or a mis-priced token could only be corrected by deploying a new module and migrating every wallet onto it — wallets whose hook is `onlyOwner`-uninstallable, i.e. a migration the protocol cannot perform on a user's behalf. Reach over already-deployed wallets is the entire point, and the trust assumption is inseparable from it.
+
+**Mitigation in place:** `SHRegistry.setPriceOracle` is `onlyOwner` and rejects `address(0)`; all registry admin flows through `SHTreasury`'s pass-through setters, so the operator key is the single point of control. `PriceOracleUpdated(oldOracle, newOracle)` is emitted on every change, making a swap publicly observable on-chain. `SpendingLimitModule`'s constructor reverts (`OracleNotSet`) if the registry it is given reports no oracle, which also catches the deploy-time mistake of passing the `SHOracle` address in place of the registry.
+
+**Residual risk:** No timelock, no multi-sig, and no per-wallet opt-out. An operator-key compromise is protocol-wide and takes effect on the next transaction of every wallet, with the only warning being the emitted event. A timelock on `setPriceOracle` is the obvious hardening step and is **not** implemented. Wallet owners cannot pin an oracle version.
+
+---
+
+### 3.9 Owner Key — Full Execution Access
+**Threat:** The owner can call `execute()` directly for any arbitrary call (via `onlyEntryPointOrSelfOrOwner`), reconfigure the cap, manage session keys, and install/uninstall modules (`onlyOwner`, direct call only). A compromised owner key gives full control of all funds and can install a malicious module.
+**Mitigation in place:** `Ownable`, `Pausable`. Config setters, session management, and module install/uninstall are `onlyOwner`; the three layers in §3.5 keep *session keys* off all of it. Note that none of those layers is a defence against the owner key itself — an owner who wants the cap gone uninstalls the hook, which is by design (it is their wallet).
 **Residual risk:** No time-lock or multi-sig on owner actions, and no recovery path for a compromised owner key.
 
 ---
 
-### 3.9 Signature Replay
+### 3.10 Signature Replay
 **Threat:** A valid UserOp signature replayed to re-execute.
 **Mitigation in place:** The ERC-4337 EntryPoint enforces sequential nonces per account. Replay is not possible.
 
 ---
 
-### 3.10 Sandwich / MEV Attack
+### 3.11 Sandwich / MEV Attack
 **Threat:** A swap in the public mempool can be front-/back-run.
 **Mitigation in place:** The swap tools set `amountOutMin` / `amountInMax` from `getAmountsOut` / `getAmountsIn` with a `slippage_bps` tolerance; any value the swap actually loses is charged against the cap by the net-value meter.
 **Residual risk:** The default 50 bps may be too loose for low-liquidity pairs; users should raise it for volatile tokens.
@@ -133,9 +154,26 @@
 ---
 
 ### 4.5 Telegram as Attack Surface
+> Applies **only when the optional Telegram bot (`make bot`) is run.** The interactive CLI (`make agent`) has no Telegram exposure, so this surface disappears entirely in that mode.
+
 **Threat:** The bot processes messages from any Telegram user with a known `chat_id`.
 **Mitigation in place:** The session key is stored encrypted; an attacker would need the target `chat_id`'s ciphertext from the DB **and** the AppRole credentials to sign for another user.
 **Residual risk:** `chat_id` values are not secret by design in Telegram.
+
+---
+
+### 4.6 Calldata-Construction Dependencies ⚠️
+
+**Threat:** Every ERC20 transfer, swap and liquidity operation has its `(to, value, data)` built by two external PyPI packages, `langchain-erc20` and `langchain-uniswap-v2`. A malicious release — or a compromised PyPI account — could return a plan whose recipient, amount or approval spender differs from what the agent asked for, and the app would sign and submit it. This is a **higher-value target than a typical dependency**: it sits directly on the path between user intent and signed calldata.
+
+**Mitigations in place:**
+- Both are pinned to exact versions in `requirements.txt`, so an upgrade is a deliberate, reviewable change.
+- `SpendingLimitModule` is an independent on-chain check on the result: a plan that overspends the USD cap, leaves a standing approval, requests an unlimited approval, or targets the admin surface reverts regardless of what built it. A malicious plan cannot exceed the cap, only misdirect value up to it.
+- Trusted-spender and watched-token lists are on-chain state the packages cannot alter.
+
+**Residual risk:** Within one window's remaining budget, a malicious plan could still send value to an attacker-controlled address — the module meters *how much* leaves, not *where it goes*. Both packages are also pre-1.0 with an explicitly unstable API, so upgrades need re-testing, not just a version bump.
+
+**Not yet done:** hash-pinning (`--require-hashes`) and a pinned lockfile. Recommended before production.
 
 ---
 

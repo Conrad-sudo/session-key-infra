@@ -89,7 +89,7 @@ contract SHProtocolTest is Test {
         vm.prank(owner);
         wallet = SessionHandler(payable(factory.deployWallet(DAILY_LIMIT, WINDOW, watched)));
 
-        harness = new SpendingLimitModuleHarness(address(oracle));
+        harness = new SpendingLimitModuleHarness(address(feeRegistry));
         spender = new MockSpender();
 
         vm.deal(address(wallet), 10 ether);
@@ -154,9 +154,7 @@ contract SHProtocolTest is Test {
         watched[0] = address(unpriced);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced)
-            )
+            abi.encodeWithSelector(SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced))
         );
         factory.deployWallet(DAILY_LIMIT, WINDOW, watched);
     }
@@ -170,7 +168,9 @@ contract SHProtocolTest is Test {
     function test_initialize_cannotRerun() public {
         address[] memory watched = new address[](0);
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        wallet.initialize(rando, config.entryPoint, address(1), address(2), address(3), 9, address(module), 1, 1, watched);
+        wallet.initialize(
+            rando, config.entryPoint, address(1), address(2), address(3), 9, address(module), 1, 1, watched
+        );
     }
 
     function test_deployWallet_forwardsFunding() public {
@@ -227,8 +227,7 @@ contract SHProtocolTest is Test {
     }
 
     function test_postCheck_silentWhenNotInstalled() public {
-        bytes memory hookData =
-            abi.encode(new address[](0), new uint256[](0), new address[](0), new address[](0));
+        bytes memory hookData = abi.encode(new address[](0), new uint256[](0), new address[](0), new address[](0));
         vm.prank(rando);
         module.postCheck(hookData); // must not revert
     }
@@ -273,9 +272,7 @@ contract SHProtocolTest is Test {
         ERC20Mock unpriced = new ERC20Mock("Unpriced", "UNP", 18);
         vm.prank(owner);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced)
-            )
+            abi.encodeWithSelector(SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced))
         );
         wallet.addWatchedToken(address(unpriced));
     }
@@ -322,7 +319,11 @@ contract SHProtocolTest is Test {
             beats[i] = 1 days;
         }
         SHOracle bigOracle = new SHOracle(tokens, feeds, beats);
-        SpendingLimitModule freshModule = new SpendingLimitModule(address(bigOracle));
+        // The module reads its oracle from a registry, so the fixture needs its own registry
+        // pointing at bigOracle (fee/agentId/router are irrelevant to the watched-list cap).
+        SHRegistry bigRegistry =
+            new SHRegistry(feeRegistry.MIN_PROTOCOL_FEE(), address(this), address(bigOracle), 1, address(0));
+        SpendingLimitModule freshModule = new SpendingLimitModule(address(bigRegistry));
 
         address account = makeAddr("eoaAccount");
         address[] memory first32 = new address[](32);
@@ -544,9 +545,7 @@ contract SHProtocolTest is Test {
         ERC20Mock unpriced = new ERC20Mock("Unpriced", "UNP", 18);
         vm.prank(owner);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced)
-            )
+            abi.encodeWithSelector(SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced))
         );
         wallet.execute(
             bytes32(0),
@@ -786,19 +785,18 @@ contract SHProtocolTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_decodeExecuteCalldata_recognizesExecuteShapes() public view {
-        bytes memory payload = abi.encodePacked(address(usdc), uint256(0), abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)));
+        bytes memory payload =
+            abi.encodePacked(address(usdc), uint256(0), abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)));
 
-        (bool isExecute, bytes32 mode, bytes memory decoded) = harness.decodeExecuteCalldata(
-            abi.encodeCall(IERC7579Execution.execute, (bytes32(0), payload))
-        );
+        (bool isExecute, bytes32 mode, bytes memory decoded) =
+            harness.decodeExecuteCalldata(abi.encodeCall(IERC7579Execution.execute, (bytes32(0), payload)));
         assertTrue(isExecute);
         assertEq(mode, bytes32(0));
         assertEq(decoded, payload);
 
         // executeFromExecutor has the identical arg shape and must also be recognized.
-        (isExecute,,) = harness.decodeExecuteCalldata(
-            abi.encodeCall(IERC7579Execution.executeFromExecutor, (bytes32(0), payload))
-        );
+        (isExecute,,) =
+            harness.decodeExecuteCalldata(abi.encodeCall(IERC7579Execution.executeFromExecutor, (bytes32(0), payload)));
         assertTrue(isExecute);
     }
 
@@ -806,8 +804,7 @@ contract SHProtocolTest is Test {
         (bool isExecute,,) = harness.decodeExecuteCalldata(hex"deadbeef");
         assertFalse(isExecute, "short calldata accepted");
 
-        (isExecute,,) =
-            harness.decodeExecuteCalldata(abi.encodeCall(ERC20Mock.transfer, (kani, uint256(1e18))));
+        (isExecute,,) = harness.decodeExecuteCalldata(abi.encodeCall(ERC20Mock.transfer, (kani, uint256(1e18))));
         assertFalse(isExecute, "non-execute selector accepted");
     }
 
@@ -820,25 +817,29 @@ contract SHProtocolTest is Test {
     }
 
     function test_validateApproval_pathsAndReverts() public {
-        (bool isApproval, address approvedSpender) =
-            harness.validateApproval(address(this), address(usdc), abi.encodeCall(ERC20Mock.approve, (kani, uint256(5e6))));
+        (bool isApproval, address approvedSpender) = harness.validateApproval(
+            address(this), address(usdc), abi.encodeCall(ERC20Mock.approve, (kani, uint256(5e6)))
+        );
         assertTrue(isApproval);
         assertEq(approvedSpender, kani);
 
-        (isApproval,) =
-            harness.validateApproval(address(this), address(usdc), abi.encodeCall(ERC20Mock.transfer, (kani, uint256(1))));
+        (isApproval,) = harness.validateApproval(
+            address(this), address(usdc), abi.encodeCall(ERC20Mock.transfer, (kani, uint256(1)))
+        );
         assertFalse(isApproval);
 
         vm.expectRevert(SpendingLimitModule.SpendingLimitModule_UnlimitedApprovalRejected.selector);
-        harness.validateApproval(address(this), address(usdc), abi.encodeCall(ERC20Mock.approve, (kani, type(uint256).max)));
+        harness.validateApproval(
+            address(this), address(usdc), abi.encodeCall(ERC20Mock.approve, (kani, type(uint256).max))
+        );
 
         ERC20Mock unpriced = new ERC20Mock("Unpriced", "UNP", 18);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced)
-            )
+            abi.encodeWithSelector(SpendingLimitModule.SpendingLimitModule_TokenNotPriced.selector, address(unpriced))
         );
-        harness.validateApproval(address(this), address(unpriced), abi.encodeCall(ERC20Mock.approve, (kani, uint256(1e18))));
+        harness.validateApproval(
+            address(this), address(unpriced), abi.encodeCall(ERC20Mock.approve, (kani, uint256(1e18)))
+        );
     }
 
     function test_collectApprovals_batchCollectsAllApprovePairs() public view {
@@ -847,8 +848,9 @@ contract SHProtocolTest is Test {
         execs[1] = Execution(address(usdc), 0, abi.encodeCall(ERC20Mock.transfer, (kani, uint256(1e6))));
         execs[2] = Execution(address(dai), 0, abi.encodeCall(ERC20Mock.approve, (rando, uint256(2e18))));
 
-        (address[] memory tokens, address[] memory spenders) =
-            harness.collectApprovals(address(this), true, bytes32(uint256(0x01) << 248), ERC7579Utils.encodeBatch(execs));
+        (address[] memory tokens, address[] memory spenders) = harness.collectApprovals(
+            address(this), true, bytes32(uint256(0x01) << 248), ERC7579Utils.encodeBatch(execs)
+        );
 
         assertEq(tokens.length, 2);
         assertEq(tokens[0], address(usdc));

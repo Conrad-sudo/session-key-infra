@@ -8,6 +8,7 @@ import {SHFactory} from "../src/SHFactory.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
 import {SpendingLimitModule} from "../src/SpendingLimitModule.sol";
 import "./Constants.s.sol";
+
 /**
  * @title DeploySHProtocol
  * @notice Deployment script for the SessionHandler protocol's shared infrastructure
@@ -55,17 +56,17 @@ contract DeploySHProtocol is Script {
         address[] memory priceFeeds = new address[](20);
         uint256[] memory heartbeats = new uint256[](20);
         tokens[0] = address(0);
-        
-        if (block.chainid== BSC_CHAIN_ID){
-        priceFeeds[0] = config.bnbUsdPriceFeed;
-        heartbeats[0] = config.bnbHeartbeat;
-        }
-        else if (block.chainid== MAINNET_CHAIN_ID||block.chainid== SEPOLIA_CHAIN_ID||block.chainid== LOCAL_CHAIN_ID){
-        priceFeeds[0] = config.ethUsdPriceFeed;
-        heartbeats[0] = config.ethHeartbeat;
 
+        if (block.chainid == BSC_CHAIN_ID) {
+            priceFeeds[0] = config.bnbUsdPriceFeed;
+            heartbeats[0] = config.bnbHeartbeat;
+        } else if (
+            block.chainid == MAINNET_CHAIN_ID || block.chainid == SEPOLIA_CHAIN_ID || block.chainid == LOCAL_CHAIN_ID
+        ) {
+            priceFeeds[0] = config.ethUsdPriceFeed;
+            heartbeats[0] = config.ethHeartbeat;
         }
-        
+
         tokens[1] = config.usdc;
         priceFeeds[1] = config.usdcUsdPriceFeed;
         heartbeats[1] = config.usdcHeartbeat;
@@ -128,7 +129,7 @@ contract DeploySHProtocol is Script {
 
         // Broadcast as config.account so it becomes the Ownable owner of SHTreasury and SHFactory
         vm.startBroadcast(config.account);
-        
+
         //deploy price oracle
         oracle = new SHOracle(tokens, priceFeeds, heartbeats);
         //register the agent
@@ -138,15 +139,11 @@ contract DeploySHProtocol is Script {
         treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId, config.router);
 
         // deploy the ERC-7579 spending-limit module, wired to the price oracle it values tokens with
-        SpendingLimitModule module = new SpendingLimitModule(address(oracle));
+        SpendingLimitModule module = new SpendingLimitModule(treasury.REGISTRY());
 
         //deploy factory (module set via constructor; deploys the SessionHandler implementation internally)
         factory = new SHFactory(
-            config.entryPoint,
-            treasury.REGISTRY(),
-            config.reputationRegistry,
-            config.identityRegistry,
-            address(module)
+            config.entryPoint, treasury.REGISTRY(), config.reputationRegistry, config.identityRegistry, address(module)
         );
         vm.stopBroadcast();
     }

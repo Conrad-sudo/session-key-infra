@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {MODULE_TYPE_HOOK, Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
+import {ERC7579Utils} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
 import {SpendingLimitModule} from "../../src/SpendingLimitModule.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
@@ -84,13 +85,12 @@ contract SessionGuardTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Signs a single-call UserOp with the session key and submits it through the EntryPoint.
-   
+
     function _sendSessionOp(address dest, bytes memory data) internal {
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedUserOp(address(wallet), config, dest, 0, data, sessionKey, sessionKeyPk);
         _handleOps(userOp);
     }
-    
 
     /*
     function _sendSessionOp(address dest, bytes memory data) internal {
@@ -138,7 +138,13 @@ contract SessionGuardTest is Test {
     ///         authorized signer) and executes external calls fine.
     function test_ownerSignedOp_legitTransfer_succeeds() public {
         (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
-            address(wallet), config, address(usdc), 0, abi.encodeCall(ERC20Mock.transfer, (kani, 500e6)), owner, ANVIL_OWNER_KEY
+            address(wallet),
+            config,
+            address(usdc),
+            0,
+            abi.encodeCall(ERC20Mock.transfer, (kani, 500e6)),
+            owner,
+            ANVIL_OWNER_KEY
         );
         _handleOps(userOp);
         assertEq(usdc.balanceOf(kani), 500e6, "owner-signed transfer did not execute");
@@ -151,8 +157,7 @@ contract SessionGuardTest is Test {
     /// @notice A session key must not be able to uninstall the spending-cap hook via a self-call.
     ///         The inner execution reverts inside the EntryPoint; the hook stays installed.
     function test_sessionOp_cannotUninstallHook() public {
-        bytes memory data =
-            abi.encodeCall(SessionHandler.uninstallModule, (MODULE_TYPE_HOOK, address(module), ""));
+        bytes memory data = abi.encodeCall(SessionHandler.uninstallModule, (MODULE_TYPE_HOOK, address(module), ""));
 
         _sendSessionOp(address(wallet), data);
 
@@ -182,9 +187,13 @@ contract SessionGuardTest is Test {
     ///         neither the transfer nor the cap change may land.
     function test_sessionOp_batchWithRestrictedTarget_revertsAtomically() public {
         Execution[] memory execs = new Execution[](2);
-        execs[0] = Execution({target: address(usdc), value: 0, callData: abi.encodeCall(ERC20Mock.transfer, (kani, 100e6))});
-        execs[1] =
-            Execution({target: address(module), value: 0, callData: abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(1_000_000_000e18)))});
+        execs[0] =
+            Execution({target: address(usdc), value: 0, callData: abi.encodeCall(ERC20Mock.transfer, (kani, 100e6))});
+        execs[1] = Execution({
+            target: address(module),
+            value: 0,
+            callData: abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(1_000_000_000e18)))
+        });
 
         (PackedUserOperation memory userOp,,) =
             sendPackedUserOp.generateSignedBatchUserOp(address(wallet), config, execs, sessionKey, sessionKeyPk);
@@ -201,9 +210,8 @@ contract SessionGuardTest is Test {
     /// @notice The guard reverts with SessionRestrictedTarget(module) when a non-owner execution
     ///         targets the spending-limit module.
     function test_guard_revertsOnModuleTarget() public {
-        bytes memory executionCalldata = _encodeSingle(
-            address(module), 0, abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(1e18)))
-        );
+        bytes memory executionCalldata =
+            _encodeSingle(address(module), 0, abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(1e18))));
 
         vm.prank(config.entryPoint);
         vm.expectRevert(
@@ -215,9 +223,8 @@ contract SessionGuardTest is Test {
     /// @notice The guard reverts with SessionRestrictedTarget(account) when a non-owner execution
     ///         targets the account itself.
     function test_guard_revertsOnSelfTarget() public {
-        bytes memory executionCalldata = _encodeSingle(
-            address(wallet), 0, abi.encodeCall(SessionHandler.addSession, (attacker))
-        );
+        bytes memory executionCalldata =
+            _encodeSingle(address(wallet), 0, abi.encodeCall(SessionHandler.addSession, (attacker)));
 
         vm.prank(config.entryPoint);
         vm.expectRevert(
@@ -229,7 +236,8 @@ contract SessionGuardTest is Test {
     /// @notice The guard rejects delegatecall mode outright for non-owner executions.
     function test_guard_revertsOnDelegatecall() public {
         // Delegate executionCalldata layout: target ++ data (no value field).
-        bytes memory executionCalldata = abi.encodePacked(address(usdc), abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)));
+        bytes memory executionCalldata =
+            abi.encodePacked(address(usdc), abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)));
         bytes32 delegatecallMode = bytes32(uint256(0xff) << 248); // CALLTYPE_DELEGATECALL in top byte
 
         vm.prank(config.entryPoint);
@@ -238,20 +246,47 @@ contract SessionGuardTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                  OWNER PATH (the guard must NOT apply)
+                               OWNER PATH
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice The owner calling execute() DIRECTLY may still reach the module (guard skipped),
-    ///         because msg.sender == owner.
-    function test_ownerDirectExecute_mayTargetModule() public {
-        bytes memory executionCalldata = _encodeSingle(
-            address(module), 0, abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(7000e18)))
-        );
+    /// @notice The module's own admin guard blocks reconfiguration through execute() for EVERYONE,
+    ///         owner included: preCheck sees msg.sender == the account whether the owner called
+    ///         execute() directly or a session key drove it through the EntryPoint, so it cannot
+    ///         tell the two apart and refuses both. This is by design — the owner has no reason to
+    ///         reach the module through execute() when the direct passthroughs exist (see
+    ///         {test_ownerPassthroughs_unaffected}), so nothing legitimate is lost.
+    /// @dev SessionHandler's own {_guardSessionExecution} is still skipped for the owner (it would
+    ///      raise SessionRestrictedTarget instead); the error asserted here proves the revert comes
+    ///      from the module's hook, one layer deeper.
+    function test_ownerExecute_blockedByModuleAdminGuard() public {
+        bytes memory executionCalldata =
+            _encodeSingle(address(module), 0, abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(7000e18))));
 
         vm.prank(owner);
+        vm.expectRevert(SpendingLimitModule.SpendingLimitModule_AdminExecution.selector);
         wallet.execute(bytes32(0), executionCalldata);
 
-        assertEq(wallet.getConfig().dailyLimitUsd, int256(7000e18), "owner direct call was wrongly guarded");
+        assertEq(wallet.getConfig().dailyLimitUsd, DAILY_LIMIT, "cap changed despite the admin guard");
+    }
+
+    /// @notice The same block applies when the module setter is buried in a BATCH alongside
+    ///         otherwise-innocent calls — the guard scans every sub-call, not just the first.
+    function test_ownerExecuteBatch_blockedByModuleAdminGuard() public {
+        Execution[] memory execs = new Execution[](2);
+        execs[0] =
+            Execution({target: address(usdc), value: 0, callData: abi.encodeCall(ERC20Mock.transfer, (kani, 1e6))});
+        execs[1] = Execution({
+            target: address(module),
+            value: 0,
+            callData: abi.encodeCall(SpendingLimitModule.setDailyLimit, (int256(7000e18)))
+        });
+
+        vm.prank(owner);
+        vm.expectRevert(SpendingLimitModule.SpendingLimitModule_AdminExecution.selector);
+        wallet.execute(bytes32(uint256(0x01) << 248), ERC7579Utils.encodeBatch(execs));
+
+        assertEq(wallet.getConfig().dailyLimitUsd, DAILY_LIMIT, "cap changed despite the admin guard");
+        assertEq(usdc.balanceOf(kani), 0, "batch was not reverted atomically");
     }
 
     /// @notice The owner's passthroughs remain the normal admin path and are untouched by the guard.
@@ -289,7 +324,13 @@ contract SessionGuardTest is Test {
         wallet.removeSession(sessionKey);
 
         (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
-            address(wallet), config, address(usdc), 0, abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)), sessionKey, sessionKeyPk
+            address(wallet),
+            config,
+            address(usdc),
+            0,
+            abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)),
+            sessionKey,
+            sessionKeyPk
         );
 
         PackedUserOperation[] memory ops = new PackedUserOperation[](1);

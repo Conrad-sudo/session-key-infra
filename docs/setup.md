@@ -12,6 +12,10 @@ Before running any setup, make sure you have completed the one-time steps:
 
    `TELEGRAM_CHAT_ID` is read by `deploy_wallet.py` (to know which user to deploy a wallet for) and by `telebot.py` / `smart_wallet_agent.py` (to know who's chatting). In CLI mode it doubles as the agent's `thread_id` and DB key — it doesn't need to be a real Telegram ID, any integer works, as long as it's the same one used at deployment time.
 
+   > **Telegram is optional.** Only the Telegram bot (`make bot`) needs a `TELEGRAM_TOKEN` (from [@BotFather](https://t.me/BotFather)) and a real Telegram account. If you plan to use the interactive CLI (`make agent`) instead, skip the bot token entirely — you still set `TELEGRAM_CHAT_ID`, but it's just an arbitrary integer key here, not a Telegram identity.
+   >
+   > **The LLM provider is optional too.** The agent defaults to Anthropic's Claude (`ANTHROPIC_API_KEY`); swap in any other [LangChain chat model](https://python.langchain.com/docs/integrations/chat/) with a small edit to `app/smart_wallet_agent.py` (see [docs/app.md](app.md#section-3--langchain-agent)) and that key is no longer required.
+
 ---
 
 ## The Setup Sequence
@@ -42,7 +46,7 @@ Every network (Anvil, Ethereum mainnet fork, Sepolia fork, live Sepolia, BSC for
 >
 > e.g. `make sepolia-fork` followed by `make setup ARGS="sepolia-fork"`. For a live deployment (no local node to start), just run `make setup ARGS="sepolia"` (or `"bsc"`) on its own.
 
-> **Celo is not yet supported end-to-end.** The Python app layer has scaffolding for it (token list, chain ID, Ubeswap V2 factory address), but `HelperConfig.s.sol` has no Celo chain ID branch, so step 2 (`make deploy ARGS="celo-fork"` or similar) cannot succeed on Celo until that's added on the Solidity side. See [docs/app.md](app.md) for what's already wired up.
+> **Celo is not yet supported end-to-end.** The Python app layer has scaffolding for it (token list, chain ID, network routing), but `HelperConfig.s.sol` has no Celo chain ID branch, so step 2 (`make deploy ARGS="celo-fork"` or similar) cannot succeed on Celo until that's added on the Solidity side. Note also that `wrap_eth` is meaningless on Celo — CELO is natively an ERC-20 with no wrapping step. See [docs/app.md](app.md) for what's already wired up.
 
 ---
 

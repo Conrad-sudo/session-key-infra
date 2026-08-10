@@ -151,9 +151,7 @@ abstract contract SHForkTestBase is Test {
     /// @dev [approve router for `approveAmount`, swap `amountIn` along _swapPath()] as one batch.
     function _swapBatch(uint256 approveAmount, uint256 amountIn) internal view returns (Execution[] memory execs) {
         execs = new Execution[](2);
-        execs[0] = Execution(
-            address(_tokenIn()), 0, abi.encodeCall(IERC20.approve, (address(router), approveAmount))
-        );
+        execs[0] = Execution(address(_tokenIn()), 0, abi.encodeCall(IERC20.approve, (address(router), approveAmount)));
         execs[1] = Execution(
             address(router),
             0,
@@ -264,8 +262,7 @@ abstract contract SHForkTestBase is Test {
         assertGt(received, 0, "swap produced no output");
         assertEq(_tokenIn().allowance(address(wallet), address(router)), 0, "router approval left standing");
 
-        int256 netUsd =
-            oracle.getPrice(address(_tokenIn()), amountIn) - oracle.getPrice(address(_tokenOut()), received);
+        int256 netUsd = oracle.getPrice(address(_tokenIn()), amountIn) - oracle.getPrice(address(_tokenOut()), received);
         int256 expected = netUsd > 0 ? netUsd : int256(0);
         assertEq(_spentInWindow(), expected, "metering != oracle-priced net portfolio change");
     }
@@ -292,8 +289,7 @@ abstract contract SHForkTestBase is Test {
             address(router),
             ethIn, // forwarded as msg.value -> spent from the wallet's native balance
             abi.encodeCall(
-                IUniswapV2Router01.swapExactETHForTokens,
-                (0, path, address(wallet), block.timestamp + 1 hours)
+                IUniswapV2Router01.swapExactETHForTokens, (0, path, address(wallet), block.timestamp + 1 hours)
             ),
             sessionKey,
             sessionKeyPk
@@ -332,8 +328,7 @@ abstract contract SHForkTestBase is Test {
             address(router),
             0,
             abi.encodeCall(
-                IUniswapV2Router01.swapExactTokensForETH,
-                (amtSold, 0, path, address(wallet), block.timestamp + 1 hours)
+                IUniswapV2Router01.swapExactTokensForETH, (amtSold, 0, path, address(wallet), block.timestamp + 1 hours)
             )
         );
         vm.prank(owner);
@@ -347,9 +342,6 @@ abstract contract SHForkTestBase is Test {
         int256 expected = netUsd > 0 ? netUsd : int256(0);
         assertEq(_spentInWindow(), expected, "native inflow not credited against token outflow");
     }
-
-
-    
 
     /// @notice An approval sized above what the swap consumes leaves a residual, and the whole
     ///         transaction must revert with exactly that residual reported.
@@ -365,9 +357,7 @@ abstract contract SHForkTestBase is Test {
                 uint256(1)
             )
         );
-        wallet.execute(
-            bytes32(uint256(0x01) << 248), ERC7579Utils.encodeBatch(_swapBatch(amountIn + 1, amountIn))
-        );
+        wallet.execute(bytes32(uint256(0x01) << 248), ERC7579Utils.encodeBatch(_swapBatch(amountIn + 1, amountIn)));
     }
 
     function test_unlimitedApprove_rejectedOnFork() public {
@@ -376,9 +366,7 @@ abstract contract SHForkTestBase is Test {
         wallet.execute(
             bytes32(0),
             abi.encodePacked(
-                address(_tokenIn()),
-                uint256(0),
-                abi.encodeCall(IERC20.approve, (address(router), type(uint256).max))
+                address(_tokenIn()), uint256(0), abi.encodeCall(IERC20.approve, (address(router), type(uint256).max))
             )
         );
     }
@@ -434,7 +422,16 @@ abstract contract SHForkTestBase is Test {
             0,
             abi.encodeCall(
                 IUniswapV2Router01.addLiquidity,
-                (address(tokenIn), address(tokenOut), amtIn, tokenOutBudget, 0, 0, address(wallet), block.timestamp + 1 hours)
+                (
+                    address(tokenIn),
+                    address(tokenOut),
+                    amtIn,
+                    tokenOutBudget,
+                    0,
+                    0,
+                    address(wallet),
+                    block.timestamp + 1 hours
+                )
             )
         );
         add[3] = Execution(address(tokenIn), 0, abi.encodeCall(IERC20.approve, (address(router), 0)));

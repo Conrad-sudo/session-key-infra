@@ -13,16 +13,18 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
  *      execution time rather than storing them as immutables, so any update here
  *      propagates instantly to every deployed wallet without redeployment.
  *
- *      Owned by the treasury operator. protocolFee is capped at MAX_PROTOCOL_FEE
- *      to bound the worst-case impact of a compromised owner key.
+ *      Owned by the treasury operator. protocolFee is bounded to
+ *      [MIN_PROTOCOL_FEE, MAX_PROTOCOL_FEE]: the ceiling bounds the worst-case impact of a
+ *      compromised owner key, and the floor means SessionHandler never sends a zero-value fee
+ *      transfer. Note the floor also means fees cannot be switched off protocol-wide.
  */
 contract SHRegistry is Ownable {
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Thrown when a proposed protocolFee exceeds MAX_PROTOCOL_FEE.
-    error SHRegistry_FeeTooHigh();
+    /// @dev Thrown when a proposed protocolFee falls outside [MIN_PROTOCOL_FEE, MAX_PROTOCOL_FEE].
+    error SHRegistry_FeeNotInRange();
     /// @dev Thrown when address(0) is passed as the treasury address.
     error SHRegistry_InvalidTreasury();
     /// @dev Thrown when address(0) is passed as the price oracle address.
@@ -36,6 +38,10 @@ contract SHRegistry is Ownable {
 
     /// @notice Maximum protocol fee that can ever be set, protecting wallet owners from runaway fees.
     uint256 public constant MAX_PROTOCOL_FEE = 0.001 ether;
+
+    /// @notice Minimum protocol fee that can ever be set. Guarantees SessionHandler's fee transfer is
+    ///         never a zero-value call, so the fee path costs nothing needlessly and always records value.
+    uint256 public constant MIN_PROTOCOL_FEE = 0.00001 ether;
 
     /// @notice Flat ETH fee charged on every session-key execution across all wallets.
     uint256 public protocolFee;
@@ -88,7 +94,7 @@ contract SHRegistry is Ownable {
 
     /**
      * @notice Deploys the SHRegistry with an initial fee and protocol addresses.
-     * @param initialFee           Starting protocol fee in wei. Must not exceed MAX_PROTOCOL_FEE.
+     * @param initialFee           Starting protocol fee in wei. Must be within [MIN_PROTOCOL_FEE, MAX_PROTOCOL_FEE].
      * @param initialTreasury      Address that will receive protocol fees. Must not be address(0).
      * @param initialOracle        Address of the deployed SHOracle. Must not be address(0).
      * @param initialAgentId       Id of the SessionHandler agent on the ERC-8004 Identity Registry. Must not be 0.
@@ -101,7 +107,7 @@ contract SHRegistry is Ownable {
         uint256 initialAgentId,
         address initialRouter
     ) Ownable(msg.sender) {
-        if (initialFee > MAX_PROTOCOL_FEE) revert SHRegistry_FeeTooHigh();
+        if (initialFee > MAX_PROTOCOL_FEE || initialFee < MIN_PROTOCOL_FEE) revert SHRegistry_FeeNotInRange();
         if (initialTreasury == address(0)) revert SHRegistry_InvalidTreasury();
         if (initialOracle == address(0)) revert SHRegistry_InvalidPriceOracle();
 
@@ -118,10 +124,10 @@ contract SHRegistry is Ownable {
 
     /**
      * @notice Updates the protocol fee charged on every session-key execution. Only callable by the owner.
-     * @param newFee The new fee in wei. Must not exceed MAX_PROTOCOL_FEE.
+     * @param newFee The new fee in wei. Must be within [MIN_PROTOCOL_FEE, MAX_PROTOCOL_FEE].
      */
     function setProtocolFee(uint256 newFee) external onlyOwner {
-        if (newFee > MAX_PROTOCOL_FEE) revert SHRegistry_FeeTooHigh();
+        if (newFee > MAX_PROTOCOL_FEE || newFee < MIN_PROTOCOL_FEE) revert SHRegistry_FeeNotInRange();
         uint256 oldFee = protocolFee;
         protocolFee = newFee;
         emit ProtocolFeeUpdated(oldFee, newFee);

@@ -13,7 +13,8 @@ import {Mode} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol
  *      between this and the production path is a test bug, not a contract bug.
  */
 contract SpendingLimitModuleHarness is SpendingLimitModule {
-    constructor(address oracle) SpendingLimitModule(oracle) {}
+    /// @param registry The SHRegistry the module reads its price oracle from (NOT the oracle itself).
+    constructor(address registry) SpendingLimitModule(registry) {}
 
     /// @notice Exposes _decodeExecuteCalldata: recovers (isExecute, mode, executionCalldata) from
     ///         raw outer account calldata.

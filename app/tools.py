@@ -1,4 +1,3 @@
-import time
 from decimal import Decimal
 
 
@@ -96,108 +95,76 @@ from contracts import (
     load_session_handler,
     load_ierc20,
     load_calldata,
-    load_iuniswap_router,
-    load_iuniswap_pair,
     load_reputation_registry,
 )
+from toolkits import get_erc20_tools, get_uniswap_tools
+from db import get_token_address
 from network_config import load_network_config
 from langchain.tools import tool
 from langchain_core.tools import ToolException
-from web3.exceptions import ContractLogicError
+from web3 import Web3
 
-BPS_DENOMINATOR = 10_000
+# Kept only as the default for the agent-facing slippage_bps arguments. The bounds themselves
+# are derived inside langchain-uniswap-v2, in exact integer arithmetic -- the old float
+# `int(base * (BPS - bps) / BPS)` here silently drifted at 18 decimals, in the wrong direction
+# for amountInMax and the addLiquidity desired amounts.
 DEFAULT_SLIPPAGE_BPS = 50  # 0.5%
-SWAP_DEADLINE_SECS = 600  # 10 minutes
 
 
-def _submit_router_call(
-    chat_id,
-    session_key_ciphertext,
-    router,
-    fn_name,
-    args,
-    value=0,
-    approvals=None,
-    reset_approvals=False,
-):
-    """Encode a Uniswap/PancakeSwap V2 router call and submit it as a session-key UserOp.
+def _resolve(chat_id: int, token: str) -> str:
+    """Ticker -> checksummed address, for the address-only langchain-uniswap-v2 tools.
 
-    Shared by every swap and liquidity @tool so the encode + submit + status-check boilerplate
-    lives in one place; each tool still builds its own quote, slippage bounds, and args list.
-    Returns (tx_hash, receipt); raises ToolException if the UserOp did not succeed.
+    "eth" maps to the chain's wrapped-native token: on a router, native ETH/BNB is always
+    routed as its wrapped form, and the *ETH-suffixed router functions wrap/unwrap around
+    that same address. A raw 0x address passes through, so LP/pair tokens work too.
 
-    When `approvals` are given, the whole thing goes out as ONE atomic ERC-7579 batch:
-    [approve(router, amount) per token] + [router call] (+ [approve(router, 0) per token] when
-    reset_approvals is True). This is mandatory under SpendingLimitModule's
-    no-standing-approval rule — an approval that survives its own transaction reverts it, so
-    pre-approving in a separate transaction is impossible. Use reset_approvals=True whenever
-    the router may pull LESS than approved (exact-output swaps, addLiquidity), so the residual
-    is zeroed in the same transaction instead of tripping the module.
-
-    Each approval entry's first field is a token REFERENCE — either a ticker ("usdc") for a
-    listed token, or a raw 0x address for one with no ticker (a pool's LP token in removeLiquidity).
-    The LP-token case only clears the module's approval check because the router is a trusted
-    spender (auto-trusted at wallet deploy), so an unpriced-token approval to it is permitted.
-
-    @param router          Bound router Contract (its .address is the UserOp target).
-    @param fn_name         Router function name for load_calldata (e.g. "swapExactTokensForTokens").
-    @param args            Positional args for that router function, in ABI order.
-    @param value           Native wei to forward (0 for token-in calls; the ETH/BNB amount for
-                           ETH-funded swaps and addLiquidityETH).
-    @param approvals       Optional list of (token_ref, amount_base) to approve for the router in
-                           the same transaction. token_ref is a ticker or a raw 0x token address.
-    @param reset_approvals Also append approve(router, 0) for each approved token after the
-                           router call, clearing any residual allowance.
+    @param token  A ticker listed for the user's chain, "eth", or a raw 0x address.
     """
-    data = load_calldata(instance=router, fn_name=fn_name, args=args)
+    if token.startswith("0x") and len(token) == 42:
+        return Web3.to_checksum_address(token)
+    _, chain_id, _ = load_network_config(chat_id)
+    if token.lower() == "eth":
+        token = get_native_wrapped_ticker(chain_id)
+    return get_token_address(chain_id, token)
 
-    if not approvals:
+
+def _submit_plan(chat_id: int, key_ciphertext: str, plan: dict):
+    """Submit a package execution plan as ONE UserOperation.
+
+    A single-call plan goes out as an ERC-7579 single execution; anything longer is batched.
+    Batching is not an optimisation here -- SpendingLimitModule reverts any transaction that
+    leaves an allowance standing, so [approve, spend, (reset)] must land atomically. The
+    packages already order and size those calls; plan["calls"] is executed verbatim, in order.
+
+    @param plan  A plan dict from a langchain-erc20 / langchain-uniswap-v2 write tool.
+    @return      A tuple of (tx_hash_bytes, receipt_dict).
+    @raises ToolException If the UserOperation did not succeed.
+    """
+    executions = [
+        (Web3.to_checksum_address(call["to"]), call["value"], bytes.fromhex(call["data"][2:]))
+        for call in plan["calls"]
+    ]
+
+    if len(executions) == 1:
+        target, value, data = executions[0]
         tx_hash, receipt = send_user_op_as_session(
             chat_id=chat_id,
-            key_ciphertext=session_key_ciphertext,
-            target=router.address,
+            key_ciphertext=key_ciphertext,
+            target=target,
             value=value,
             data=data,
         )
     else:
-
-        def _load_approval_token(ref):
-            # A raw 0x address (e.g. an LP-token/pair) is bound directly; a ticker is resolved
-            # through the token tables. uniswap_pair=True makes load_ierc20 treat ref as the address.
-            if isinstance(ref, str) and ref.startswith("0x") and len(ref) == 42:
-                return load_ierc20(chat_id=chat_id, token=ref, uniswap_pair=True)
-            return load_ierc20(chat_id=chat_id, token=ref)
-
-        executions = []
-        for token_ref, amount_base in approvals:
-            erc20 = _load_approval_token(token_ref)
-            executions.append(
-                (
-                    erc20.address,
-                    0,
-                    load_calldata(instance=erc20, fn_name="approve", args=[router.address, amount_base]),
-                )
-            )
-        executions.append((router.address, value, data))
-        if reset_approvals:
-            for token_ref, _ in approvals:
-                erc20 = _load_approval_token(token_ref)
-                executions.append(
-                    (
-                        erc20.address,
-                        0,
-                        load_calldata(instance=erc20, fn_name="approve", args=[router.address, 0]),
-                    )
-                )
         tx_hash, receipt = send_batch_user_op_as_session(
             chat_id=chat_id,
-            key_ciphertext=session_key_ciphertext,
+            key_ciphertext=key_ciphertext,
             executions=executions,
         )
 
     if receipt["status"] != 1:
         raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
     return tx_hash, receipt
+
 
 """
  /*//////////////////////////////////////////////////////////////
@@ -702,10 +669,9 @@ def get_erc20_balance(chat_id: int, token: str) -> float:
     """
     print("Running get_erc20_balance")
     address = load_session_handler(chat_id).address
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
-    balance = erc20.functions.balanceOf(address).call()
-    decimals = erc20.functions.decimals().call()
-    return balance / (10**decimals)
+    return get_erc20_tools(chat_id)["get_balance"].invoke(
+        {"token": token, "owner": address}
+    )["amount"]
 
 
 @tool
@@ -727,10 +693,9 @@ def get_contact_erc20_balance(chat_id: int, contact_name: str, token: str) -> fl
     """
     print("Running get_contact_erc20_balance")
     address = _get_contact(chat_id, contact_name)
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
-    balance = erc20.functions.balanceOf(address).call()
-    decimals = erc20.functions.decimals().call()
-    return balance / (10**decimals)
+    return get_erc20_tools(chat_id)["get_balance"].invoke(
+        {"token": token, "owner": address}
+    )["amount"]
 
 
 @tool
@@ -752,12 +717,11 @@ def get_erc20_allowance(chat_id: int, token: str, spender: str) -> float:
         The token allowance approved for the spender in whole units (typically 0.0 by design).
     """
     print("Running get_erc20_allowance")
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
     address = load_session_handler(chat_id).address
     spender_addr = get_contact.func(chat_id, spender)
-    allowance = erc20.functions.allowance(address, spender_addr).call()
-    decimals = erc20.functions.decimals().call()
-    return allowance / (10**decimals)
+    return get_erc20_tools(chat_id)["get_allowance"].invoke(
+        {"token": token, "owner": address, "spender": spender_addr}
+    )["amount"]
 
 
 @tool
@@ -783,27 +747,15 @@ def wrap_eth(chat_id: int, session_key_ciphertext: str, amount_eth: float):
         A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running wrap_eth")
-    _, chain_id, _ = load_network_config(chat_id)
-    iweth = load_ierc20(chat_id, get_native_wrapped_ticker(chain_id))
-    value = _to_base_units(amount_eth, 18)
-
-    data = load_calldata(
-        instance=iweth,
-        fn_name="deposit",
-        args=[],
+    plan = get_erc20_tools(chat_id)["wrap_native"].invoke(
+        {
+            "from_address": load_session_handler(chat_id).address,
+            # str, not float: the package parses amounts as Decimal, and a float cannot
+            # represent 18 decimal places exactly.
+            "amount": str(amount_eth),
+        }
     )
-    target = iweth.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=value,
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
     return f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}"
 
 
@@ -832,26 +784,16 @@ def transfer_erc20(
     Returns: A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running transfer_erc20")
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
     recipient_addr = get_contact.func(chat_id, recipient)
-    decimals = erc20.functions.decimals().call()
-    value = _to_base_units(amount, decimals)
-
-    data = load_calldata(
-        instance=erc20, fn_name="transfer", args=[recipient_addr, value]
+    plan = get_erc20_tools(chat_id)["transfer"].invoke(
+        {
+            "token": token,
+            "to": recipient_addr,
+            "from_address": load_session_handler(chat_id).address,
+            "amount": str(amount),
+        }
     )
-    target = erc20.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
     return f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}"
 
 
@@ -888,33 +830,20 @@ def transferFrom_erc20(
     """
 
     print("Running transferFrom_erc20")
-    erc20 = load_ierc20(chat_id=chat_id, token=token)
+    wallet = load_session_handler(chat_id).address
     sender_addr = get_contact.func(chat_id, sender)
+    recipient_addr = wallet if recipient.lower() == "me" else get_contact.func(chat_id, recipient)
 
-    if recipient.lower() == "me":
-        recipient_addr = load_session_handler(chat_id).address
-    else:
-        recipient_addr = get_contact.func(chat_id, recipient)
-    decimals = erc20.functions.decimals().call()
-    value = _to_base_units(amount, decimals)
-
-    data = load_calldata(
-        instance=erc20,
-        fn_name="transferFrom",
-        args=[sender_addr, recipient_addr, value],
+    plan = get_erc20_tools(chat_id)["transfer_from"].invoke(
+        {
+            "token": token,
+            "owner": sender_addr,
+            "to": recipient_addr,
+            "from_address": wallet,
+            "amount": str(amount),
+        }
     )
-    target = erc20.address
-
-    tx_hash, receipt = send_user_op_as_session(
-        chat_id=chat_id,
-        key_ciphertext=session_key_ciphertext,
-        target=target,
-        value=int(0),
-        data=data,
-    )
-
-    if receipt["status"] != 1:
-        raise ToolException(f"UserOp failed! tx: {tx_hash.hex()}")
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
     return f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}"
 
 
@@ -947,50 +876,20 @@ def get_quote_in(
 
     Returns:
         A dict with:
-          - path (list[str]): the token address path used for the quote (passable directly to swap tools)
           - amount_in (float): required token_in in whole units (e.g. 101.5 for 101.5 USDC)
-          - amount_in_base (int): required token_in in base units (for slippage math in swap tools)
           - amount_out (float): the requested token_out amount in whole units
-          - amount_out_base (int): the requested token_out amount in base units
+          - path (list[str]): the token address path used for the quote
 
-        When presenting to the user, show only amount_in and amount_out.
-        Never expose path, amount_in_base, or amount_out_base.
+        When presenting to the user, show only amount_in and amount_out. Never expose path.
     """
-    print("Running get_amount_in")
-    _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
-    token_in = native_wrapped if token_in.lower() == "eth" else token_in
-    token_out = native_wrapped if token_out.lower() == "eth" else token_out
-    router = load_iuniswap_router(chat_id=chat_id)
-    erc20_out = load_ierc20(chat_id=chat_id, token=token_out)
-    erc20_in = load_ierc20(chat_id=chat_id, token=token_in)
-    decimals_out = erc20_out.functions.decimals().call()
-    decimals_in = erc20_in.functions.decimals().call()
-    amount_out_base = _to_base_units(amount_out, decimals_out)
-    if token_in.lower() != native_wrapped and token_out.lower() != native_wrapped:
-        path = [
-            erc20_in.address,
-            load_ierc20(chat_id, native_wrapped).address,
-            erc20_out.address,
-        ]
-    else:
-        path = [erc20_in.address, erc20_out.address]
-
-    try:
-        amounts = router.functions.getAmountsIn(amount_out_base, path).call()
-    except ContractLogicError:
-        raise ToolException(
-            f"No Uniswap V2 liquidity path found for {token_in.upper()} → {token_out.upper()}. "
-            f"The pool may not exist or have insufficient reserves."
-        )
-
-    return {
-        "path": path,
-        "amount_in": amounts[0] / 10**decimals_in,
-        "amount_in_base": amounts[0],
-        "amount_out": amount_out,
-        "amount_out_base": amount_out_base,
-    }
+    print("Running get_quote_in")
+    return get_uniswap_tools(chat_id)["get_quote_in"].invoke(
+        {
+            "token_in": _resolve(chat_id, token_in),
+            "token_out": _resolve(chat_id, token_out),
+            "amount_out": amount_out,
+        }
+    )
 
 
 @tool
@@ -1015,50 +914,20 @@ def get_quote_out(
 
     Returns:
         A dict with:
-          - path (list[str]): the token address path used for the quote (passable directly to swap tools)
           - amount_in (float): the token_in amount in whole units
-          - amount_in_base (int): the token_in amount in base units
           - amount_out (float): expected token_out in whole units (e.g. 99.2 for 99.2 DAI)
-          - amount_out_base (int): expected token_out in base units (for slippage math in swap tools)
+          - path (list[str]): the token address path used for the quote
 
-        When presenting to the user, show only amount_in and amount_out.
-        Never expose path, amount_in_base, or amount_out_base.
+        When presenting to the user, show only amount_in and amount_out. Never expose path.
     """
-    print("Running get_amount_out")
-    _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
-    token_in = native_wrapped if token_in.lower() == "eth" else token_in
-    token_out = native_wrapped if token_out.lower() == "eth" else token_out
-    router = load_iuniswap_router(chat_id=chat_id)
-    erc20_out = load_ierc20(chat_id=chat_id, token=token_out)
-    erc20_in = load_ierc20(chat_id=chat_id, token=token_in)
-    decimals_out = erc20_out.functions.decimals().call()
-    decimals_in = erc20_in.functions.decimals().call()
-    amount_in_base = _to_base_units(amount_in, decimals_in)
-    if token_in.lower() != native_wrapped and token_out.lower() != native_wrapped:
-        path = [
-            erc20_in.address,
-            load_ierc20(chat_id, native_wrapped).address,
-            erc20_out.address,
-        ]
-    else:
-        path = [erc20_in.address, erc20_out.address]
-
-    try:
-        amounts = router.functions.getAmountsOut(amount_in_base, path).call()
-    except ContractLogicError:
-        raise ToolException(
-            f"No Uniswap V2 liquidity path found for {token_in.upper()} → {token_out.upper()}. "
-            f"The pool may not exist or have insufficient reserves."
-        )
-
-    return {
-        "path": path,
-        "amount_in": amount_in,
-        "amount_in_base": amount_in_base,
-        "amount_out": amounts[-1] / 10**decimals_out,
-        "amount_out_base": amounts[-1],
-    }
+    print("Running get_quote_out")
+    return get_uniswap_tools(chat_id)["get_quote_out"].invoke(
+        {
+            "token_in": _resolve(chat_id, token_in),
+            "token_out": _resolve(chat_id, token_out),
+            "amount_in": amount_in,
+        }
+    )
 
 
 @tool
@@ -1085,13 +954,13 @@ def get_liquidity_token_balance(
     if token_b is None:
         _, chain_id, _ = load_network_config(chat_id)
         token_b = get_native_wrapped_ticker(chain_id)
-    pair = load_iuniswap_pair(chat_id, token_a, token_b)
-    address = load_session_handler(chat_id).address
-    pair_address = pair.address
-    pair_erc20 = load_ierc20(chat_id, pair_address, uniswap_pair=True)
-    balance = pair_erc20.functions.balanceOf(address).call()
-    decimals = pair_erc20.functions.decimals().call()
-    return balance / (10**decimals)
+    return get_uniswap_tools(chat_id)["get_liquidity_token_balance"].invoke(
+        {
+            "owner_address": load_session_handler(chat_id).address,
+            "token_a": _resolve(chat_id, token_a),
+            "token_b": _resolve(chat_id, token_b),
+        }
+    )
 
 
 @tool
@@ -1120,29 +989,36 @@ def is_derived_input_sufficient(
           - is_sufficient (bool): True if the user has sufficient funds to cover the swap including slippage, False otherwise.
           - derived_input (float): The amount of the input token required to cover the swap including slippage.
     """
+    print("Running is_derived_input_sufficient")
+    wallet = load_session_handler(chat_id).address
+    tools = get_uniswap_tools(chat_id)
 
+    # Paying in the native asset is a different balance check (the wallet's ETH/BNB, not an
+    # ERC20 holding), so it has its own tool in the package.
     if token_in.lower() == "eth":
-        balance = _get_native_balance(chat_id)
+        result = tools["is_derived_native_input_sufficient"].invoke(
+            {
+                "token_out": _resolve(chat_id, token_out),
+                "amount_out": amount_out,
+                "owner_address": wallet,
+                "slippage_bps": slippage_bps,
+            }
+        )
     else:
-        balance = get_erc20_balance.func(chat_id, token_in)
+        result = tools["is_derived_token_input_sufficient"].invoke(
+            {
+                "token_in": _resolve(chat_id, token_in),
+                "token_out": _resolve(chat_id, token_out),
+                "amount_out": amount_out,
+                "owner_address": wallet,
+                "slippage_bps": slippage_bps,
+            }
+        )
 
-    _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
-    if token_in.lower() == "eth":
-        token_in = native_wrapped
-    if token_out.lower() == "eth":
-        token_out = native_wrapped
-
-    quote = get_quote_in.func(chat_id, token_in, token_out, amount_out)
-
-    required_with_slippage = (
-        quote["amount_in"] * (BPS_DENOMINATOR + slippage_bps) / BPS_DENOMINATOR
-    )
-
-    if balance < required_with_slippage:
-        return {"is_sufficient": False, "derived_input": required_with_slippage}
-    else:
-        return {"is_sufficient": True, "derived_input": required_with_slippage}
+    return {
+        "is_sufficient": result["is_sufficient"],
+        "derived_input": result["required_input"],
+    }
 
 
 @tool
@@ -1161,15 +1037,21 @@ def is_exact_input_sufficient(chat_id: int, token_in: str, amount_in: float) -> 
     Returns:
         True if the user has sufficient funds to cover the swap without slippage, False otherwise.
     """
-    if token_in.lower() == "eth":
-        balance = _get_native_balance(chat_id)
-    else:
-        balance = get_erc20_balance.func(chat_id, token_in)
+    print("Running is_exact_input_sufficient")
+    wallet = load_session_handler(chat_id).address
+    tools = get_uniswap_tools(chat_id)
 
-    if balance < amount_in:
-        return False
-    else:
-        return True
+    if token_in.lower() == "eth":
+        return tools["is_native_balance_sufficient"].invoke(
+            {"amount": amount_in, "owner_address": wallet}
+        )
+    return tools["is_token_balance_sufficient"].invoke(
+        {
+            "token_address": _resolve(chat_id, token_in),
+            "amount": amount_in,
+            "owner_address": wallet,
+        }
+    )
 
 
 @tool
@@ -1197,23 +1079,34 @@ def is_liquidity_sufficient(
           - is_sufficient (bool): True if the wallet holds enough of both tokens, False otherwise.
           - amount_b (float): The proportional token_b amount required, in whole units.
     """
-    _, chain_id, _ = load_network_config(chat_id)
-    quote_token_b = get_native_wrapped_ticker(chain_id) if token_b.lower() == "eth" else token_b
-    quote = get_pool_quote.func(chat_id, token_a, quote_token_b, amount_a)
-    amount_b = quote["amount_b_desired"]
+    print("Running is_liquidity_sufficient")
+    wallet = load_session_handler(chat_id).address
+    tools = get_uniswap_tools(chat_id)
 
-    balance_a = get_erc20_balance.func(chat_id, token_a)
-    if amount_a > balance_a:
-        return {"is_sufficient": False, "amount_b": amount_b}
-
+    # Pairing against the raw native asset checks the wallet's ETH/BNB balance rather than a
+    # wrapped-native ERC20 holding, so the package splits it into a separate tool.
     if token_b.lower() == "eth":
-        balance_b = _get_native_balance(chat_id)
-    else:
-        balance_b = get_erc20_balance.func(chat_id, token_b)
-    if amount_b > balance_b:
-        return {"is_sufficient": False, "amount_b": amount_b}
+        result = tools["is_liquidity_sufficient_eth"].invoke(
+            {
+                "token": _resolve(chat_id, token_a),
+                "amount_token": amount_a,
+                "owner_address": wallet,
+            }
+        )
+        return {
+            "is_sufficient": result["is_sufficient"],
+            "amount_b": result["required_native"],
+        }
 
-    return {"is_sufficient": True, "amount_b": amount_b}
+    result = tools["is_liquidity_sufficient"].invoke(
+        {
+            "token_a": _resolve(chat_id, token_a),
+            "amount_a": amount_a,
+            "token_b": _resolve(chat_id, token_b),
+            "owner_address": wallet,
+        }
+    )
+    return {"is_sufficient": result["is_sufficient"], "amount_b": result["required_b"]}
 
 
 @tool
@@ -1233,22 +1126,28 @@ def is_liquidity_removal_sufficient(
     Returns:
         True if the wallet holds enough LP tokens to burn, False otherwise.
     """
-    lp_token_balance = get_liquidity_token_balance.func(chat_id, token_a, token_b)
-    return lp_amount <= lp_token_balance
+    print("Running is_liquidity_removal_sufficient")
+    return get_uniswap_tools(chat_id)["is_liquidity_removal_sufficient"].invoke(
+        {
+            "token_a": _resolve(chat_id, token_a),
+            "token_b": _resolve(chat_id, token_b),
+            "lp_amount": lp_amount,
+            "owner_address": load_session_handler(chat_id).address,
+        }
+    )
 
 
 @tool
 def get_pool_quote(chat_id: int, token_a: str, token_b: str, amount_a: float) -> dict:
     """
     Returns the proportional token_b amount required to match a given token_a deposit in a
-    Uniswap V2 pool, using live pool reserves and router.quote(). Also returns token addresses
-    and base-unit amounts needed by the add_liquidity and add_liquidity_eth tools.
+    Uniswap V2 pool, using live pool reserves and router.quote().
 
     Use this tool when the user wants to preview how much of the second token they need to
     provide before adding liquidity (e.g. "How much ETH do I need to pair with 2500 DAI?").
     For native-paired pools, pass token_b as the chain's wrapped-native ticker ("weth" on
-    Ethereum, "wbnb" on BSC). When presenting the result to the user, only show amount_a and
-    amount_b_desired — never expose token addresses or base-unit fields.
+    Ethereum, "wbnb" on BSC). add_liquidity derives this amount itself, so this tool is for
+    previewing only.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
@@ -1258,48 +1157,17 @@ def get_pool_quote(chat_id: int, token_a: str, token_b: str, amount_a: float) ->
 
     Returns:
         A dict with:
-          - token_a_address (str): checksummed address of token_a
-          - token_b_address (str): checksummed address of token_b
-          - decimals_a (int): decimal precision of token_a
-          - decimals_b (int): decimal precision of token_b
           - amount_a (float): token_a deposit in whole units
-          - amount_a_base (int): token_a deposit in base units
           - amount_b_desired (float): required token_b in whole units
-          - amount_b_desired_base (int): required token_b in base units
     """
-    router = load_iuniswap_router(chat_id)
-    erc20_a = load_ierc20(chat_id=chat_id, token=token_a)
-    erc20_b = load_ierc20(chat_id=chat_id, token=token_b)
-    try:
-        pair = load_iuniswap_pair(chat_id, token_a, token_b)
-    except ValueError as e:
-        raise ToolException(str(e))
-
-    decimals_a = erc20_a.functions.decimals().call()
-    decimals_b = erc20_b.functions.decimals().call()
-    amount_a_base = _to_base_units(amount_a, decimals_a)
-
-    reserve0, reserve1, _ = pair.functions.getReserves().call()
-    token0 = pair.functions.token0().call()
-    if token0.lower() == erc20_a.address.lower():
-        reserve_a, reserve_b = reserve0, reserve1
-    else:
-        reserve_a, reserve_b = reserve1, reserve0
-
-    amount_b_desired_base = router.functions.quote(
-        amount_a_base, reserve_a, reserve_b
-    ).call()
-
-    return {
-        "token_a_address": erc20_a.address,
-        "token_b_address": erc20_b.address,
-        "decimals_a": decimals_a,
-        "decimals_b": decimals_b,
-        "amount_a": amount_a,
-        "amount_a_base": amount_a_base,
-        "amount_b_desired": amount_b_desired_base / 10**decimals_b,
-        "amount_b_desired_base": amount_b_desired_base,
-    }
+    print("Running get_pool_quote")
+    return get_uniswap_tools(chat_id)["get_pool_quote"].invoke(
+        {
+            "token_a": _resolve(chat_id, token_a),
+            "token_b": _resolve(chat_id, token_b),
+            "amount_a": amount_a,
+        }
+    )
 
 
 @tool
@@ -1307,14 +1175,12 @@ def get_lp_amounts(chat_id: int, token_a: str, token_b: str, lp_amount: float) -
     """
     Returns the expected token amounts redeemable by burning a given amount of Uniswap V2 LP
     tokens, derived from live reserves using the proportional share formula
-    (liquidity × reserve / totalSupply). Also returns base-unit amounts needed by the
-    remove_liquidity and remove_liquidity_eth tools.
+    (liquidity × reserve / totalSupply).
 
     Use this tool when the user wants to preview how much they'll receive before removing
     liquidity (e.g. "How much DAI and ETH will I get back for 0.5 LP tokens?"). For native-paired
     pools, pass token_b as the chain's wrapped-native ticker ("weth" on Ethereum, "wbnb" on BSC).
-    When presenting the result to the user, only show expected_a and expected_b — never expose
-    token addresses, base-unit fields, or liquidity.
+    remove_liquidity derives these amounts itself, so this tool is for previewing only.
 
     Args:
         chat_id: The Telegram chat ID of the user making the request.
@@ -1324,49 +1190,17 @@ def get_lp_amounts(chat_id: int, token_a: str, token_b: str, lp_amount: float) -
 
     Returns:
         A dict with:
-          - token_a_address (str): checksummed address of token_a
-          - token_b_address (str): checksummed address of token_b
-          - decimals_a (int): decimal precision of token_a
-          - decimals_b (int): decimal precision of token_b
-          - liquidity (int): LP amount in base units
           - expected_a (float): expected token_a return in whole units
-          - expected_a_base (int): expected token_a return in base units
           - expected_b (float): expected token_b return in whole units
-          - expected_b_base (int): expected token_b return in base units
     """
-    erc20_a = load_ierc20(chat_id=chat_id, token=token_a)
-    erc20_b = load_ierc20(chat_id=chat_id, token=token_b)
-    pair = load_iuniswap_pair(chat_id, token_a, token_b)
-
-    pair_erc20 = load_ierc20(chat_id, pair.address, uniswap_pair=True)
-    lp_decimals = pair_erc20.functions.decimals().call()
-    decimals_a = erc20_a.functions.decimals().call()
-    decimals_b = erc20_b.functions.decimals().call()
-    liquidity = _to_base_units(lp_amount, lp_decimals)
-
-    reserve0, reserve1, _ = pair.functions.getReserves().call()
-    total_supply = pair_erc20.functions.totalSupply().call()
-    token0 = pair.functions.token0().call()
-
-    raw0 = (liquidity * reserve0) // total_supply
-    raw1 = (liquidity * reserve1) // total_supply
-
-    if token0.lower() == erc20_a.address.lower():
-        expected_a_base, expected_b_base = raw0, raw1
-    else:
-        expected_a_base, expected_b_base = raw1, raw0
-
-    return {
-        "token_a_address": erc20_a.address,
-        "token_b_address": erc20_b.address,
-        "decimals_a": decimals_a,
-        "decimals_b": decimals_b,
-        "liquidity": liquidity,
-        "expected_a": expected_a_base / 10**decimals_a,
-        "expected_a_base": expected_a_base,
-        "expected_b": expected_b_base / 10**decimals_b,
-        "expected_b_base": expected_b_base,
-    }
+    print("Running get_lp_amounts")
+    return get_uniswap_tools(chat_id)["get_lp_amounts"].invoke(
+        {
+            "token_a": _resolve(chat_id, token_a),
+            "token_b": _resolve(chat_id, token_b),
+            "lp_amount": lp_amount,
+        }
+    )
 
 
 @tool
@@ -1405,35 +1239,21 @@ def swap_ETH_for_exact_tokens(
     """
     print("Running swap_ETH_for_exact_tokens")
     _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
     native_ticker = get_native_asset_ticker(chain_id)
-    router = load_iuniswap_router(chat_id)
-    quote = get_quote_in.func(chat_id, native_wrapped, token_out, amount_out)
-    derived_check = is_derived_input_sufficient.func(
-        chat_id, "eth", token_out, amount_out, slippage_bps
-    )
-    if not derived_check["is_sufficient"]:
-        raise ToolException(f"Insufficient {native_ticker} balance for this swap.")
 
-    value = int(
-        quote["amount_in_base"] * (BPS_DENOMINATOR + slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["swap_eth_for_exact_tokens"].invoke(
+        {
+            "token_out": _resolve(chat_id, token_out),
+            "amount_out": amount_out,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-    to = load_session_handler(chat_id).address
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "swapETHForExactTokens",
-        [quote["amount_out_base"], quote["path"], to, deadline],
-        value=value,
-    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"{native_ticker} spent: {quote['amount_in']:.6f} {native_ticker}, "
+        f"Max {native_ticker} spent: {plan['summary']['amount_in_max']:.6f}, "
         f"{token_out.upper()} received: {amount_out}"
     )
 
@@ -1470,38 +1290,21 @@ def swap_exact_tokens_for_tokens(
              amount of token_in spent, and amount of token_out received.
     """
     print("Running swap_exact_tokens_for_tokens")
-
-    if not is_exact_input_sufficient.func(chat_id, token_in, amount_in):
-        raise ToolException(f"Insufficient {token_in.upper()} balance for this swap.")
-
-    router = load_iuniswap_router(chat_id)
-    quote = get_quote_out.func(chat_id, token_in, token_out, amount_in)
-
-    amount_out_min = int(
-        quote["amount_out_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["swap_exact_tokens_for_tokens"].invoke(
+        {
+            "token_in": _resolve(chat_id, token_in),
+            "token_out": _resolve(chat_id, token_out),
+            "amount_in": amount_in,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "swapExactTokensForTokens",
-        [
-            quote["amount_in_base"],
-            amount_out_min,
-            quote["path"],
-            load_session_handler(chat_id).address,
-            deadline,
-        ],
-        # Exact-input swap: the router pulls exactly amount_in, consuming the approval to zero.
-        approvals=[(token_in, quote["amount_in_base"])],
-    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token_in.upper()} spent: {amount_in}, "
-        f"{token_out.upper()} received: {quote['amount_out']:.6f}"
+        f"Min {token_out.upper()} received: {plan['summary']['amount_out_min']:.6f}"
     )
 
 
@@ -1537,40 +1340,20 @@ def swap_tokens_for_exact_tokens(
              amount of token_in spent, and amount of token_out received.
     """
     print("Running swap_tokens_for_exact_tokens")
-    router = load_iuniswap_router(chat_id)
-    quote = get_quote_in.func(chat_id, token_in, token_out, amount_out)
-    derived_check = is_derived_input_sufficient.func(
-        chat_id, token_in, token_out, amount_out, slippage_bps
+    plan = get_uniswap_tools(chat_id)["swap_tokens_for_exact_tokens"].invoke(
+        {
+            "token_in": _resolve(chat_id, token_in),
+            "token_out": _resolve(chat_id, token_out),
+            "amount_out": amount_out,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-    if not derived_check["is_sufficient"]:
-        raise ToolException(f"Insufficient {token_in.upper()} balance for this swap.")
-
-    amount_in_max = int(
-        quote["amount_in_base"] * (BPS_DENOMINATOR + slippage_bps) / BPS_DENOMINATOR
-    )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "swapTokensForExactTokens",
-        [
-            quote["amount_out_base"],
-            amount_in_max,
-            quote["path"],
-            load_session_handler(chat_id).address,
-            deadline,
-        ],
-        # Exact-output swap: the router may pull LESS than amount_in_max, so the residual
-        # allowance must be zeroed in the same transaction (reset_approvals).
-        approvals=[(token_in, amount_in_max)],
-        reset_approvals=True,
-    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"{token_in.upper()} spent: {quote['amount_in']:.6f}, "
+        f"Max {token_in.upper()} spent: {plan['summary']['amount_in_max']:.6f}, "
         f"{token_out.upper()} received: {amount_out}"
     )
 
@@ -1610,36 +1393,23 @@ def swap_exact_tokens_for_ETH(
              amount of token_in spent, and native asset received.
     """
     print("Running swap_exact_tokens_for_ETH")
-
-    if not is_exact_input_sufficient.func(chat_id, token_in, amount_in):
-        raise ToolException(f"Insufficient {token_in.upper()} balance for this swap.")
-
     _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
     native_ticker = get_native_asset_ticker(chain_id)
-    router = load_iuniswap_router(chat_id)
-    quote = get_quote_out.func(chat_id, token_in, native_wrapped, amount_in)
 
-    amount_out_min = int(
-        quote["amount_out_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["swap_exact_tokens_for_eth"].invoke(
+        {
+            "token_in": _resolve(chat_id, token_in),
+            "amount_in": amount_in,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-    to = load_session_handler(chat_id).address
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "swapExactTokensForETH",
-        [quote["amount_in_base"], amount_out_min, quote["path"], to, deadline],
-        # Exact-input swap: the router pulls exactly amount_in, consuming the approval to zero.
-        approvals=[(token_in, quote["amount_in_base"])],
-    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token_in.upper()} spent: {amount_in}, "
-        f"{native_ticker} received: {quote['amount_out']:.6f}"
+        f"Min {native_ticker} received: {plan['summary']['amount_out_min']:.6f}"
     )
 
 
@@ -1679,38 +1449,21 @@ def swap_tokens_for_exact_ETH(
     """
     print("Running swap_tokens_for_exact_ETH")
     _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
     native_ticker = get_native_asset_ticker(chain_id)
-    router = load_iuniswap_router(chat_id)
-    quote = get_quote_in.func(chat_id, token_in, native_wrapped, amount_out_eth)
-    derived_check = is_derived_input_sufficient.func(
-        chat_id, token_in, "eth", amount_out_eth, slippage_bps
-    )
-    if not derived_check["is_sufficient"]:
-        raise ToolException(f"Insufficient {token_in.upper()} balance for this swap.")
 
-    amount_in_max = int(
-        quote["amount_in_base"] * (BPS_DENOMINATOR + slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["swap_tokens_for_exact_eth"].invoke(
+        {
+            "token_in": _resolve(chat_id, token_in),
+            "amount_out": amount_out_eth,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-    to = load_session_handler(chat_id).address
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "swapTokensForExactETH",
-        [quote["amount_out_base"], amount_in_max, quote["path"], to, deadline],
-        # Exact-output swap: the router may pull LESS than amount_in_max, so the residual
-        # allowance must be zeroed in the same transaction (reset_approvals).
-        approvals=[(token_in, amount_in_max)],
-        reset_approvals=True,
-    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"{token_in.upper()} spent: {quote['amount_in']:.6f}, "
+        f"Max {token_in.upper()} spent: {plan['summary']['amount_in_max']:.6f}, "
         f"{native_ticker} received: {amount_out_eth}"
     )
 
@@ -1750,36 +1503,23 @@ def swap_exact_ETH_for_tokens(
              native asset spent, and amount of token_out received.
     """
     print("Running swap_exact_ETH_for_tokens")
-
     _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
     native_ticker = get_native_asset_ticker(chain_id)
 
-    if not is_exact_input_sufficient.func(chat_id, "eth", eth_amount_in):
-        raise ToolException(f"Insufficient {native_ticker} balance for this swap.")
-
-    router = load_iuniswap_router(chat_id)
-    quote = get_quote_out.func(chat_id, native_wrapped, token_out, eth_amount_in)
-
-    amount_out_min = int(
-        quote["amount_out_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["swap_exact_eth_for_tokens"].invoke(
+        {
+            "token_out": _resolve(chat_id, token_out),
+            "amount_in": eth_amount_in,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-    to = load_session_handler(chat_id).address
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "swapExactETHForTokens",
-        [amount_out_min, quote["path"], to, deadline],
-        value=quote["amount_in_base"],
-    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{native_ticker} spent: {eth_amount_in}, "
-        f"{token_out.upper()} received: {quote['amount_out']:.6f}"
+        f"Min {token_out.upper()} received: {plan['summary']['amount_out_min']:.6f}"
     )
 
 
@@ -1822,53 +1562,23 @@ def add_liquidity(
     if token_b is None:
         _, chain_id, _ = load_network_config(chat_id)
         token_b = get_native_wrapped_ticker(chain_id)
-    router = load_iuniswap_router(chat_id)
-    quote = get_pool_quote.func(chat_id, token_a, token_b, amount_a)
 
-    liquidity_check = is_liquidity_sufficient.func(chat_id, token_a, amount_a, token_b)
-    if not liquidity_check["is_sufficient"]:
-        raise ToolException(
-            f"Insufficient token balance. Ensure the wallet holds enough {token_a.upper()} and {token_b.upper()} to cover the deposit."
-        )
-
-    amount_a_min = int(
-        quote["amount_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["add_liquidity"].invoke(
+        {
+            "token_a": _resolve(chat_id, token_a),
+            "token_b": _resolve(chat_id, token_b),
+            "amount_a": amount_a,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-    amount_b_min = int(
-        quote["amount_b_desired_base"]
-        * (BPS_DENOMINATOR - slippage_bps)
-        / BPS_DENOMINATOR
-    )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "addLiquidity",
-        [
-            quote["token_a_address"],
-            quote["token_b_address"],
-            quote["amount_a_base"],
-            quote["amount_b_desired_base"],
-            amount_a_min,
-            amount_b_min,
-            load_session_handler(chat_id).address,
-            deadline,
-        ],
-        # addLiquidity pulls at most the desired amounts and may pull less (pool ratio), so
-        # both approvals are granted and their residuals zeroed in the same transaction.
-        approvals=[
-            (token_a, quote["amount_a_base"]),
-            (token_b, quote["amount_b_desired_base"]),
-        ],
-        reset_approvals=True,
-    )
-
+    summary = plan["summary"]
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"{token_a.upper()} min deposited: {amount_a_min / 10**quote['decimals_a']:.6f}, "
-        f"{token_b.upper()} min deposited: {amount_b_min / 10**quote['decimals_b']:.6f}"
+        f"{token_a.upper()} min deposited: {summary['amount_a_min']:.6f}, "
+        f"{token_b.upper()} min deposited: {summary['amount_b_min']:.6f}"
     )
 
 
@@ -1911,51 +1621,23 @@ def add_liquidity_eth(
     """
     print("Running add_liquidity_eth")
     _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
     native_ticker = get_native_asset_ticker(chain_id)
-    router = load_iuniswap_router(chat_id)
-    quote = get_pool_quote.func(chat_id, token, native_wrapped, amount_token)
 
-    liquidity_check = is_liquidity_sufficient.func(chat_id, token, amount_token, "eth")
-    if not liquidity_check["is_sufficient"]:
-        raise ToolException(
-            f"Insufficient token balance. Ensure the wallet holds enough {token.upper()} and {native_ticker} to cover the deposit."
-        )
-
-    amount_token_min = int(
-        quote["amount_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
+    plan = get_uniswap_tools(chat_id)["add_liquidity_eth"].invoke(
+        {
+            "token": _resolve(chat_id, token),
+            "amount_token": amount_token,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
     )
-    amount_eth_min = int(
-        quote["amount_b_desired_base"]
-        * (BPS_DENOMINATOR - slippage_bps)
-        / BPS_DENOMINATOR
-    )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "addLiquidityETH",
-        [
-            quote["token_a_address"],
-            quote["amount_a_base"],
-            amount_token_min,
-            amount_eth_min,
-            load_session_handler(chat_id).address,
-            deadline,
-        ],
-        value=quote["amount_b_desired_base"],
-        # addLiquidityETH may pull less than the desired token amount (pool ratio), so the
-        # approval is granted and its residual zeroed in the same transaction.
-        approvals=[(token, quote["amount_a_base"])],
-        reset_approvals=True,
-    )
-
+    summary = plan["summary"]
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"{token.upper()} min deposited: {amount_token_min / 10**quote['decimals_a']:.6f}, "
-        f"{native_ticker} min deposited: {amount_eth_min / WEI_PER_ETH:.6f}"
+        f"{token.upper()} min deposited: {summary['amount_token_min']:.6f}, "
+        f"{native_ticker} min deposited: {summary['amount_eth_min']:.6f}"
     )
 
 
@@ -2000,46 +1682,26 @@ def remove_liquidity(
     if token_b is None:
         _, chain_id, _ = load_network_config(chat_id)
         token_b = get_native_wrapped_ticker(chain_id)
-    if not is_liquidity_removal_sufficient.func(chat_id, token_a, token_b, lp_amount):
-        raise ToolException(
-            "Insufficient LP tokens. Use get_liquidity_token_balance to check your balance."
-        )
 
-    router = load_iuniswap_router(chat_id)
-    lp = get_lp_amounts.func(chat_id, token_a, token_b, lp_amount)
-    pair_address = load_iuniswap_pair(chat_id, token_a, token_b).address
+    # The plan's approval is on the pair's own LP token, which the oracle does not price. It
+    # clears SpendingLimitModule only because the router is a trusted spender (auto-trusted at
+    # wallet deploy), and removeLiquidity pulls exactly the approved amount.
+    plan = get_uniswap_tools(chat_id)["remove_liquidity"].invoke(
+        {
+            "token_a": _resolve(chat_id, token_a),
+            "token_b": _resolve(chat_id, token_b),
+            "lp_amount": lp_amount,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
+    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
-    amount_a_min = int(
-        lp["expected_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
-    )
-    amount_b_min = int(
-        lp["expected_b_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
-    )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "removeLiquidity",
-        [
-            lp["token_a_address"],
-            lp["token_b_address"],
-            lp["liquidity"],
-            amount_a_min,
-            amount_b_min,
-            load_session_handler(chat_id).address,
-            deadline,
-        ],
-        # removeLiquidity pulls exactly `liquidity` LP tokens, consuming this approval to zero.
-        # The LP token is unpriced, so the approval only clears SpendingLimitModule because the
-        # router is a trusted spender (auto-trusted at wallet deploy).
-        approvals=[(pair_address, lp["liquidity"])],
-    )
+    summary = plan["summary"]
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"Min {token_a.upper()} returned: {amount_a_min / 10**lp['decimals_a']:.6f}, "
-        f"Min {token_b.upper()} returned: {amount_b_min / 10**lp['decimals_b']:.6f}"
+        f"Min {token_a.upper()} returned: {summary['amount_a_min']:.6f}, "
+        f"Min {token_b.upper()} returned: {summary['amount_b_min']:.6f}"
     )
 
 
@@ -2085,43 +1747,23 @@ def remove_liquidity_eth(
     """
     print("Running remove_liquidity_eth")
     _, chain_id, _ = load_network_config(chat_id)
-    native_wrapped = get_native_wrapped_ticker(chain_id)
     native_ticker = get_native_asset_ticker(chain_id)
-    if not is_liquidity_removal_sufficient.func(chat_id, token, native_wrapped, lp_amount):
-        raise ToolException(
-            "Insufficient LP tokens. Use get_liquidity_token_balance to check your balance."
-        )
 
-    router = load_iuniswap_router(chat_id)
-    lp = get_lp_amounts.func(chat_id, token, native_wrapped, lp_amount)
-    pair_address = load_iuniswap_pair(chat_id, token, native_wrapped).address
+    plan = get_uniswap_tools(chat_id)["remove_liquidity_eth"].invoke(
+        {
+            "token": _resolve(chat_id, token),
+            "lp_amount": lp_amount,
+            "from_address": load_session_handler(chat_id).address,
+            "slippage_bps": slippage_bps,
+        }
+    )
+    tx_hash, receipt = _submit_plan(chat_id, session_key_ciphertext, plan)
 
-    amount_token_min = int(
-        lp["expected_a_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
-    )
-    amount_eth_min = int(
-        lp["expected_b_base"] * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
-    )
-    deadline = int(time.time()) + SWAP_DEADLINE_SECS
-
-    tx_hash, receipt = _submit_router_call(
-        chat_id,
-        session_key_ciphertext,
-        router,
-        "removeLiquidityETH",
-        [
-            lp["token_a_address"],
-            lp["liquidity"],
-            amount_token_min,
-            amount_eth_min,
-            load_session_handler(chat_id).address,
-            deadline,
-        ],
-    )
+    summary = plan["summary"]
     return (
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
-        f"Min {token.upper()} returned: {amount_token_min / 10**lp['decimals_a']:.6f}, "
-        f"Min {native_ticker} returned: {amount_eth_min / WEI_PER_ETH:.6f}"
+        f"Min {token.upper()} returned: {summary['amount_token_min']:.6f}, "
+        f"Min {native_ticker} returned: {summary['amount_eth_min']:.6f}"
     )
 
 

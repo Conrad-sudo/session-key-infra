@@ -94,8 +94,7 @@ contract SendPackedUserOp is Script {
         // Batch mode word: CALLTYPE_BATCH (0x01) in the top byte, EXECTYPE_DEFAULT (0x00) next,
         // everything else zero -- matches ERC7579Utils.decodeMode's byte layout.
         bytes32 mode = bytes32(uint256(0x01) << 248);
-        bytes memory callData =
-            abi.encodeCall(IERC7579Execution.execute, (mode, ERC7579Utils.encodeBatch(executions)));
+        bytes memory callData = abi.encodeCall(IERC7579Execution.execute, (mode, ERC7579Utils.encodeBatch(executions)));
         return _signUserOp(sender, config, callData, signer, signerKey);
     }
 

@@ -62,7 +62,8 @@ contract SHTreasury is Ownable, ReentrancyGuard {
      *      flow here from the moment the first SessionHandler goes live. The SHRegistry's
      *      Ownable owner is also set to `address(this)`, so all registry admin passes
      *      through this contract.
-     * @param initialFee     Starting protocol fee in wei. Must not exceed SHRegistry.MAX_PROTOCOL_FEE.
+     * @param initialFee     Starting protocol fee in wei. Must be within
+     *                       [SHRegistry.MIN_PROTOCOL_FEE, SHRegistry.MAX_PROTOCOL_FEE].
      * @param priceOracle    Address of the deployed SHOracle. Must not be address(0).
      * @param initialAgentId Id of the SessionHandler ERC-4337 AI agent on the ERC-8004 Identity Registry.
      * @param uniswapRouter  Uniswap V2 Router address. May be address(0) on chains without Uniswap V2.
@@ -120,7 +121,8 @@ contract SHTreasury is Ownable, ReentrancyGuard {
 
     /**
      * @notice Updates the protocol fee charged on every session-key execution. Only callable by the owner.
-     * @param newFee The new fee in wei. Must not exceed SHRegistry.MAX_PROTOCOL_FEE.
+     * @param newFee The new fee in wei. Must be within
+     *               [SHRegistry.MIN_PROTOCOL_FEE, SHRegistry.MAX_PROTOCOL_FEE].
      */
     function setProtocolFee(uint256 newFee) external onlyOwner {
         SHRegistry(REGISTRY).setProtocolFee(newFee);

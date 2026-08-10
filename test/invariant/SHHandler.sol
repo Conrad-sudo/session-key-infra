@@ -100,7 +100,7 @@ contract SHHandler is Test {
         try wallet.execute(bytes32(0), payload) {
             ghostSpent = base + outUsd;
             ghostWindowStart = startAfter;
-        } catch {/* budget/staleness revert: nothing changed on-chain either */}
+        } catch { /* budget/staleness revert: nothing changed on-chain either */ }
     }
 
     /// @dev Batch that mints USDC in and transfers USDC out in one tx: only the net outflow may be

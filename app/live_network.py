@@ -8,11 +8,19 @@ from userop import create_signed_user_op, prepare_execute_call, prepare_execute_
 load_dotenv()
 
 # Placeholder gas limits for the dummy op sent to eth_estimateUserOperationGas.
-# verificationGasLimit and callGasLimit are kept separate: verification is ECDSA +
-# storage reads (~50-100k), while the call may be complex (swap, liquidity, etc.).
-# Keeping the verification dummy tight prevents bundlers from echoing an inflated
-# value back as the estimate, which would fail the bundler's efficiency check.
-DUMMY_VERIFICATION_GAS = 150_000
+# verificationGasLimit and callGasLimit are kept separate: verification is ECDSA + a few
+# storage reads (measured ~44k for this account's SessionHandler validation), while the call
+# may be complex (swap, liquidity, etc.).
+#
+# DUMMY_VERIFICATION_GAS is echoed straight back by Alchemy's bundler as the estimate, so it
+# effectively IS the submitted verificationGasLimit. eth_sendUserOperation then enforces a
+# verification-gas efficiency floor (actualGasUsed / limit >= 0.4), i.e. the limit must be
+# <= 2.5x actual. At 150_000 the limit was ~3.4x the ~44k actually used (efficiency ~0.29),
+# which the bundler rejected. 55_000 sits ~25% above real usage (safe against on-chain
+# out-of-gas) while keeping efficiency ~0.8 first-op and >0.4 for cheaper follow-up ops.
+# Since every wallet shares one SessionHandler implementation, verification gas is uniform,
+# so a single tuned constant is appropriate. Must stay >= real verification gas.
+DUMMY_VERIFICATION_GAS = 65_000
 DUMMY_CALL_GAS = 500_000
 DUMMY_PRE_VERIFICATION_GAS = 50_000
 
@@ -173,9 +181,25 @@ def create_unsigned_user_op(
     verification_gas_limit = int(estimates["verificationGasLimit"], 16)
     pre_verification_gas = int(int(estimates["preVerificationGas"], 16) * GAS_BUFFER_MULTIPLIER)
 
-    # Re-fetch gas price after estimation so the final op uses the latest base fee.
-    # Apply the same buffer to stay above the bundler's minimum even if the fee ticks up slightly.
-    fresh_gas_price = int(w3.eth.gas_price * GAS_BUFFER_MULTIPLIER)
+    # A UserOp's maxFeePerGas is fixed at submission, but Sepolia's base fee is highly volatile
+    # (observed swinging ~1 <-> 40+ gwei within the hour). A thin buffer over the current price
+    # gets stranded the moment the base fee climbs past it: the bundler can no longer include the
+    # op without losing money, so it parks it until it's dropped (the 600s inclusion timeout).
+    # Set the fee to 2x the current base fee + a tip so it survives a base-fee spike of up to ~2x.
+    #
+    # maxFeePerGas and maxPriorityFeePerGas are packed to the SAME value on purpose. The signed
+    # hash comes from EntryPoint.getUserOpHash() over these packed bytes, but _packed_user_op_to_rpc_json
+    # splits them and the bundler re-packs the halves in the opposite 128-bit order (per the
+    # ERC-4337 v0.7 spec), so the on-chain hash only matches our signature while the two halves are
+    # identical. Splitting them into a real (low) tip + (high) cap requires aligning that packing
+    # order first (in _packed_user_op_to_rpc_json and here) — see the note on gasFees above.
+    base_fee = w3.eth.get_block("latest")["baseFeePerGas"]
+    try:
+        tip = w3.eth.max_priority_fee
+    except Exception:
+        # Some nodes don't implement eth_maxPriorityFeePerGas; a 2 gwei tip is a safe default.
+        tip = w3.to_wei(2, "gwei")
+    fresh_gas_price = 2 * base_fee + tip
     account_gas_limits = (verification_gas_limit << 128 | call_gas_limit).to_bytes(32, "big")
     gas_fees = (fresh_gas_price << 128 | fresh_gas_price).to_bytes(32, "big")
 

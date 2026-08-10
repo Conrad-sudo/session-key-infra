@@ -6,24 +6,16 @@ from db import (
     get_token_address,
     get_factory_address,
 )
-from constants import UNISWAP_V2_FACTORY, SEPOLIA_UNISWAP_V2_FACTORY, PANCAKE_V2_FACTORY, UBESWAP_V2_FACTORY, ETH_SENTINEL, CHAIN_ID_BSC, CHAIN_ID_CELO, CHAIN_ID_MAINNET, CHAIN_ID_SEPOLIA
 from abi import (
     ientry_point,
-    iweth,
     ierc20_extended,
-    iuniswap_v2_router02,
-    iuniswap_v2_factory,
     ireputation_registry,
-    iuniswap_v2_pair,
 )
 
 _session_handler_cache: dict[int, Contract] = {}
 _entry_point_cache: dict[int, Contract] = {}
 _erc20_cache: dict[tuple[int, str], Contract] = {}
-_router_cache: dict[int, Contract] = {}
-_factory_cache: dict[int, Contract] = {}
 _sh_factory_cache: dict[int, Contract] = {}
-_pair_cache: dict[tuple[int, str, str], Contract] = {}
 _reputation_registry_cache: dict[int, Contract] = {}
 _spending_limit_module_cache: dict[int, Contract] = {}
 
@@ -36,22 +28,20 @@ ERC7579_SINGLE_CALL_MODE = b"\x00" * 32
 ERC7579_BATCH_CALL_MODE = b"\x01" + b"\x00" * 31
 
 
-
-
 def invalidate_cache(chat_id: int) -> None:
     """Drop all cached contract instances for chat_id after a redeploy."""
+    # Imported here, not at module scope: toolkits.py imports load_session_handler from this
+    # module, so a top-level import would be circular.
+    from toolkits import invalidate_toolkits
+
+    invalidate_toolkits(chat_id)
     _session_handler_cache.pop(chat_id, None)
     _entry_point_cache.pop(chat_id, None)
-    _router_cache.pop(chat_id, None)
-    _factory_cache.pop(chat_id, None)
     _sh_factory_cache.pop(chat_id, None)
     _reputation_registry_cache.pop(chat_id, None)
     _spending_limit_module_cache.pop(chat_id, None)
     for key in [k for k in _erc20_cache if k[0] == chat_id]:
         del _erc20_cache[key]
-    for key in [k for k in _pair_cache if k[0] == chat_id]:
-        del _pair_cache[key]
-
 
 
 def load_session_handler(chat_id: int) -> Contract:
@@ -156,26 +146,23 @@ def encode_batch_execution_calldata(executions: list[tuple[str, int, bytes]]) ->
     return encode(["(address,uint256,bytes)[]"], [executions])
 
 
-def load_ierc20(chat_id: int, token: str, uniswap_pair=False) -> Contract:
+def load_ierc20(chat_id: int, token: str) -> Contract:
     """
     Loads an IERC20 Contract instance for the given ticker symbol.
 
+    Only used now for address lookups and decimals() by the oracle-pricing tools; all ERC20
+    reads and calldata construction moved to langchain-erc20 (see app/toolkits.py). The
+    wrapped-native token needs no special ABI here either -- deposit()/withdraw() are the
+    package's wrap_native/unwrap_native.
+
     @param token  The token ticker symbol to look up (e.g. "usdc", "dai").
-    @return       A web3.py Contract instance for the matching ERC20Mock deployment.
+    @return       A web3.py Contract instance for the matching token.
     """
     key = (chat_id, token)
     if key not in _erc20_cache:
         w3, chain_id, _ = load_network_config(chat_id)
-        if token in ("weth", "wbnb"):
-            abi = iweth
-        else:
-            abi = ierc20_extended
-        if uniswap_pair:
-            address = token
-        else:
-            address = get_token_address(chain_id, token)
-
-        _erc20_cache[key] = w3.eth.contract(address=address, abi=abi)
+        address = get_token_address(chain_id, token)
+        _erc20_cache[key] = w3.eth.contract(address=address, abi=ierc20_extended)
     return _erc20_cache[key]
 
 
@@ -195,8 +182,6 @@ def load_factory(chat_id: int) -> Contract:
     return _sh_factory_cache[chat_id]
 
 
-
-
 def load_calldata(instance: Contract, fn_name: str, args: list) -> bytes:
     """
     ABI-encodes a call to a function and returns the raw calldata bytes.
@@ -211,50 +196,6 @@ def load_calldata(instance: Contract, fn_name: str, args: list) -> bytes:
     )
 
 
-def load_iuniswap_router(chat_id: int) -> Contract:
-    """
-    Loads the Uniswap V2 Router interface ABI and binds it to the known mainnet address.
-
-    @return  A web3.py Contract instance for the Uniswap V2 Router.
-    """
-    if chat_id not in _router_cache:
-        w3, _, _ = load_network_config(chat_id)
-        abi = iuniswap_v2_router02
-        address = load_session_handler(chat_id).functions.getRouter().call()
-        _router_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
-    return _router_cache[chat_id]
-
-
-def load_iuniswap_factory(chat_id: int) -> Contract:
-    """
-    Loads the Uniswap/PancakeSwap/Ubeswap V2 Factory interface ABI, bound to the known
-    factory address for the user's current network (Uniswap V2 on mainnet/Sepolia,
-    PancakeSwap V2 on BSC, Ubeswap V2 on Celo).
-
-    @return  A web3.py Contract instance for the V2 Factory.
-    @raises ValueError  If the user's current chain_id has no known V2 factory address
-                        (e.g. Anvil, which has no default Uniswap V2 deployment).
-    """
-
-    if chat_id not in _factory_cache:
-        w3, chain_id, _ = load_network_config(chat_id)
-        abi = iuniswap_v2_factory
-        if chain_id == CHAIN_ID_MAINNET:
-            address = UNISWAP_V2_FACTORY
-        elif chain_id == CHAIN_ID_SEPOLIA:
-            address = SEPOLIA_UNISWAP_V2_FACTORY
-        elif chain_id == CHAIN_ID_BSC:
-            address = PANCAKE_V2_FACTORY
-        elif chain_id == CHAIN_ID_CELO:
-            address = UBESWAP_V2_FACTORY
-        else:
-            raise ValueError(f"No Uniswap V2-compatible factory configured for chain_id {chain_id}")
-        _factory_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
-    return _factory_cache[chat_id]
-
-
-
-
 def load_reputation_registry(chat_id: int) -> Contract:
     """Loads the ERC-8004 Reputation Registry bound to the correct address for this chain.
     Anvil uses the locally compiled ABI; Sepolia/Mainnet use the canonical artifact."""
@@ -267,26 +208,3 @@ def load_reputation_registry(chat_id: int) -> Contract:
     return _reputation_registry_cache[chat_id]
 
 
-def load_iuniswap_pair(chat_id: int, token_a: str, token_b: str) -> Contract:
-    """
-    Loads the Uniswap V2 Pair interface ABI and binds it to the address of the pair for the given tokens.
-
-    @param token_a   The ticker symbol of the first token (e.g. "usdc").
-    @param token_b   The ticker symbol of the second token (e.g. "dai").
-    @return          A web3.py Contract instance for the Uniswap V2 Pair of the two tokens.
-    """
-
-    key = (chat_id, token_a, token_b)
-    if key not in _pair_cache:
-        w3, chain_id, _ = load_network_config(chat_id)
-        factory = load_iuniswap_factory(chat_id)
-        address = factory.functions.getPair(
-            get_token_address(chain_id, token_a), get_token_address(chain_id, token_b)
-        ).call()
-        if address == ETH_SENTINEL:
-            raise ValueError(
-                f"No Uniswap V2 pool exists for {token_a.upper()}/{token_b.upper()}."
-            )
-        abi = iuniswap_v2_pair
-        _pair_cache[key] = w3.eth.contract(address=address, abi=abi)
-    return _pair_cache[key]

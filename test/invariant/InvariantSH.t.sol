@@ -56,15 +56,8 @@ contract InvariantSH is StdInvariant, Test {
         usdc.mint(address(wallet), 1_000_000e6);
         dai.mint(address(wallet), 1_000_000e18);
 
-        handler = new SHHandler(
-            wallet,
-            module,
-            oracle,
-            usdc,
-            dai,
-            MockV3Aggregator(config.usdcUsdPriceFeed),
-            config.account
-        );
+        handler =
+            new SHHandler(wallet, module, oracle, usdc, dai, MockV3Aggregator(config.usdcUsdPriceFeed), config.account);
 
         targetContract(address(handler));
     }

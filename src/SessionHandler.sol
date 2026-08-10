@@ -3,7 +3,8 @@ pragma solidity ^0.8.24;
 
 import {IEntryPoint} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
 import {AccountERC7579Hooked} from "@openzeppelin/contracts/account/extensions/draft-AccountERC7579Hooked.sol";
-import {MODULE_TYPE_HOOK, Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
+import {MODULE_TYPE_HOOK, MODULE_TYPE_EXECUTOR, Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
+import {Calldata} from "@openzeppelin/contracts/utils/Calldata.sol";
 import {ERC7579Utils, Mode, CallType} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
@@ -33,11 +34,21 @@ import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Cont
  *      module is installed -- SpendingLimitModule is a hook (module type 4) ONLY, enforcing the USD
  *      spending cap on every execution. A session key is a BARE signer with no per-key target/
  *      selector scope or expiry; the spending cap is its only on-chain guardrail (see {addSession}).
- * @dev Deliberate deviation from stock AccountERC7579Hooked: `execute`, `installModule`, and
- *      `uninstallModule` are normally `onlyEntryPointOrSelf` -- an EOA owner cannot call them
- *      directly. This contract reopens that direct-owner path (see the three overrides below) so
- *      the owner never has to submit a UserOp for their own admin actions -- they just call the
- *      account directly, without needing a second "owner validator" module.
+ * @dev Deliberate deviation from stock AccountERC7579Hooked, which makes `execute`, `installModule`,
+ *      and `uninstallModule` `onlyEntryPointOrSelf` -- an EOA owner cannot call them directly. The
+ *      three overrides below reopen a direct-owner path so the owner never has to submit a UserOp for
+ *      their own admin actions, and needs no second "owner validator" module. They do NOT all reopen
+ *      it the same way:
+ *        - {execute} becomes onlyEntryPointOrSelfOrOwner: still reachable through the EntryPoint (that
+ *          is how session keys act at all), with {_guardSessionExecution} restraining non-owner callers.
+ *        - {installModule} / {uninstallModule} become onlyOwner, which is strictly TIGHTER than stock.
+ *          An owner-signed UserOp arrives as msg.sender == EntryPoint, not the owner, so these are
+ *          reachable only by a direct owner call and by no UserOp at all -- closing the path where a
+ *          session key submits a UserOp aimed straight at them, bypassing {execute}'s guard entirely.
+ *      Module reconfiguration has a second, independent line of defence in the hook itself:
+ *      SpendingLimitModule's preCheck refuses any execute-routed call to its own admin surface, for
+ *      every caller including the owner. The owner's supported route to the cap settings is the
+ *      passthroughs below, which call the module directly with the account as msg.sender.
  */
 contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     using SafeERC20 for IERC20;
@@ -57,6 +68,10 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     ///      code in the account's context and so could reach the admin surface regardless of target.
     error SessionHandler_SessionDelegateCallForbidden();
 
+    error SessionHandler_TransferFailed();
+
+    
+
     /*//////////////////////////////////////////////////////////////
                                     EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -64,6 +79,12 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     event SessionAdded(address indexed sessionKey);
     /// @notice Emitted when the owner revokes a session key.
     event SessionRemoved(address indexed sessionKey);
+
+    /// @notice Emitted when a session-key execution pays the protocol fee. Owner-initiated executions
+    ///         pay no fee and emit nothing.
+    /// @param treasury The registry-configured recipient at the time of payment.
+    /// @param fee      The amount paid in wei.
+    event ProtocolFeePaid(address indexed treasury, uint256 fee);
 
     /*//////////////////////////////////////////////////////////////
                              STATE VARIABLES
@@ -88,6 +109,7 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     ///         cap. Managed via {addSession}/{removeSession}.
     mapping(address sessionKey => bool allowed) public allowedSession;
 
+   
 
     /*//////////////////////////////////////////////////////////////
                                 Constructor
@@ -96,6 +118,7 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     constructor() {
         _disableInitializers();
     }
+
     /*//////////////////////////////////////////////////////////////
                                 Initialization
     //////////////////////////////////////////////////////////////*/
@@ -110,7 +133,7 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         int256 dailyLimitUsd,
         uint256 windowDuration,
         address[] calldata watchedTokens
-    )  external initializer {
+    ) external initializer {
         __Ownable_init(owner);
         ENTRY_POINT = entryPointAddress;
         REPUTATION_REGISTRY = reputationRegistry;
@@ -123,9 +146,7 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         // decodes exactly this (dailyLimitUsd, windowDuration, watchedTokens) tuple, so the config
         // must be non-empty and valid: windowDuration > 0, dailyLimitUsd >= 0, and every watched
         // token already priced by the oracle.
-        _installModule(
-            MODULE_TYPE_HOOK, spendingLimitModule, abi.encode(dailyLimitUsd, windowDuration, watchedTokens)
-        );
+        _installModule(MODULE_TYPE_HOOK, spendingLimitModule, abi.encode(dailyLimitUsd, windowDuration, watchedTokens));
 
         // Trust the registry's canonical DEX router by default so unpriced-token approvals to it
         // (e.g. an LP token in removeLiquidity) are permitted -- the no-standing-approval rule still
@@ -171,24 +192,35 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         Mode execMode = Mode.wrap(mode);
         // Owner-initiated calls are unrestricted; any other path (a session-key UserOp via the
         // EntryPoint, or a self-call) must not be able to reach the account's own admin surface.
-        if (msg.sender != owner()) _guardSessionExecution(execMode, executionCalldata);
+        if (msg.sender != owner()) {
+            _guardSessionExecution(execMode, executionCalldata);
+
+           _extractFee();
+        }
         _execute(execMode, executionCalldata);
     }
 
-    /// @notice Installs an ERC-7579 module. Callable by the EntryPoint, the account itself, or the owner.
-    function installModule(uint256 moduleTypeId, address module, bytes calldata initData)
-        public
-        override
-        onlyEntryPointOrSelfOrOwner
-    {
+       
+    /// @notice Installs an ERC-7579 module.
+    /// @dev Owner-only, via a direct call: an owner-signed UserOp arrives as msg.sender == EntryPoint
+    ///      (not the owner), so onlyOwner rejects it. This is deliberate — a session key could
+    ///      otherwise submit a UserOp whose callData targets this function directly (bypassing
+    ///      {execute}'s {_guardSessionExecution}) to install a malicious validator/executor and
+    ///      escape the spending cap. Deployment is unaffected: {initialize} uses the internal
+    ///      {_installModule} rather than this external entrypoint.
+    function installModule(uint256 moduleTypeId, address module, bytes calldata initData) public override onlyOwner {
         _installModule(moduleTypeId, module, initData);
     }
 
-    /// @notice Uninstalls an ERC-7579 module. Callable by the EntryPoint, the account itself, or the owner.
+    /// @notice Uninstalls an ERC-7579 module.
+    /// @dev Owner-only, via a direct call (same rationale as {installModule}): a session key must
+    ///      never be able to uninstall the SpendingLimitModule hook to lift its own cap. Because an
+    ///      owner-signed UserOp is seen as msg.sender == EntryPoint, this is reachable only by the
+    ///      owner calling the account directly, not through any UserOp.
     function uninstallModule(uint256 moduleTypeId, address module, bytes calldata deInitData)
         public
         override
-        onlyEntryPointOrSelfOrOwner
+        onlyOwner
     {
         _uninstallModule(moduleTypeId, module, deInitData);
     }
@@ -200,6 +232,11 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /// @dev Each setter below calls the module AS this account, so the module keys the config under
     ///      this account's address. Kept owner-only on purpose: a session key must never be able to
     ///      raise its own cap or reshape the watched list (see SpendingLimitModule's NatSpec).
+    /// @dev These passthroughs are also the ONLY working route to the module's setters, for the owner
+    ///      included. Reaching them via execute(address(SH_MODULE), ...) reverts with
+    ///      SpendingLimitModule_AdminExecution -- the hook cannot tell an owner-driven execute from a
+    ///      session-key one, so it refuses both. A direct call here is not wrapped in execute, so no
+    ///      hook runs and the account reaches the module as itself.
 
     /// @notice Sets the account's max USD spend per window (18 decimals). Forwards to SH_MODULE.setDailyLimit.
     function setDailyLimit(int256 dailyLimitUsd) external onlyOwner {
@@ -294,12 +331,7 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
      *      eth_account.encode_defunct), so it is re-wrapped here before recovery. Uses tryRecover so
      *      a malformed signature returns SIG_VALIDATION_FAILED instead of reverting validation.
      */
-    function _rawSignatureValidation(bytes32 hash, bytes calldata signature)
-        internal
-        view
-        override
-        returns (bool)
-    {
+    function _rawSignatureValidation(bytes32 hash, bytes calldata signature) internal view override returns (bool) {
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(hash);
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecoverCalldata(digest, signature);
         if (err != ECDSA.RecoverError.NoError) return false;
@@ -339,6 +371,33 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
             revert SessionHandler_SessionRestrictedTarget(target);
         }
     }
+
+     function _extractFee() internal {
+            address treasury = REGISTRY.treasury();
+            uint256 fee = REGISTRY.protocolFee();
+            if (address(this).balance < fee) revert SessionHandler_NotEnoughBalance();
+            (bool success,) = treasury.call{value: fee}("");
+            if (!success) revert SessionHandler_TransferFailed();
+            emit ProtocolFeePaid(treasury, fee);
+
+        }
+
+     function executeFromExecutor(
+        bytes32 mode,
+        bytes calldata executionCalldata
+    )
+        public
+        payable
+        override
+        onlyModule(MODULE_TYPE_EXECUTOR, Calldata.emptyBytes())
+        whenNotPaused
+        returns (bytes[] memory returnData)
+    {   
+        _extractFee();
+
+        return _execute(Mode.wrap(mode), executionCalldata);
+    }
+
 
     /*//////////////////////////////////////////////////////////////
                            OWNER-ONLY FUNCTIONS

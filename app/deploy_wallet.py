@@ -28,6 +28,16 @@ DEFAULT_DAILY_LIMIT_USD = 50_000 * 10**18
 # Spending-window length in seconds (24h — the cap refills each window).
 DEFAULT_WINDOW_SECS = 86_400
 
+# ETH transferred into a freshly deployed wallet by prefund() so it can pay its own ERC-4337
+# prefund (maxFeePerGas * total gas limit, drawn from balance since the wallet holds no EntryPoint
+# deposit) and forward ETH into WETH wraps / Uniswap swaps. Live testnets get a modest amount
+# (Sepolia/BSC ETH is faucet-scarce) sized to cover a UserOp prefund even when the base fee is
+# elevated — at ~40 gwei base, a ~400k-gas op prefunds ~0.03 ETH, so 0.15 leaves room for the op
+# plus the transfer. Local anvil + fork chains run on a richly-funded deployer, so they keep a
+# larger cushion for multi-swap e2e runs. Strings (not floats) so to_wei converts them exactly.
+WALLET_PREFUND_ETH_LIVE = "0.15"
+WALLET_PREFUND_ETH_LOCAL = "1"
+
 # Tokens the wallet's spending-limit module meters (net-value tracking), per network. Each MUST
 # already be priced by the deployed SHOracle, or deployWallet reverts with TokenNotPriced.
 # Native ETH/BNB is ALWAYS metered (it is not on this watched list); only unwatched ERC20s sit
@@ -67,11 +77,30 @@ def _private_key_env(chain_name: str) -> str:
     return LIVE_PRIVATE_KEY_ENV.get(chain_name, "ANVIL_PRIVATE_KEY")
 
 
+def _eip1559_fees(w3: Web3) -> dict:
+    """
+    Returns EIP-1559 fee fields (maxFeePerGas / maxPriorityFeePerGas) giving a transaction a
+    2x base-fee cushion. A legacy fixed `gasPrice` can never pay above its set value, so on
+    Sepolia — where the base fee routinely several-x's within a few blocks — such a tx gets
+    stranded and eventually dropped once the base fee climbs past it (the TimeExhausted this
+    replaces). The 2x headroom mirrors how web3.py auto-populates fees for build_transaction,
+    which is why deployWallet() below never hit this. Splat into a tx dict with **.
+    """
+    base = w3.eth.get_block("latest")["baseFeePerGas"]
+    try:
+        tip = w3.eth.max_priority_fee
+    except Exception:
+        # Some nodes don't implement eth_maxPriorityFeePerGas; a 2 gwei tip is a safe default.
+        tip = w3.to_wei(2, "gwei")
+    return {"maxFeePerGas": 2 * base + tip, "maxPriorityFeePerGas": tip}
+
+
 def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int):
     """
     Funds two accounts from the deployer after SessionHandler wallet deployment:
-      1. SessionHandler wallet — 10 ETH to cover ERC-4337 prefund and any forwarded
-         ETH used for WETH wraps or Uniswap swaps initiated by session keys.
+      1. SessionHandler wallet — ETH to cover its ERC-4337 prefund deposit and any forwarded
+         ETH used for WETH wraps or Uniswap swaps initiated by session keys. Amount is
+         WALLET_PREFUND_ETH_LIVE on live testnets, WALLET_PREFUND_ETH_LOCAL on anvil/forks.
       2. Bundler (FORK_DEPLOYER_PK, shared across every fork network) — 10 ETH to cover
          the gas cost of bundling ERC-4337 UserOperations on the fork. This is the same
          key anvil.py uses at runtime to sign the outer handleOps transaction, so the
@@ -88,22 +117,24 @@ def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int
         chain_id:       EIP-155 chain ID used when building transactions.
     """
     nonce = w3.eth.get_transaction_count(deployer.address)
-    # 1. Send 10 ETH to the SessionHandler wallet (covers ERC-4337 prefund + forwarded ETH for wraps/swaps)
+    is_live = "fork" not in network and network != "anvil"
+    wallet_prefund = WALLET_PREFUND_ETH_LIVE if is_live else WALLET_PREFUND_ETH_LOCAL
+    # 1. Fund the SessionHandler wallet (covers its ERC-4337 prefund deposit + forwarded ETH for wraps/swaps)
     tx = {
         "from": deployer.address,
         "to": wallet_address,
-        "value": w3.to_wei(10, "ether"),
+        "value": w3.to_wei(wallet_prefund, "ether"),
         "nonce": nonce,
         "chainId": chain_id,
         "gas": 50_000,
-        "gasPrice": w3.eth.gas_price,
+        **_eip1559_fees(w3),
     }
     w3.eth.wait_for_transaction_receipt(
         w3.eth.send_raw_transaction(
             w3.eth.account.sign_transaction(tx, deployer.key).raw_transaction
         )
     )
-    print(f"SessionHandler wallet funded with 10 ETH for {network} deployments.")
+    print(f"SessionHandler wallet funded with {wallet_prefund} ETH for {network} deployments.")
 
     if "fork" in network:
         # 2. Fund the Bundler with 10 ETH to cover the gas costs of bundling UserOperations on
@@ -121,7 +152,7 @@ def prefund(deployer, wallet_address: str, w3: Web3, network: str, chain_id: int
             "nonce": nonce,
             "chainId": chain_id,
             "gas": 50_000,
-            "gasPrice": w3.eth.gas_price,
+            **_eip1559_fees(w3),
         }
         w3.eth.wait_for_transaction_receipt(
             w3.eth.send_raw_transaction(

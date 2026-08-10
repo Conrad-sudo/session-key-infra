@@ -32,9 +32,9 @@ BSC_RPC_URL=https://bnb-mainnet.g.alchemy.com/v2/your_alchemy_key
 CELO_RPC_URL=https://celo-mainnet.g.alchemy.com/v2/your_alchemy_key
 
 # AI / bot credentials
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
-TELEGRAM_TOKEN=your_telegram_bot_token_here
-TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+ANTHROPIC_API_KEY=your_anthropic_api_key_here   # default LLM; not needed if you swap in another provider
+TELEGRAM_TOKEN=your_telegram_bot_token_here     # optional — only for `make bot` (the Telegram front end)
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here     # a plain integer user key; any value works (see below)
 
 # HashiCorp Vault — populated automatically by `make vault`
 VAULT_ADDR=http://127.0.0.1:8200
@@ -59,6 +59,10 @@ ETHERSCAN_API_KEY=your_etherscan_api_key_here
 > On live Sepolia/BSC, the Alchemy bundler handles gas — no local bundler key is used by `live_network.py`.
 >
 > `ETHERSCAN_API_KEY` is optional. If not set, deployment skips contract verification and prints a notice.
+>
+> **`TELEGRAM_TOKEN` is optional — the whole Telegram layer is.** It is read only by `telebot.py` (`make bot`). The interactive CLI (`make agent`) never reads it, so you can run the full agent without a bot token or a Telegram account. `TELEGRAM_CHAT_ID` is still required even in CLI mode, but only as an integer user key (agent `thread_id` + DB key) — it does **not** have to be a real Telegram ID; any integer works, as long as it matches the one used at wallet deployment.
+>
+> **`ANTHROPIC_API_KEY` is only the default.** The agent uses Anthropic's Claude out of the box, but the LLM is not tied to Anthropic — swap in any [LangChain chat model](https://python.langchain.com/docs/integrations/chat/) with a small edit to `app/smart_wallet_agent.py` (see [docs/app.md](app.md#section-3--langchain-agent)), and this key is no longer needed. Some LLM provider is always required; Anthropic specifically is not.
 
 ---
 

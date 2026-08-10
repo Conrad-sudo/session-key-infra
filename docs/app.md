@@ -6,11 +6,13 @@ The `app/` directory bridges the AI agent to the on-chain contracts. It is built
 
 ```
 app/
-├── constants.py           ← Chain IDs, DEX factory addresses, ETH sentinel, native-wrapped ticker map
+├── constants.py           ← Chain IDs, ETH sentinel, native-wrapped ticker map
 ├── db.py                  ← SQLite data layer (all reads/writes to wallet.db)
 ├── seed_data.py           ← Static reference data (chains, RPCs, token addresses) seeded by make db
 ├── network_config.py      ← Web3 connection factory
 ├── contracts.py           ← Contract loading with per-chat_id caching; ERC-7579 calldata/nonce helpers
+├── toolkits.py            ← Per-chat_id langchain-erc20 / langchain-uniswap-v2 toolkits (cached)
+├── userop.py              ← Shared UserOp construction + signing, used by both backends
 ├── anvil.py               ← UserOp execution (local/fork) — single + batch, via direct handleOps
 ├── live_network.py        ← UserOp execution via Alchemy bundler (live networks) — single + batch
 ├── vault_signer.py        ← HashiCorp Vault Transit encrypt/decrypt wrapper
@@ -19,8 +21,16 @@ app/
 ├── smart_wallet_agent.py  ← LangChain agent and system prompt
 ├── telebot.py             ← Telegram bot front end
 ├── agent_card.json        ← ERC-8004/v1 agent card (hosted publicly, referenced by tokenURI)
-└── artifacts/             ← JSON ABIs for EntryPoint, ERC20, WETH, Uniswap V2 router/factory/pair, mocks
+└── abi.py                 ← ABIs for EntryPoint, ERC20, the ERC-8004 registry, and mocks
 ```
+
+> **ERC20 and Uniswap V2 calldata comes from two external packages.**
+> [`langchain-erc20`](https://pypi.org/project/langchain-erc20/) and
+> [`langchain-uniswap-v2`](https://pypi.org/project/langchain-uniswap-v2/) build every balance
+> read, quote, slippage bound and approval sequence. They return an ordered *execution plan* of
+> `(to, value, data)` calls and never sign or submit; `tools._submit_plan` turns a plan into one
+> UserOperation. That is why `abi.py` no longer carries the router/factory/pair/WETH ABIs and
+> `constants.py` no longer hardcodes factory addresses.
 
 > **Celo support is partial.** `celo_tokens` has a seeded table and the network routing handles `"celo"`/`"celo-fork"`, but there is no Solidity-side deployment path yet, and Celo is intentionally excluded from `deploy_wallet.py`'s default watched-token map (see [docs/contracts.md](contracts.md#helperconfigssol)).
 
@@ -28,13 +38,14 @@ app/
 
 ```
 telebot.py ──────────► smart_wallet_agent.py ──► tools.py ──► contracts.py ──► network_config.py ──► db.py
+                                                  tools.py ──► toolkits.py ──► contracts.py
                                                   tools.py ──► anvil.py ─────► userop.py ──► vault_signer.py
                                                   tools.py ──► live_network.py ► userop.py ──► vault_signer.py
                                                   tools.py ──► db.py
 deploy_wallet.py ───────────────────────────────────────────────────────────────────────────────────► db.py
 ```
 
-The dependency graph is strictly one-directional — no circular imports.
+The dependency graph is one-directional with a single exception: `contracts.invalidate_cache` imports `toolkits.invalidate_toolkits` inside the function body, because `toolkits.py` imports `load_session_handler` from `contracts.py` at module scope. Keeping invalidation behind one entry point is worth the function-local import.
 
 ---
 
@@ -50,10 +61,9 @@ CHAIN_ID_BSC        = 56
 CHAIN_ID_CELO       = 42220
 WEI_PER_ETH         = 10**18
 ETH_SENTINEL        = "0x0000000000000000000000000000000000000000"
-UNISWAP_V2_FACTORY  = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
-SEPOLIA_UNISWAP_V2_FACTORY = "0xF62c03E08ada871A0bEb309762E260a7a6a880E6"
-PANCAKE_V2_FACTORY  = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-UBESWAP_V2_FACTORY  = "0x62d5b84bE28a183aBB507E125B384122D2C25fAE"
+
+# V2 factory addresses are no longer hardcoded: langchain-uniswap-v2 reads router.factory()
+# off the router the wallet reports via getRouter(). See toolkits.py.
 ```
 
 `NATIVE_WRAPPED_TICKER` maps each chain ID to its wrapped-native ticker — `"weth"` on Ethereum/Sepolia/Anvil, `"wbnb"` on BSC, `"celo"` on Celo. `get_native_wrapped_ticker(chain_id)` and `get_native_asset_ticker(chain_id)` resolve these, raising `ValueError` for unconfigured chains.
@@ -130,10 +140,7 @@ Contract loading with per-`chat_id` caching, plus the ERC-7579 calldata/nonce he
 def load_session_handler(chat_id) -> Contract
 def load_spending_limit_module(chat_id) -> Contract   # the spending-cap HOOK, read off SessionHandler.SH_MODULE()
 def load_entry_point(chat_id) -> Contract
-def load_ierc20(chat_id, token, uniswap_pair=False) -> Contract  # uniswap_pair=True binds a raw address (LP tokens)
-def load_iuniswap_router(chat_id) -> Contract
-def load_iuniswap_factory(chat_id) -> Contract
-def load_iuniswap_pair(chat_id, token_a, token_b) -> Contract
+def load_ierc20(chat_id, token) -> Contract      # ticker -> address + decimals, for the oracle-pricing tools
 def load_factory(chat_id) -> Contract
 def load_reputation_registry(chat_id) -> Contract
 def load_calldata(instance, fn_name, args) -> bytes
@@ -149,6 +156,30 @@ def session_key_nonce_key(module_address) -> int                    # uint192(ui
 ```
 
 > **On the nonce key:** the module is a hook, never a validator, so no matter what address the nonce key encodes, the account falls through to its own `_rawSignatureValidation`. `session_key_nonce_key` is kept (any key value validates identically) for continuity with wallets that already submitted ops under it. The batch mode + `encode_batch_execution_calldata` are new — they're how the swap/liquidity tools grant and consume an approval in a single atomic transaction (the module reverts any approval left standing).
+
+---
+
+## `toolkits.py`
+
+Builds and caches the two external toolkits per `chat_id`, mirroring `contracts.py`'s caching. A toolkit instance is bound to one RPC, one router and one token map, so it cannot be shared across users.
+
+```python
+def get_erc20_tools(chat_id)   -> dict[str, BaseTool]   # langchain-erc20
+def get_uniswap_tools(chat_id) -> dict[str, BaseTool]   # langchain-uniswap-v2
+def invalidate_toolkits(chat_id) -> None                # called by contracts.invalidate_cache
+```
+
+Both are constructed with `tx_mode="calls"`, which emits `plan["calls"]` and makes zero nonce/gas/fee RPC calls — the right mode for a smart account, whose nonce is `EntryPoint.getNonce(sender, key)` rather than an EOA transaction count.
+
+Three configuration choices carry weight:
+
+| Setting | Why |
+|---|---|
+| `router_address` read from `SessionHandler.getRouter()` | Never the package's own chain registry: it has no Anvil entry and points BSC at PancakeSwap. This is also the router `SpendingLimitModule` auto-trusts at deploy. |
+| `factory_address=None` | The toolkit reads `router.factory()`, so pair lookups cannot drift from the router in use, and chains with no hardcoded factory work. |
+| `reset_residual_approvals=True` | Appends `approve(spender, 0)` wherever the router may pull less than approved. Already the default in calls mode; explicit because the module depends on it. |
+
+`_BLOCKED_TOOLS` withholds `approve`, `approve_token` and `revoke_approval` from the returned dicts. They build valid calldata but always revert here (see the approvals note under `tools.py`), so exposing them would only let the agent burn a UserOp on a guaranteed failure.
 
 ---
 
@@ -213,7 +244,11 @@ DEFAULT_WATCHED_TICKERS = {                 # tokens metered against the cap, pe
 
 ## `tools.py`
 
-Wraps blockchain operations as LangChain `@tool`-decorated functions; each docstring tells the LLM when/how to call it. `get_tools()` is the factory. All write tools route through `send_user_op_as_session()` / `send_batch_user_op_as_session()`.
+Wraps blockchain operations as LangChain `@tool`-decorated functions; each docstring tells the LLM when/how to call it. `get_tools()` is the factory.
+
+**The ERC20 and Uniswap tools are wrappers.** Their bodies do three things: resolve tickers and contact names to addresses, invoke the matching `langchain-erc20` / `langchain-uniswap-v2` tool to get an execution plan, and hand that plan to `_submit_plan`. `_submit_plan` sends a one-call plan as an ERC-7579 single execution and anything longer as an atomic batch, then raises `ToolException` on a non-success receipt.
+
+The wrappers exist — rather than exposing the package tools directly — because the package tools take no `chat_id` (a toolkit instance is bound to one user's chain), `langchain-uniswap-v2` accepts raw addresses only, and neither package submits anything. Their docstrings describe a *different* function signature (addresses, `from_address`, `nonce`, returns an unsubmitted plan), so they are not interchangeable with the docstrings here, which are the contract the LLM actually sees. See [langchain-packages-migration.md](langchain-packages-migration.md) §3.
 
 **One key, one budget.** `get_session_keys(chat_id, <anything>)` always returns the wallet's single session key — the argument is kept for tool-API compatibility but selects nothing. Spending is bounded by one wallet-wide USD cap per window, read on-chain.
 
@@ -233,6 +268,12 @@ Wraps blockchain operations as LangChain `@tool`-decorated functions; each docst
 
 `get_eth_balance`, `get_erc20_balance`, `get_contact_erc20_balance`, `get_erc20_allowance` (≈always 0 by design), `get_quote_in`, `get_quote_out`, `get_pool_quote`, `get_lp_amounts`, `get_liquidity_token_balance`, `is_derived_input_sufficient`, `is_exact_input_sufficient`, `is_liquidity_sufficient`, `is_liquidity_removal_sufficient`, plus contacts (`save_contact`/`get_contact`/`get_all_contacts`/`delete_contact`) and `get_supported_tokens`, `get_native_asset`.
 
+> **The quote tools return whole units only.** `get_quote_in` / `get_quote_out` return `{amount_in, amount_out, path}`, and `get_pool_quote` / `get_lp_amounts` return only their whole-unit fields. The old `*_base`, `decimals_a/b`, `liquidity` and `token_*_address` keys are gone: they existed so the swap tools could do their own base-unit and slippage arithmetic, which now happens inside the packages.
+>
+> **`"eth"` is accepted by the Uniswap-side tools only** — the quote, sufficiency, swap and liquidity tools all route their token arguments through `tools._resolve`, which maps `"eth"` to the chain's wrapped-native address and passes a raw `0x…` through unchanged (that is how LP tokens are named). The six ERC20 tools (`get_erc20_balance`, `get_contact_erc20_balance`, `get_erc20_allowance`, `wrap_eth`, `transfer_erc20`, `transferFrom_erc20`) hand the ticker straight to `langchain-erc20`, which resolves it against the DB token map — and that map has no `"eth"` entry. Use `get_eth_balance` / `send_eth` for the native asset, as before.
+>
+> `is_derived_input_sufficient` and `is_liquidity_sufficient` keep their `{is_sufficient, derived_input}` / `{is_sufficient, amount_b}` shapes; the wrappers rename the packages' `required_input` / `required_b` / `required_native` fields so the agent-facing contract is unchanged.
+
 ### Write tools
 
 | Tool | Description |
@@ -245,7 +286,7 @@ Wraps blockchain operations as LangChain `@tool`-decorated functions; each docst
 | `add_liquidity(...)` / `add_liquidity_eth(...)` | Add liquidity — approvals batched and residuals zeroed atomically |
 | `remove_liquidity(...)` / `remove_liquidity_eth(...)` | Remove liquidity — the pool's **LP token** is approved by address to the auto-trusted router and consumed in one batch |
 
-> **There is no `approve_erc20` tool.** Standing approvals revert on-chain (the module forbids leaving an allowance outstanding), so a standalone approval can never succeed. The swap and liquidity tools grant and consume the router approval atomically via `_submit_router_call(..., approvals=[(token_ref, amount)])`, where `token_ref` is a ticker or a raw address (for LP tokens). Exact-output flows also zero any residual in the same transaction (`reset_approvals=True`).
+> **There is no `approve_erc20` tool.** Standing approvals revert on-chain (the module forbids leaving an allowance outstanding), so a standalone approval can never succeed — which is also why `toolkits._BLOCKED_TOOLS` withholds the packages' own `approve` / `approve_token` / `revoke_approval`. The swap and liquidity tools instead receive the approval as `plan["calls"][0]`, already sized to what the router will actually pull, and `_submit_plan` sends the whole plan as one atomic ERC-7579 batch. Exact-output swaps and `addLiquidity` — where the router may pull less than approved — carry a trailing `approve(router, 0)` in the same plan. Each call's `role` (`approve`, `approve_reset`, `swap`, …) records which is which.
 
 ### ERC-8004 tools
 
@@ -255,7 +296,9 @@ Wraps blockchain operations as LangChain `@tool`-decorated functions; each docst
 
 ## Section 3 — LangChain Agent
 
-`app/smart_wallet_agent.py` wraps the tools in a LangChain agent powered by Claude (`claude-sonnet-4-6` by default, swappable).
+`app/smart_wallet_agent.py` wraps the tools in a LangChain agent powered by Claude (`claude-sonnet-4-6` by default).
+
+> **The Anthropic LLM is optional — any LangChain chat model works.** The provider is set in one place: the `llm = ChatAnthropic(...)` call in `smart_wallet_agent.py`. To use a different provider, replace that line with the matching LangChain chat model (e.g. `ChatOpenAI`, `ChatGoogleGenerativeAI`, `ChatOllama`) and its API-key env var, and drop or swap the `AnthropicPromptCachingMiddleware` in `init_agent()` (it is Anthropic-specific). Nothing else in the app is tied to Anthropic — the tools, prompt, and checkpointer are provider-agnostic. `ANTHROPIC_API_KEY` is only needed while the default provider is in use.
 
 ```python
 def init_agent():
@@ -281,6 +324,8 @@ The `chat_id` is embedded in each `HumanMessage` as a `[chat_id: <n>]` prefix (A
 ## Section 4 — Telegram Bot
 
 `app/telebot.py` exposes the agent as a Telegram bot ([python-telegram-bot v20](https://docs.python-telegram-bot.org/)).
+
+> **The entire Telegram layer is optional.** `telebot.py` is just one front end over the same agent; `smart_wallet_agent.py`'s `main()` provides an equivalent interactive CLI (`make agent`) that needs neither `TELEGRAM_TOKEN` nor a Telegram account. Only `make bot` requires the token (read at `telebot.py` module load) and the `python-telegram-bot` dependency. Everything below — handlers, budget alerts — applies to `make bot` only.
 
 | Handler | Trigger | Action |
 |---|---|---|
