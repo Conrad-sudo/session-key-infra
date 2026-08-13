@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IEntryPoint} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
+import {IEntryPoint, PackedUserOperation} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
 import {AccountERC7579Hooked} from "@openzeppelin/contracts/account/extensions/draft-AccountERC7579Hooked.sol";
 import {MODULE_TYPE_HOOK, MODULE_TYPE_EXECUTOR, Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
 import {Calldata} from "@openzeppelin/contracts/utils/Calldata.sol";
@@ -32,8 +32,13 @@ import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Cont
  *      {_rawSignatureValidation}, accepting a UserOp signed by the owner OR by any address on the
  *      `allowedSession` allowlist (managed with {addSession}/{removeSession}). No separate validator
  *      module is installed -- SpendingLimitModule is a hook (module type 4) ONLY, enforcing the USD
- *      spending cap on every execution. A session key is a BARE signer with no per-key target/
- *      selector scope or expiry; the spending cap is its only on-chain guardrail (see {addSession}).
+ *      spending cap on every execution. A session key is a BARE signer with no per-key selector
+ *      scope or expiry; the spending cap is its main on-chain guardrail (see {addSession}), narrowed
+ *      optionally by the owner-managed {sessionTargetAllowlist}.
+ * @dev The USD cap cannot see ETH spent as GAS (the prefund leaves before the hook's preCheck,
+ *      refunds land in the EntryPoint deposit after postCheck). {maxOpGasCost} bounds it instead,
+ *      and the EntryPoint is a restricted target so a key cannot withdraw the deposit.
+ *      THREAT_MODEL §3.12.
  * @dev Deliberate deviation from stock AccountERC7579Hooked, which makes `execute`, `installModule`,
  *      and `uninstallModule` `onlyEntryPointOrSelf` -- an EOA owner cannot call them directly. The
  *      three overrides below reopen a direct-owner path so the owner never has to submit a UserOp for
@@ -70,7 +75,16 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
 
     error SessionHandler_TransferFailed();
 
-    
+    /// @dev Thrown when a UserOp's prefund request exceeds {maxOpGasCost}.
+    error SessionHandler_PrefundTooHigh(uint256 requested, uint256 max);
+    /// @dev Thrown when a UserOp's own gas parameters price it above {maxOpGasCost}.
+    error SessionHandler_OpGasCostTooHigh(uint256 cost, uint256 max);
+    /// @dev Thrown on setMaxOpGasCost(0), which would reject every UserOp.
+    error SessionHandler_InvalidMaxOpGasCost();
+    /// @dev Thrown on enabling an empty allowlist, which would reject every session-key execution.
+    error SessionHandler_EmptyAllowlist();
+    /// @dev Thrown when address(0) is passed as a session-key allowlist target.
+    error SessionHandler_InvalidAllowedTarget();
 
     /*//////////////////////////////////////////////////////////////
                                     EVENTS
@@ -79,6 +93,15 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     event SessionAdded(address indexed sessionKey);
     /// @notice Emitted when the owner revokes a session key.
     event SessionRemoved(address indexed sessionKey);
+
+    /// @notice Emitted when the owner changes the per-UserOp gas-cost ceiling.
+    event MaxOpGasCostUpdated(uint256 oldMax, uint256 newMax);
+    /// @notice Emitted when the owner enables or disables the session-key target allowlist.
+    event SessionAllowlistToggled(bool enabled);
+    /// @notice Emitted when a target is added to the session-key allowlist.
+    event AllowedTargetAdded(address indexed target);
+    /// @notice Emitted when a target is removed from the session-key allowlist.
+    event AllowedTargetRemoved(address indexed target);
 
     /// @notice Emitted when a session-key execution pays the protocol fee. Owner-initiated executions
     ///         pay no fee and emit nothing.
@@ -89,6 +112,16 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /*//////////////////////////////////////////////////////////////
                              STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
+
+    /// @notice Default {maxOpGasCost} written by {initialize}, in wei.
+    /// @dev Deliberately generous — it clears a ~600k-gas swap at 2x a spiking base fee, so a fee
+    ///      spike never rejects a legitimate op. A bound on abuse, not a gas budget.
+    uint256 public constant DEFAULT_MAX_OP_GAS_COST = 0.1 ether;
+     /// @notice Maximum total ETH (wei) one UserOp may cost this account, however it is paid.
+    /// @dev Owner-settable because gas prices differ per chain and over time; a compile-time constant
+    ///      would be too tight somewhere (legitimate ops fail in a fee spike) and too loose elsewhere.
+    ///      Enforced in both {_validateUserOp} and {_payPrefund} — see each for why one is not enough.
+    uint256 public maxOpGasCost;
 
     /// @dev Overrides Account's default (OZ's canonical v0.8 singleton) with this deployment's own
     ///      EntryPoint, since this project actually uses a v0.7 EntryPoint (see HelperConfig.s.sol).
@@ -103,13 +136,24 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /// @dev Installed as MODULE_TYPE_HOOK in initialize(); enforces the account's USD spending cap.
     SpendingLimitModule public SH_MODULE;
 
+   
+
+    /// @notice Targets a session key may call, when {sessionAllowlistEnabled} is true. OFF by default.
+    /// @dev Confines a key to a fixed set of venues — mainly to keep it away from protocols where the
+    ///      account can take on a LIABILITY, which the balance-diff meter never charges to the cap
+    ///      (THREAT_MODEL §3.13). Address-granular, never selector-granular, so the account needs no
+    ///      ABI knowledge of what it calls.
+    mapping(address target => bool allowed) public sessionTargetAllowlist;
+    /// @notice Whether {sessionTargetAllowlist} is being enforced. See {toggleAllowList}.
+    bool public sessionAllowlistEnabled;
+    /// @dev Entry count for {sessionTargetAllowlist}; lets {toggleAllowList} refuse an empty one.
+    uint256 public allowedTargetCount;
+
     /// @notice Session keys authorized to sign UserOps for this account (the owner is always
     ///         authorized separately, in {_rawSignatureValidation}). A bare allowlist: an allowed
     ///         key may drive ANY execute() call, bounded only by the SpendingLimitModule spending
     ///         cap. Managed via {addSession}/{removeSession}.
     mapping(address sessionKey => bool allowed) public allowedSession;
-
-   
 
     /*//////////////////////////////////////////////////////////////
                                 Constructor
@@ -141,19 +185,17 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         REGISTRY = SHRegistry(registry);
         WALLET_ID = walletId;
         SH_MODULE = SpendingLimitModule(spendingLimitModule);
+        maxOpGasCost = DEFAULT_MAX_OP_GAS_COST;
 
-        // Install the spending-limit module as a HOOK only (it is not a validator). Its onInstall
+        // Install the spending-limit hook. Its onInstall
         // decodes exactly this (dailyLimitUsd, windowDuration, watchedTokens) tuple, so the config
         // must be non-empty and valid: windowDuration > 0, dailyLimitUsd >= 0, and every watched
         // token already priced by the oracle.
         _installModule(MODULE_TYPE_HOOK, spendingLimitModule, abi.encode(dailyLimitUsd, windowDuration, watchedTokens));
 
-        // Trust the registry's canonical DEX router by default so unpriced-token approvals to it
-        // (e.g. an LP token in removeLiquidity) are permitted -- the no-standing-approval rule still
-        // forces every such approval to zero within its own transaction. Skipped when no router is
-        // configured for this chain. The owner can add/remove trusted spenders later.
-        address router = REGISTRY.router();
-        if (router != address(0)) SH_MODULE.addTrustedSpender(router);
+        // No spender is trusted at deploy: which venue a wallet trades on is the owner's choice, not
+        // protocol config. Unpriced-token approvals (e.g. an LP token) are refused until the owner
+        // grants a spender with {addTrustedSpender}.
     }
 
     function entryPoint() public view override returns (IEntryPoint) {
@@ -195,12 +237,11 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         if (msg.sender != owner()) {
             _guardSessionExecution(execMode, executionCalldata);
 
-           _extractFee();
+            _extractFee();
         }
         _execute(execMode, executionCalldata);
     }
 
-       
     /// @notice Installs an ERC-7579 module.
     /// @dev Owner-only, via a direct call: an owner-signed UserOp arrives as msg.sender == EntryPoint
     ///      (not the owner), so onlyOwner rejects it. This is deliberate — a session key could
@@ -275,8 +316,8 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
 
     /// @notice Trusts a spender so it may be approved even for unpriced tokens (e.g. the DEX router,
     ///         for removeLiquidity's LP-token approval). Forwards to SH_MODULE.addTrustedSpender.
-    /// @dev Owner-only: a trusted spender can pull an unpriced token within a single transaction, so
-    ///      only grant it to contracts you trust (the canonical router is auto-trusted at deploy).
+    /// @dev Owner-only: a trusted spender can pull an unpriced token within a single transaction.
+    ///      The list starts EMPTY at deploy, so a router must be granted here explicitly.
     function addTrustedSpender(address spender) external onlyOwner {
         SH_MODULE.addTrustedSpender(spender);
     }
@@ -289,6 +330,76 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /// @notice Returns whether a spender is trusted for this account.
     function isTrustedSpender(address spender) external view returns (bool) {
         return SH_MODULE.isTrustedSpender(address(this), spender);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    SESSION TARGET ALLOWLIST (owner-only)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Turns the session-key target allowlist on or off.
+     * @dev Refuses to enable an empty allowlist (it would reject every session execution). Disabling
+     *      is always allowed, so the owner can never be locked out of restoring service.
+     * @param enabled True to enforce {sessionTargetAllowlist}.
+     */
+    function toggleAllowList(bool enabled) external onlyOwner {
+        if (enabled && allowedTargetCount == 0) revert SessionHandler_EmptyAllowlist();
+        sessionAllowlistEnabled = enabled;
+        emit SessionAllowlistToggled(enabled);
+    }
+
+    /**
+     * @notice Permits session keys to call `target` while the allowlist is enforced. No-op if
+     *         already allowed.
+     * @param target The contract a session key may call. Must not be address(0).
+     */
+    function addAllowedTarget(address target) external onlyOwner {
+        if (target == address(0)) revert SessionHandler_InvalidAllowedTarget();
+        if (sessionTargetAllowlist[target]) return;
+        sessionTargetAllowlist[target] = true;
+        allowedTargetCount++;
+        emit AllowedTargetAdded(target);
+    }
+
+    /**
+     * @notice Adds several targets in one transaction (a real allowlist needs a router plus tokens).
+     * @param targets The contracts session keys may call. Each must not be address(0).
+     */
+    function addAllowedTargets(address[] calldata targets) external onlyOwner {
+        for (uint256 i = 0; i < targets.length; i++) {
+            address target = targets[i];
+            if (target == address(0)) revert SessionHandler_InvalidAllowedTarget();
+            if (sessionTargetAllowlist[target]) continue;
+            sessionTargetAllowlist[target] = true;
+            allowedTargetCount++;
+            emit AllowedTargetAdded(target);
+        }
+    }
+
+    /**
+     * @notice Stops session keys from calling `target`. No-op if it was not allowed.
+     * @dev Emptying the list does NOT auto-disable enforcement: it fails closed rather than silently
+     *      reopening every target. Disable deliberately with {toggleAllowList}.
+     * @param target The contract to remove.
+     */
+    function removeAllowedTarget(address target) external onlyOwner {
+        if (!sessionTargetAllowlist[target]) return;
+        delete sessionTargetAllowlist[target];
+        allowedTargetCount--;
+        emit AllowedTargetRemoved(target);
+    }
+
+    /**
+     * @notice Sets the maximum total ETH one UserOp may cost this account. See {maxOpGasCost}.
+     * @dev Raise it on an expensive chain, lower it to tighten the bound on a compromised key.
+     *      Reverts on 0, which would reject every UserOp.
+     * @param newMax New ceiling in wei. Must be > 0.
+     */
+    function setMaxOpGasCost(uint256 newMax) external onlyOwner {
+        if (newMax == 0) revert SessionHandler_InvalidMaxOpGasCost();
+        maxOpGasCost = newMax;
+        emit MaxOpGasCostUpdated(maxOpGasCost, newMax);
+        
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -339,15 +450,60 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     }
 
     /**
+     * @notice ERC-4337 entry point for validating a UserOp against this account.
+     * @dev Overridden only to add {whenNotPaused}, so a paused wallet fails in validation and pays no
+     *      prefund, rather than paying one and then reverting in `execute`. `onlyEntryPoint` comes
+     *      from {Account-validateUserOp} via `super`.
+     */
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
+        public
+        override
+        whenNotPaused
+        returns (uint256)
+    {
+        return super.validateUserOp(userOp, userOpHash, missingAccountFunds);
+    }
+
+    /**
+     * @dev Rejects any UserOp whose own gas parameters price it above {maxOpGasCost}. Stops a
+     *      compromised key signing an op with absurd gas fields and bundling it itself: the inflated
+     *      `preVerificationGas` is charged as if consumed and paid to the bundler beneficiary.
+     * @dev Must price the op rather than `missingAccountFunds`: the EntryPoint debits the FULL
+     *      requiredPrefund from the account's deposit and only asks for the shortfall, so a wallet
+     *      carrying a deposit (every wallet accrues one from refunds) would see a top-up of 0 however
+     *      extravagant the op. Pricing the op is deposit-independent.
+     * @dev Packing per ERC-4337 v0.7+: `accountGasLimits` = verificationGasLimit | callGasLimit;
+     *      `gasFees` = maxPriorityFeePerGas | maxFeePerGas (high | LOW 128 each). Paymaster limits are
+     *      excluded — a sponsored op costs the account nothing.
+     */
+    function _validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, bytes calldata signature)
+        internal
+        override
+        returns (uint256)
+    {
+        uint256 verificationGasLimit = uint256(userOp.accountGasLimits) >> 128;
+        uint256 callGasLimit = uint128(uint256(userOp.accountGasLimits));
+        uint256 maxFeePerGas = uint128(uint256(userOp.gasFees));
+        // Any op extreme enough to overflow this is rejected by the checked-arithmetic revert, which
+        // is the same outcome as failing the comparison below.
+        uint256 cost = (verificationGasLimit + callGasLimit + userOp.preVerificationGas) * maxFeePerGas;
+        if (cost > maxOpGasCost) revert SessionHandler_OpGasCostTooHigh(cost, maxOpGasCost);
+
+        return super._validateUserOp(userOp, userOpHash, signature);
+    }
+
+    /**
      * @dev Blocks a non-owner (session-key or self) execution from reaching the account's own admin
      *      surface. Session keys may act on external protocols under the USD cap, but must never be
-     *      able to reconfigure or remove the cap itself:
-     *        - single / batch: reverts if any sub-call targets address(this) or address(SH_MODULE);
+     *      able to reconfigure or remove the cap itself, nor reach value the cap cannot see:
+     *        - single / batch: reverts if any sub-call targets a restricted address (see
+     *          {_requireUnrestrictedTarget}) or, when enabled, one outside {sessionTargetAllowlist};
      *        - delegatecall: reverts outright, since delegated code runs in this account's context
      *          and could reach the admin surface regardless of the encoded target.
      *      address(this) is restricted because execute(address(this), ...) self-calls installModule/
      *      uninstallModule/addSession/withdraw/the cap setters with msg.sender == the account, which
-     *      those functions accept; SH_MODULE is restricted because its cap setters key by msg.sender.
+     *      those functions accept; SH_MODULE is restricted because its cap setters key by msg.sender;
+     *      ENTRY_POINT is restricted because the account's 4337 deposit sits outside the meter.
      */
     function _guardSessionExecution(Mode mode, bytes calldata executionCalldata) internal view {
         (CallType callType,,,) = ERC7579Utils.decodeMode(mode);
@@ -365,39 +521,55 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         }
     }
 
-    /// @dev Reverts if `target` is the account itself or its spending-limit module. See {_guardSessionExecution}.
+    /**
+     * @dev Reverts if a session key may not call `target`: a permanent denylist (the account, the
+     *      module, the EntryPoint), plus {sessionTargetAllowlist} when enabled. The EntryPoint is on
+     *      the denylist because `withdrawTo` moves the account's 4337 deposit without changing
+     *      `account.balance`, so the hook would meter a $0 spend. See {_guardSessionExecution}.
+     */
     function _requireUnrestrictedTarget(address target) internal view {
-        if (target == address(this) || target == address(SH_MODULE)) {
+        if (target == address(this) || target == address(SH_MODULE) || target == ENTRY_POINT) {
+            revert SessionHandler_SessionRestrictedTarget(target);
+        }
+        if (sessionAllowlistEnabled && !sessionTargetAllowlist[target]) {
             revert SessionHandler_SessionRestrictedTarget(target);
         }
     }
 
-     function _extractFee() internal {
-            address treasury = REGISTRY.treasury();
-            uint256 fee = REGISTRY.protocolFee();
-            if (address(this).balance < fee) revert SessionHandler_NotEnoughBalance();
-            (bool success,) = treasury.call{value: fee}("");
-            if (!success) revert SessionHandler_TransferFailed();
-            emit ProtocolFeePaid(treasury, fee);
+    function _extractFee() internal {
+        address treasury = REGISTRY.treasury();
+        uint256 fee = REGISTRY.protocolFee();
+        if (address(this).balance < fee) revert SessionHandler_NotEnoughBalance();
+        (bool success,) = treasury.call{value: fee}("");
+        if (!success) revert SessionHandler_TransferFailed();
+        emit ProtocolFeePaid(treasury, fee);
+    }
 
+    /**
+     * @dev Bounds the prefund this account will pay for one UserOp. Not redundant with the ceiling in
+     *      {_validateUserOp}: the EntryPoint also forwards a UserOp's callData to the account in the
+     *      EXECUTION phase, where a key can call `validateUserOp` with a hand-crafted op (harmless gas
+     *      fields) and any `missingAccountFunds`. Only this check stops that transfer.
+     */
+    function _payPrefund(uint256 missingAccountFunds) internal override {
+        if (missingAccountFunds > maxOpGasCost) {
+            revert SessionHandler_PrefundTooHigh(missingAccountFunds, maxOpGasCost);
         }
+        super._payPrefund(missingAccountFunds);
+    }
 
-     function executeFromExecutor(
-        bytes32 mode,
-        bytes calldata executionCalldata
-    )
+    function executeFromExecutor(bytes32 mode, bytes calldata executionCalldata)
         public
         payable
         override
         onlyModule(MODULE_TYPE_EXECUTOR, Calldata.emptyBytes())
         whenNotPaused
         returns (bytes[] memory returnData)
-    {   
+    {
         _extractFee();
 
         return _execute(Mode.wrap(mode), executionCalldata);
     }
-
 
     /*//////////////////////////////////////////////////////////////
                            OWNER-ONLY FUNCTIONS
@@ -464,11 +636,6 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         clients[0] = address(this);
         (feedbackCount, summaryValue, summaryValueDecimals) =
             IReputationRegistry(REPUTATION_REGISTRY).getSummary(agentId, clients, "", "");
-    }
-
-    /// @notice Returns the Uniswap V2 Router address from the registry.
-    function getRouter() public view returns (address) {
-        return REGISTRY.router();
     }
 
     /*//////////////////////////////////////////////////////////////

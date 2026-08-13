@@ -29,7 +29,7 @@ contract SHFactory is Ownable, Pausable {
 
     /// @notice SpendingLimitModule module address installed on every SessionHandler deployed here.
     /// @dev Settable rather than immutable, consistent with how SHRegistry's own dependent addresses
-    ///      (priceOracle, router) are owner-updatable without redeployment.
+    ///      (priceOracle) are owner-updatable without redeployment.
     ///      deployWallet reverts while this is unset.
     address public spendingLimitModule;
 

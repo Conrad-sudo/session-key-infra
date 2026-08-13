@@ -8,9 +8,12 @@ from db import (
 )
 from abi import (
     ientry_point,
-    ierc20_extended,
     ireputation_registry,
 )
+# The ERC-20 ABI comes from langchain-erc20 rather than a local copy: the package already
+# exports the exact same nine-function ABI it builds all its own calldata against, so a local
+# duplicate could only ever drift away from what the toolkits actually encode.
+from langchain_erc20 import ERC20_ABI
 
 _session_handler_cache: dict[int, Contract] = {}
 _entry_point_cache: dict[int, Contract] = {}
@@ -162,7 +165,7 @@ def load_ierc20(chat_id: int, token: str) -> Contract:
     if key not in _erc20_cache:
         w3, chain_id, _ = load_network_config(chat_id)
         address = get_token_address(chain_id, token)
-        _erc20_cache[key] = w3.eth.contract(address=address, abi=ierc20_extended)
+        _erc20_cache[key] = w3.eth.contract(address=address, abi=ERC20_ABI)
     return _erc20_cache[key]
 
 

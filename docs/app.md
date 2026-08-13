@@ -62,8 +62,9 @@ CHAIN_ID_CELO       = 42220
 WEI_PER_ETH         = 10**18
 ETH_SENTINEL        = "0x0000000000000000000000000000000000000000"
 
-# V2 factory addresses are no longer hardcoded: langchain-uniswap-v2 reads router.factory()
-# off the router the wallet reports via getRouter(). See toolkits.py.
+# ROUTER maps each chain ID to its canonical V2 router; get_router(chain_id) resolves it.
+# V2 factory addresses stay unhardcoded: langchain-uniswap-v2 reads router.factory()
+# off that router. See toolkits.py.
 ```
 
 `NATIVE_WRAPPED_TICKER` maps each chain ID to its wrapped-native ticker — `"weth"` on Ethereum/Sepolia/Anvil, `"wbnb"` on BSC, `"celo"` on Celo. `get_native_wrapped_ticker(chain_id)` and `get_native_asset_ticker(chain_id)` resolve these, raising `ValueError` for unconfigured chains.
@@ -175,7 +176,7 @@ Three configuration choices carry weight:
 
 | Setting | Why |
 |---|---|
-| `router_address` read from `SessionHandler.getRouter()` | Never the package's own chain registry: it has no Anvil entry and points BSC at PancakeSwap. This is also the router `SpendingLimitModule` auto-trusts at deploy. |
+| `router_address` read from `constants.get_router(chain_id)` | Never the package's own chain registry: it has no Anvil entry and points BSC elsewhere. The router is no longer protocol config (`SHRegistry.router` is gone), so this constant is also what `deploy_wallet.trust_router` passes to `addTrustedSpender` — one source of truth, so the router the toolkit builds calldata for is always the one the wallet trusts. |
 | `factory_address=None` | The toolkit reads `router.factory()`, so pair lookups cannot drift from the router in use, and chains with no hardcoded factory work. |
 | `reset_residual_approvals=True` | Appends `approve(spender, 0)` wherever the router may pull less than approved. Already the default in calls mode; explicit because the module depends on it. |
 
@@ -282,9 +283,33 @@ The wrappers exist — rather than exposing the package tools directly — becau
 | `transfer_erc20(...)` | Sends tokens (metered if watched) |
 | `transferFrom_erc20(...)` | Transfers from an approved sender |
 | `wrap_eth(...)` | Wraps native → WETH/WBNB |
-| `swap_*` (all six variants) | Uniswap/PancakeSwap V2 swaps — **approve + swap sent as one atomic batch** |
+| `swap_*` (all six variants) | Uniswap/PancakeSwap V2 swaps — **approve + swap sent as one atomic batch**. Optional `recipient` delivers the output straight to a saved contact (see below) |
 | `add_liquidity(...)` / `add_liquidity_eth(...)` | Add liquidity — approvals batched and residuals zeroed atomically |
-| `remove_liquidity(...)` / `remove_liquidity_eth(...)` | Remove liquidity — the pool's **LP token** is approved by address to the auto-trusted router and consumed in one batch |
+| `remove_liquidity(...)` / `remove_liquidity_eth(...)` | Remove liquidity — the pool's **LP token** is approved by address to the trusted router (granted at deploy by `trust_router`) and consumed in one batch |
+
+> **Swap-and-send in one transaction.** All six `swap_*` tools take an optional `recipient`, passed
+> through to the router's own recipient argument, so "swap 1 ETH for USDC and send it to Sandy" is
+> one atomic UserOp rather than a swap followed by a `transfer_erc20`. Beyond saving a set of fees,
+> it removes a real correctness problem: a swap returns a *minimum* output, not an exact figure, so
+> a follow-up transfer has no reliable amount to send.
+>
+> `recipient` accepts **a saved contact name or `"me"` — never an address.** `tools._resolve_recipient`
+> raises `ToolException` on an unknown name before any UserOp is built, so an address injected into
+> the conversation can never become a swap destination (THREAT_MODEL §4.2). Omitting it, or passing
+> `"me"`, keeps the output in the wallet.
+
+> **All contact resolution goes through `tools._resolve_contact`.** `send_eth`, `transfer_erc20`,
+> `transferFrom_erc20` (both sender and recipient), `get_contact_erc20_balance`,
+> `get_erc20_allowance` and the swap `recipient` all use it. It exists because `db.get_contact`
+> returns `None` for an unknown name rather than raising — passing that `None` onward surfaced as
+> an opaque `"must be a string, got NoneType"` from inside the calldata builder, which gives the
+> agent nothing to act on. Now the error names the person, the role they were being used as
+> (`sender`, `spender`, `swap output recipient`, …) and tells the agent to call `save_contact`.
+> `"me"` resolves to the wallet in every one of them, not just `transferFrom_erc20`.
+>
+> No new on-chain check was needed: routing the output away means the account's portfolio drops with
+> nothing coming back, so the module charges the **full** outgoing value against the cap instead of a
+> swap's usual near-zero net.
 
 > **There is no `approve_erc20` tool.** Standing approvals revert on-chain (the module forbids leaving an allowance outstanding), so a standalone approval can never succeed — which is also why `toolkits._BLOCKED_TOOLS` withholds the packages' own `approve` / `approve_token` / `revoke_approval`. The swap and liquidity tools instead receive the approval as `plan["calls"][0]`, already sized to what the router will actually pull, and `_submit_plan` sends the whole plan as one atomic ERC-7579 batch. Exact-output swaps and `addLiquidity` — where the router may pull less than approved — carry a trailing `approve(router, 0)` in the same plan. Each call's `role` (`approve`, `approve_reset`, `swap`, …) records which is which.
 

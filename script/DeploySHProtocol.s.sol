@@ -136,7 +136,7 @@ contract DeploySHProtocol is Script {
         uint256 agentId = IIdentityRegistry(config.identityRegistry).register(AGENT_URI);
 
         // SHTreasury deploys the SHRegistry in its constructor.
-        treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId, config.router);
+        treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId);
 
         // deploy the ERC-7579 spending-limit module, wired to the price oracle it values tokens with
         SpendingLimitModule module = new SpendingLimitModule(treasury.REGISTRY());

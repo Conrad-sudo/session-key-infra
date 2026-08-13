@@ -18,6 +18,7 @@ import {SHRegistry} from "../../src/SHRegistry.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
 import {SHTreasury} from "../../src/SHTreasury.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
+import "../../script/Constants.s.sol";
 import {DeploySHProtocol} from "../../script/DeploySHProtocol.s.sol";
 import {SendPackedUserOp} from "../../script/SendPackedUserOp.s.sol";
 
@@ -96,8 +97,7 @@ abstract contract SHForkTestBase is Test {
         feeRegistry = SHRegistry(treasury.REGISTRY());
         module = SpendingLimitModule(factory.spendingLimitModule());
         owner = config.account;
-        router = IUniswapV2Router01(config.router);
-        require(address(router) != address(0), "no router configured for this network");
+        router = IUniswapV2Router01(_routerForChain());
 
         address[] memory watched = new address[](2);
         watched[0] = address(_tokenIn());
@@ -113,7 +113,23 @@ abstract contract SHForkTestBase is Test {
         vm.prank(owner);
         wallet.addSession(sessionKey);
 
+        // The router is no longer protocol configuration, so nothing is trusted at deploy — the
+        // owner grants it explicitly. Required for the unpriced LP-token approval in removeLiquidity;
+        // the no-standing-approval rule still forces every such approval to zero in its own tx.
+        vm.prank(owner);
+        wallet.addTrustedSpender(address(router));
+
         _freshenFeeds();
+    }
+
+    /// @dev The canonical V2 router for the forked chain, read straight from Constants.s.sol rather
+    ///      than from protocol config. Which venue a wallet trades on is a wallet-level choice now,
+    ///      so the test suite picks it the same way an owner would.
+    function _routerForChain() internal view returns (address) {
+        if (block.chainid == MAINNET_CHAIN_ID) return MNT_UNISWAP_V2_ROUTER_02;
+        if (block.chainid == SEPOLIA_CHAIN_ID) return SPO_UNISWAP_V2_ROUTER_02;
+        if (block.chainid == BSC_CHAIN_ID) return PANCAKE_V2_ROUTER_02;
+        revert("no router constant for this chain");
     }
 
     /// @dev Re-serves each feed's REAL current price with updatedAt = now, so a pinned fork block
@@ -173,9 +189,9 @@ abstract contract SHForkTestBase is Test {
         assertEq(cfg.dailyLimitUsd, DAILY_LIMIT);
         assertTrue(wallet.isWatched(address(_tokenIn())));
         assertTrue(wallet.isWatched(address(_tokenOut())));
-        // The chain's canonical router is auto-trusted at deploy (initialize), so unpriced-token
-        // approvals to it (LP tokens in removeLiquidity) are permitted.
-        assertTrue(wallet.isTrustedSpender(address(router)), "router not auto-trusted on deploy");
+        // Nothing is trusted at deploy; setUp grants the router explicitly as the owner would, so
+        // unpriced-token approvals to it (LP tokens in removeLiquidity) are permitted.
+        assertTrue(wallet.isTrustedSpender(address(router)), "router not trusted");
     }
 
     function test_agentIdentityViews_doNotRevert() public view {
@@ -393,13 +409,13 @@ abstract contract SHForkTestBase is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-        OPTION C: removeLiquidity via the auto-trusted router (LP approval)
+        OPTION C: removeLiquidity via the trusted router (LP approval)
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Full round-trip on a real DEX proving the trusted-spender exemption: add liquidity
     ///         (priced-token approvals), then REMOVE it — which requires approving the pool's
     ///         UNPRICED LP token to the router. That approval is legal only because initialize()
-    ///         auto-trusts the router; the no-standing-approval rule still forces it to zero within
+    ///         trusts the router (granted by the owner in setUp); the no-standing-approval rule still forces it to zero within
     ///         the same transaction. Driven owner-side so an illegal LP approval surfaces as a direct
     ///         revert (SpendingLimitModule_TokenNotPriced) rather than being absorbed by the EntryPoint.
     function test_removeLiquidity_roundTrip_viaTrustedRouter() public {

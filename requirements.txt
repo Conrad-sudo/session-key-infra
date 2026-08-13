@@ -8,7 +8,7 @@ eth-account==0.13.7
 # explicitly unstable public API, and langchain-uniswap-v2 already changed its write
 # return shape between 0.2.0 and 0.3.0.
 langchain-erc20==0.1.0
-langchain-uniswap-v2==0.3.0
+langchain-uniswap-v2==0.4.0
 
 # LangChain agent stack
 langchain==1.2.10

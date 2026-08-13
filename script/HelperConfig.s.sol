@@ -49,7 +49,6 @@ contract HelperConfig is Script {
      * @notice Encapsulates the chain-specific addresses required for deployment
      * @param entryPoint Address of the ERC-4337 EntryPoint contract on the current chain.
      *                   Set to address(0) on zkSync which uses native account abstraction.
-     *@param router Address of the Uniswap V2 Router02 contract on the current chain. Set to address(0) on chains where Uniswap is unavailable.
      * @param account    Deployer/owner address used when broadcasting transactions.
      *                   Becomes the Ownable owner of the deployed SessionHandler.
      * @param usdc       Circle USD (USDC) ERC-20 token address
@@ -126,7 +125,6 @@ contract HelperConfig is Script {
     struct NetworkConfig {
         address entryPoint;
         address account;
-        address router;
         address identityRegistry;
         address reputationRegistry;
         // Stablecoins
@@ -292,7 +290,6 @@ contract HelperConfig is Script {
             // Stablecoins
             usdc: SPO_USDC,
             weth: SPO_WETH,
-            router: SPO_UNISWAP_V2_ROUTER_02,
             dai: SPO_DAI,
             usdt: address(0),
             // ERC-20 tokens — address(0) where no official Sepolia deployment exists
@@ -384,7 +381,6 @@ contract HelperConfig is Script {
             identityRegistry: MNT_IDENTITY_REGISTRY,
             reputationRegistry: MNT_REPUTATION_REGISTRY,
             //swap for the deployer account on mainnet and ensure it's funded before broadcasting
-            router: MNT_UNISWAP_V2_ROUTER_02,
             // Stablecoins
             usdc: MNT_USDC,
             dai: MNT_DAI,
@@ -463,7 +459,7 @@ contract HelperConfig is Script {
 
     /**
      * @notice Returns the BSC (Binance Smart Chain) mainnet configuration
-     * @dev Uses PancakeSwap V2 as the router. Tokens without a BSC deployment
+     * @dev Tokens without a BSC deployment
      *      (APE, ARB, ENS, SAND, wTAO, IMX) are set to address(0).
      * @return config NetworkConfig for BSC mainnet
      */
@@ -473,7 +469,6 @@ contract HelperConfig is Script {
             account: _mainnetDeployer(),
             identityRegistry: MNT_IDENTITY_REGISTRY,
             reputationRegistry: MNT_REPUTATION_REGISTRY,
-            router: PANCAKE_V2_ROUTER_02,
             // Stablecoins
             usdc: BSC_USDC,
             dai: BSC_DAI,
@@ -633,7 +628,6 @@ contract HelperConfig is Script {
                 account: ANVIL_BURNER_WALLET,
                 identityRegistry: address(identityRegistry),
                 reputationRegistry: address(reputationRegistry),
-                router: address(0), // Uniswap not deployed on Anvil by default
                 // Stablecoins
                 usdc: address(usdc),
                 dai: address(dai),

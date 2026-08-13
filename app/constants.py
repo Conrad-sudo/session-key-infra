@@ -1,15 +1,47 @@
+
+
+
+
+from langchain_erc20.tokens import ZERO_ADDRESS
+from langchain_uniswap_v2 import KNOWN_NETWORKS
+
 CHAIN_ID_ANVIL = 31337
 CHAIN_ID_MAINNET = 1
 CHAIN_ID_SEPOLIA = 11155111
 CHAIN_ID_BSC = 56
 CHAIN_ID_CELO = 42220
 WEI_PER_ETH = 10**18
-ETH_SENTINEL = "0x0000000000000000000000000000000000000000"
+# The address(0) sentinel the wallet, SHOracle and both toolkits all use for "native asset".
+# Taken from langchain-erc20 so there is exactly one definition in play: it is what the ERC20
+# toolkit is configured with as native_sentinel, and a mismatch would silently route a native
+# operation down the ERC-20 path.
+ETH_SENTINEL = ZERO_ADDRESS
 
-# The V2 factory address is no longer hardcoded per chain: langchain-uniswap-v2 reads
-# router.factory() off the router the wallet itself reports via getRouter(), so pair lookups
-# can never drift from the router SpendingLimitModule trusts, and chains with no hardcoded
-# entry (Anvil) work without one.
+# The router is no longer protocol configuration: SHRegistry.router was removed because which
+# venue a wallet trades on is a wallet-level choice. It is resolved from langchain-uniswap-v2's
+# own network table rather than a local copy, so this app and the toolkit can never disagree
+# about which contract "the router" is.
+
+
+def get_router(chain_id: int) -> str:
+    """
+    Returns the canonical V2-compatible router address for chain_id.
+
+    The one address deploy_wallet.trust_router passes to addTrustedSpender AND toolkits.py binds
+    the Uniswap toolkit to. They must match: the module rejects an approval whose spender it does
+    not trust, so a mismatch turns every LP-token approval into a revert.
+
+    @param chain_id  The numeric chain ID.
+    @raises ValueError  If the package knows no V2 deployment for the chain (e.g. a bare Anvil
+                        node — fork modes inherit the forked chain's ID and so resolve normally).
+    """
+    network = KNOWN_NETWORKS.get(chain_id)
+    if network is None:
+        raise ValueError(f"No Uniswap-V2-compatible router configured for chain_id {chain_id}")
+    return network["router"]
+
+# The V2 factory address is not hardcoded per chain: langchain-uniswap-v2 reads router.factory()
+# off the router above, so pair lookups can never drift from the router in use.
 
 # The ticker of the chain's actual wrapped-native-asset contract — the one *ETH*-suffixed
 # router functions and deposit()/withdraw() calls operate against. WETH on Ethereum/Sepolia/

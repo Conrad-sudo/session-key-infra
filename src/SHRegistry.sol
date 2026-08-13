@@ -7,8 +7,8 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
  * @title SHRegistry
  * @author Conrad Japhet
  * @notice Central configuration registry for the SessionHandler Protocol. Stores the
- *         protocol fee, treasury address, price oracle, agent identity, and Uniswap router
- *         used across all deployed SessionHandler wallets.
+ *         protocol fee, treasury address, price oracle, and agent identity used across all
+ *         deployed SessionHandler wallets.
  * @dev SessionHandler wallets read all protocol parameters from this contract at
  *      execution time rather than storing them as immutables, so any update here
  *      propagates instantly to every deployed wallet without redeployment.
@@ -55,10 +55,6 @@ contract SHRegistry is Ownable {
     /// @notice Id of the SessionHandler ERC-4337 AI agent registered on ERC-8004 Identity Registery
     uint256 public agentId;
 
-    /// @notice Uniswap V2 Router address used for swap and liquidity calldata parsing.
-    /// @dev May be address(0) on chains where Uniswap V2 is not deployed.
-    address public router;
-
     /*//////////////////////////////////////////////////////////////
                                   EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -83,11 +79,6 @@ contract SHRegistry is Ownable {
     /// @param newId The new agentId.
     event AgentIdUpdated(uint256 indexed oldId, uint256 indexed newId);
 
-    /// @notice Emitted when the Uniswap V2 Router address is updated.
-    /// @param oldRouter The previous router address.
-    /// @param newRouter The new router address.
-    event UniswapRouterUpdated(address indexed oldRouter, address indexed newRouter);
-
     /*//////////////////////////////////////////////////////////////
                                CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -98,15 +89,10 @@ contract SHRegistry is Ownable {
      * @param initialTreasury      Address that will receive protocol fees. Must not be address(0).
      * @param initialOracle        Address of the deployed SHOracle. Must not be address(0).
      * @param initialAgentId       Id of the SessionHandler agent on the ERC-8004 Identity Registry. Must not be 0.
-     * @param initialRouter Uniswap V2 Router address. May be address(0) on chains without Uniswap V2.
      */
-    constructor(
-        uint256 initialFee,
-        address initialTreasury,
-        address initialOracle,
-        uint256 initialAgentId,
-        address initialRouter
-    ) Ownable(msg.sender) {
+    constructor(uint256 initialFee, address initialTreasury, address initialOracle, uint256 initialAgentId)
+        Ownable(msg.sender)
+    {
         if (initialFee > MAX_PROTOCOL_FEE || initialFee < MIN_PROTOCOL_FEE) revert SHRegistry_FeeNotInRange();
         if (initialTreasury == address(0)) revert SHRegistry_InvalidTreasury();
         if (initialOracle == address(0)) revert SHRegistry_InvalidPriceOracle();
@@ -115,7 +101,6 @@ contract SHRegistry is Ownable {
         treasury = initialTreasury;
         priceOracle = initialOracle;
         agentId = initialAgentId;
-        router = initialRouter;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -165,16 +150,5 @@ contract SHRegistry is Ownable {
         uint256 oldId = agentId;
         agentId = newId;
         emit AgentIdUpdated(oldId, newId);
-    }
-
-    /**
-     * @notice Updates the Uniswap V2 Router address. Only callable by the owner.
-     * @dev Pass address(0) to disable Uniswap calldata parsing on chains where it is unavailable.
-     * @param newRouter The new Uniswap V2 Router address.
-     */
-    function setUniswapRouter(address newRouter) external onlyOwner {
-        address old = router;
-        router = newRouter;
-        emit UniswapRouterUpdated(old, newRouter);
     }
 }

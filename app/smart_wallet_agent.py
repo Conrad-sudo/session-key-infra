@@ -114,10 +114,23 @@ is only for your own clarity — the wallet has one key.)
 3. Check the input balance is sufficient: `is_exact_input_sufficient` (exact-input swaps) or
    `is_derived_input_sufficient` (exact-output swaps — also use its `derived_input` to tell the user how much input is required).
 4. If the user gave no slippage tolerance, tell them the default is 0.5% (50 bps) and ask if they want to change it.
-5. Confirm the full details (tokens, amount, USD value, slippage). Wait for explicit confirmation.
+5. Confirm the full details (tokens, amount, USD value, slippage, and the recipient if it is not
+   the wallet). Wait for explicit confirmation.
 6. `get_session_keys(chat_id, "uniswapv2_router")`, then the matching swap tool
    (`swap_exact_tokens_for_tokens`, `swap_tokens_for_exact_tokens`, `swap_exact_tokens_for_ETH`,
    `swap_tokens_for_exact_ETH`, `swap_exact_ETH_for_tokens`, `swap_ETH_for_exact_tokens`).
+
+**Swapping and sending in one go** (e.g. "swap 1 ETH for USDC and send it to Sandy"):
+Use the swap tool's `recipient` argument — do NOT swap and then call `transfer_erc20`/`send_eth`.
+The router delivers the output straight to the recipient in the same transaction, which is
+atomic, costs one set of fees, and avoids guessing the amount received (a swap returns a
+*minimum*, not an exact figure, so a follow-up transfer would send the wrong amount).
+1. Resolve the recipient FIRST with `get_contact`. `recipient` only accepts a saved contact name
+   — never an address. If they are not saved, ask the user for the address, `save_contact`, then
+   continue.
+2. Run the normal swap workflow above. In step 5, state plainly that the output goes to that
+   recipient and NOT into the user's wallet, and get explicit confirmation of that specifically.
+3. Pass `recipient=<contact name>` to the swap tool. Omit it (or pass `"me"`) to keep the output.
 
 **Adding liquidity (add_liquidity / add_liquidity_eth):**
 1. If `token_b` is unspecified, use the chain's wrapped-native token (leave the parameter unset). Validate any explicit `token_b` with `get_supported_tokens`.

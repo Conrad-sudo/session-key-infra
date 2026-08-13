@@ -1,12 +1,13 @@
 # Threat Model — SessionHandler
 
-> This model reflects the current design: a hook-only USD **spending cap** (net-value metering + no-standing-approvals), an account that **validates its own UserOps** (owner + session-key allowlist), and an **admin-surface guard** on session-key executions. Session keys are bare signers — they carry no per-key target/selector allowlist or expiry.
+> This model reflects the current design: a hook-only USD **spending cap** (net-value metering + no-standing-approvals), an account that **validates its own UserOps** (owner + session-key allowlist), an **admin-surface guard** on session-key executions, and **per-UserOp gas ceilings** covering the one value path the cap structurally cannot see. Session keys carry no per-key selector scope or expiry; the account offers an optional owner-managed **target allowlist** (`sessionTargetAllowlist`, off by default) that applies to every key at once.
 
 ## 1. Assets
 
 | Asset | Description |
 |---|---|
 | SessionHandler ETH & ERC20 balance | Funds held by the smart account |
+| SessionHandler EntryPoint deposit | A **second** ETH balance held inside the EntryPoint on the account's behalf. Funded by prefund payments and by every UserOp's unused-gas refund (refunds settle here, never back to the account balance). Invisible to `SpendingLimitModule`, which meters `account.balance` only — see §3.12 |
 | Session private key (raw) | A 32-byte random key that authorizes ERC-4337 `UserOperation`s — one per wallet, never stored in plaintext |
 | Vault Transit key | AES-256-GCM96 key inside HashiCorp Vault used to encrypt/decrypt the session key; never exported |
 | AppRole credentials (`VAULT_ROLE_ID` / `VAULT_SECRET_ID`) | Authenticate the Python agent to Vault |
@@ -25,7 +26,7 @@
 ```
 
 - The **owner key** is fully trusted — it can call `execute()` directly for arbitrary calls, and install/uninstall modules.
-- **The session key** is partially trusted — it can drive any *external* call, bounded by (a) the wallet-wide USD spending cap per window, and (b) the admin-surface guard that keeps it off the account's own functions and the module. It is **not** scoped to specific targets/selectors and does not expire.
+- **The session key** is partially trusted — it can drive any *external* call, bounded by (a) the wallet-wide USD spending cap per window, (b) the admin-surface guard that keeps it off the account's own functions, the module, and the EntryPoint, and (c) the per-UserOp gas ceilings (§3.12). It is **not** scoped to specific selectors and does not expire; an owner may additionally confine it to a set of target addresses (§3.13).
 - The **protocol operator key** (owner of `SHTreasury`, which owns `SHRegistry`) is trusted for **spending-cap integrity across every wallet**, not just for fees. `SpendingLimitModule` resolves its price oracle from `SHRegistry.priceOracle()` on each valuation, so repointing that one address changes how every already-deployed wallet values everything. This is a distinct boundary from the per-wallet owner key: it is protocol-wide and needs no wallet owner's consent. See §3.8.
 - The **AI agent** is an untrusted intermediary — it interprets natural language and decides which tools to call.
 - The **Telegram channel** is an untrusted input surface.
@@ -36,8 +37,8 @@
 
 ### 3.1 Session Key Compromise
 **Threat:** A leaked session key lets an attacker sign UserOps until the owner revokes it (`removeSession`).
-**Mitigations in place:** (a) The wallet-wide USD **spending cap** bounds net value that can leave the watched-token portfolio per rolling window. (b) The **admin-surface guard** (`_guardSessionExecution`) blocks the key from calling `address(this)` or the module, and rejects `delegatecall`, so it cannot raise its own cap, uninstall the hook, mint more keys, or run arbitrary code as the account. (c) Owner revocation via `removeSession`.
-**Residual risk:** Within a window the key can spend up to the full remaining cap in watched tokens and native ETH/BNB (both are metered), and can freely move **unwatched** tokens (which sit outside the meter by design — the protection model is "watch the tokens you care about"). There is no per-block or per-swap rate limit.
+**Mitigations in place:** (a) The wallet-wide USD **spending cap** bounds net value that can leave the watched-token portfolio per rolling window. (b) The **admin-surface guard** (`_guardSessionExecution`) blocks the key from calling `address(this)`, the module, or the **EntryPoint**, and rejects `delegatecall`, so it cannot raise its own cap, uninstall the hook, mint more keys, withdraw the account's 4337 deposit, or run arbitrary code as the account. (c) **Per-UserOp gas ceilings** (§3.12) bound the ETH a key can burn or extract as gas, which the cap cannot see. (d) The optional **target allowlist** (§3.13) narrows a key to a fixed set of venues. (e) Owner revocation via `removeSession`.
+**Residual risk:** Within a window the key can spend up to the full remaining cap in watched tokens and native ETH/BNB (both are metered), and can freely move **unwatched** tokens (which sit outside the meter by design — the protection model is "watch the tokens you care about"). There is no per-block or per-swap rate limit. Non-ERC20 assets (ERC-721/1155) are outside the meter entirely.
 
 ---
 
@@ -61,7 +62,7 @@ Both `approve` and the legacy non-standard `increaseAllowance` are recognized as
 
 ### 3.4 Trusted-Spender Exemption (unpriced approvals)
 **Threat:** An `approve` on a token the oracle can't price (e.g. a Uniswap V2 **LP token**, which has no Chainlink feed) is normally rejected (`TokenNotPriced`). Relaxing that could let a compromised key approve an unpriced token to an attacker and pull it, unmetered.
-**Mitigation in place:** The exemption is narrow — an unpriced approval is allowed **only** when the spender is on the account's owner-managed `trustedSpenders` list (the canonical DEX router is auto-trusted at deploy). The no-standing-approval and no-unlimited rules still apply in full, so even a trusted-spender approval must be consumed to zero in the same transaction. A trusted spender (the router) can only consume an LP-token approval via `removeLiquidity`, which *returns* value to the wallet.
+**Mitigation in place:** The exemption is narrow — an unpriced approval is allowed **only** when the spender is on the account's owner-managed `trustedSpenders` list, which starts **empty**: nothing is trusted at deploy, so the owner grants a router explicitly (`addTrustedSpender`) before any `removeLiquidity` flow works. The no-standing-approval and no-unlimited rules still apply in full, so even a trusted-spender approval must be consumed to zero in the same transaction. A trusted spender (the router) can only consume an LP-token approval via `removeLiquidity`, which *returns* value to the wallet.
 **Residual risk:** The exemption's safety rests on the trusted spender behaving like a router. An owner who trusts a malicious contract could let it pull unpriced tokens (bounded to same-transaction consumption). Note also that unpriced tokens are *already* freely transferable by a session key (they can't be watched), so the exemption grants no new capability over a plain transfer — it only unblocks the legitimate `removeLiquidity` flow.
 
 ---
@@ -124,6 +125,41 @@ A negative test suite (`SessionGuardTest`) locks all three in: session-key unins
 
 ---
 
+### 3.12 Gas and the EntryPoint Deposit — Value the Cap Cannot See ⚠️
+**Threat:** The spending cap is structurally blind to ETH that moves as *gas*. The ERC-4337 prefund leaves the account during **validation**, before the hook's `preCheck` runs, and unused gas is refunded into the account's **EntryPoint deposit** after `postCheck` — so neither ever appears in the `preCheck`→`postCheck` native delta. Three distinct paths exploit that, all reachable by a session key alone:
+
+1. **Inflated gas parameters.** `requiredPrefund = (verificationGasLimit + callGasLimit + preVerificationGas) × maxFeePerGas`, all signed by whoever signs the op. `preVerificationGas` is charged as if consumed and paid to the `beneficiary` — the address that calls `handleOps`, which the attacker can be. A key that signs an op with absurd gas fields and bundles it itself extracts the account's ETH without moving a single token.
+2. **`validateUserOp` reached during execution.** `Account.validateUserOp` is `onlyEntryPoint`, but the EntryPoint also forwards a UserOp's `callData` to the account in the **execution** phase with `msg.sender == EntryPoint`. A key can therefore call it as an ordinary operation with an arbitrary `missingAccountFunds`, and `_payPrefund` would hand that amount to the EntryPoint. An invalid signature does not stop it: `_validateUserOp` returns `SIG_VALIDATION_FAILED` rather than reverting, and the prefund is paid regardless.
+3. **Deposit withdrawal.** `EntryPoint.withdrawTo(dest, amount)` authorizes on `msg.sender`, so the account withdrawing "its own" deposit means *anything that can make the account call the EntryPoint*. The ETH goes straight from the EntryPoint to `dest`, leaving `account.balance` unchanged — the hook meters a $0 spend.
+
+**Mitigations in place:**
+- `maxOpGasCost` (default `0.1 ether`, owner-settable via `setMaxOpGasCost`) is enforced in **two** places. `_validateUserOp` prices each op's own declared gas parameters — this is the binding check, because the EntryPoint debits the full `requiredPrefund` from the **deposit** regardless of how much top-up it requested, so a wallet carrying a deposit would see `missingAccountFunds == 0` no matter how extravagant the op. `_payPrefund` separately bounds the transfer itself, which is what covers path 2 (there the op struct is attacker-supplied and can declare harmless gas fields while demanding any transfer).
+- `ENTRY_POINT` is a permanently restricted target in `_requireUnrestrictedTarget`, closing path 3. The **owner** retains access by direct call (`_guardSessionExecution` runs only for non-owner callers), so a stranded deposit is always recoverable.
+- `validateUserOp` is `whenNotPaused`: a paused wallet fails in validation and pays nothing, rather than paying a full prefund and then reverting in `execute`.
+
+**Residual risk:** A compromised key can still burn up to `maxOpGasCost` per UserOp, each op costing it real gas and being individually visible on-chain — bounded and slow, not zero. The ceiling is a blunt instrument: too low and legitimate ops fail during a fee spike (`AA23 reverted`, an opaque bundler error), too high and the bound is weak. It is one value for all chains until an owner tunes it, and the default is sized for the worst case the bot builds (~600k gas at 2× a spiking base fee), which is deliberately generous on cheap chains. Gas is still not charged against the USD cap at all.
+
+---
+
+### 3.13 Liabilities Are Invisible to the Meter
+**Threat:** `SpendingLimitModule` meters **balance deltas**. A transaction that has the account incur a *liability* and moves the proceeds out in the same transaction nets to zero and is charged nothing:
+
+```
+batch: [ borrow(100k USDC)          → watched inflow,  netOutflow -= $100k
+       , USDC.transfer(attacker)    → watched outflow, netOutflow += $100k ]
+→ netOutflowUsd == 0, nothing metered
+```
+
+The wallet is left holding debt against collateral the module cannot see, and the value is gone. The same shape applies to any leveraged position, escrow, or signed-order fill.
+
+**Why no hook can fix this:** the debt lives in the lending protocol's storage, in a form a balance-diff hook cannot read without protocol-specific knowledge. Teaching the module to decode individual venues is exactly the coupling net-value metering exists to avoid — it is what makes one deployed module work on any account, at any venue, with no per-protocol decoder. This is the boundary of the technique, not a defect in its implementation.
+
+**Mitigation in place:** `sessionTargetAllowlist` — an optional, owner-managed, **address-granular** allowlist on session-key executions (`toggleAllowList`, `addAllowedTarget`, `addAllowedTargets`, `removeAllowedTarget`). It lives in the account, not the module, for two reasons: only the account can distinguish an owner from a session key (`msg.sender` is the account either way by the time the hook runs), and keeping it out of the module preserves the module's protocol-agnosticism. Address granularity means the account needs no ABI knowledge of anything it calls. Off by default; enabling an empty allowlist is refused, and removing the last entry fails closed rather than silently reopening every target.
+
+**Residual risk:** The allowlist is opt-in, so a wallet that never enables it carries the full exposure. It bounds *where* a key can go, not *what* it can do there: an allowlisted venue that itself permits borrowing is unprotected. Selector-level scoping (Smart Sessions / ERC-7715) remains future work and would reintroduce the per-protocol coupling this design removed.
+
+---
+
 ## 4. Off-Chain Threats
 
 ### 4.1 AppRole Credential Compromise ⚠️ HIGH
@@ -138,6 +174,12 @@ A negative test suite (`SessionGuardTest`) locks all three in: session-key unins
 **Mitigations in place:** `SYSTEM_PROMPT` requires `preflight_check` and an explicit user confirmation before any on-chain write. On-chain, the spending cap and admin guard are the last line of defence regardless of what the LLM does.
 **Residual risk:** The confirmation step is enforced by the LLM, not by code — a sufficiently crafted prompt could bypass it, at which point on-chain constraints (the cap, the guard, no-standing-approvals) are what bound the damage.
 
+**Value-destination surface (added with the swap `recipient` argument).** The six swap tools accept an optional `recipient`, letting the router deliver swap output to an address other than the wallet in the same transaction. That makes "send value elsewhere" a single agent-reachable action rather than a two-step swap-then-transfer.
+
+The guardrail is that **`recipient` resolves contact names only, never addresses** (`tools._resolve_recipient`): an unrecognised name raises `ToolException` before any UserOp is built, so an address injected into the conversation cannot become a swap destination. The worst an injection achieves is redirecting output to a contact **the user themselves saved** — which is the same set of destinations `transfer_erc20` and `send_eth` already reach. `save_contact` is therefore a privileged action, and should be treated as one if a contact allowlist is ever added.
+
+On-chain this is metered correctly and needs no new check: routing output away means the account's portfolio drops with nothing coming back, so `SpendingLimitModule` charges the **full** outgoing value against the cap rather than a swap's usual near-zero net. Verified on a Sepolia fork — a 0.01 ETH swap routed to a contact was charged $19.13, versus ≈$0 when the output stays in the wallet. Note this is deliberately *not* a re-introduction of the old `to == account` restriction (removed in the 2026-07-23 hook redesign); net-value metering subsumes it.
+
 ---
 
 ### 4.3 `wallet.db` Compromise
@@ -149,7 +191,7 @@ A negative test suite (`SessionGuardTest`) locks all three in: session-key unins
 
 ### 4.4 Bundler Key Compromise
 **Threat:** The bundler key (local/fork flow) is in `.env`. A compromised bundler key can submit UserOps — but each still needs a valid owner/session signature, so funds cannot move without also compromising AppRole + `wallet.db`.
-**Residual risk:** Gas draining via failing UserOps that consume the account's ETH prefund. (On live networks the Alchemy bundler pays gas; no local bundler key is used.)
+**Residual risk:** Gas draining via UserOps that consume the account's ETH prefund — the *account* always pays for its own gas (a bundler only fronts it and is reimbursed by the EntryPoint), so a bundler that can get signed ops included can burn account ETH. Now bounded per op by `maxOpGasCost`; see §3.12 for the full gas-as-value analysis.
 
 ---
 

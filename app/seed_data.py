@@ -13,8 +13,24 @@ init_db().
 import os
 
 from dotenv import load_dotenv
+from langchain_erc20 import KNOWN_NETWORKS as ERC20_NETWORKS
 
 load_dotenv()
+
+
+def _wrapped_native(chain_id: int) -> str:
+    """The chain's wrapped-native address, from langchain-erc20's verified table.
+
+    Not hardcoded alongside the tokens below: this one address is what toolkits.py passes as
+    `native_wrapped_address`, so wrap/unwrap and every *ETH-suffixed router call depend on it
+    being exactly right. The package verifies each entry on-chain (bytecode present, symbol()
+    matches, decimals() == 18, deposit()/withdraw() in the deployed code) and is the same table
+    the toolkits resolve against, so sourcing it here removes the only copy that could drift.
+
+    Every OTHER token below stays local on purpose — the package ships no token registry, since
+    a wrong address in one is a silent, unrecoverable loss of funds.
+    """
+    return ERC20_NETWORKS[chain_id]["native_wrapped"]
 
 
 # Function-selector tables were removed with the per-target session-key design: the old
@@ -95,7 +111,7 @@ RPCS = {
 # ── Tokens (ticker → address) ─────────────────────────────────────────────────
 
 MAINNET_TOKENS = {
-    "weth": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "weth": _wrapped_native(1),
     "usdt": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
     "usdc": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     "dai": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
@@ -126,7 +142,7 @@ MAINNET_TOKENS = {
 }
 
 SEPOLIA_TOKENS = {
-    "weth": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+    "weth": _wrapped_native(11155111),
     "link": "0x779877A7B0D9E8603169DdbD7836e478b4624789",
     # USDC/DAI have live Sepolia Chainlink feeds and are the default watched tokens for Sepolia
     # deploys (deploy_wallet.DEFAULT_WATCHED_TICKERS) — addresses match Constants.s.sol SPO_USDC/SPO_DAI.
@@ -136,7 +152,7 @@ SEPOLIA_TOKENS = {
 
 BSC_TOKENS = {
     "weth": "0x2170Ed0880ac9A755fd29B2688956BD959F933F8",
-    "wbnb": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    "wbnb": _wrapped_native(56),
     "usdt": "0x55d398326f99059fF775485246999027B3197955",
     "usdc": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     "dai": "0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3",

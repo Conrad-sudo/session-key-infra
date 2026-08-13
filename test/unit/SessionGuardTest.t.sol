@@ -6,6 +6,9 @@ import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/Pac
 import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {MODULE_TYPE_HOOK, Execution} from "@openzeppelin/contracts/interfaces/draft-IERC7579.sol";
 import {ERC7579Utils} from "@openzeppelin/contracts/account/utils/draft-ERC7579Utils.sol";
+import {PackedUserOperation as OZPackedUserOperation} from "@openzeppelin/contracts/interfaces/draft-IERC4337.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {SessionHandler} from "../../src/SessionHandler.sol";
 import {SpendingLimitModule} from "../../src/SpendingLimitModule.sol";
 import {SHFactory} from "../../src/SHFactory.sol";
@@ -338,5 +341,293 @@ contract SessionGuardTest is Test {
         vm.prank(bundler, bundler);
         vm.expectRevert(abi.encodeWithSelector(IEntryPoint.FailedOp.selector, 0, "AA24 signature error"));
         IEntryPoint(config.entryPoint).handleOps(ops, payable(bundler));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+          GAS AS AN UNMETERED VALUE PATH (THREAT_MODEL §3.12)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Re-signs a UserOp after its gas fields have been mutated, so the EntryPoint hash still
+    ///      matches. Mirrors SendPackedUserOp's EIP-191-over-userOpHash scheme.
+    function _resign(PackedUserOperation memory userOp, uint256 pk) internal view returns (PackedUserOperation memory) {
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(IEntryPoint(config.entryPoint).getUserOpHash(userOp));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        userOp.signature = abi.encodePacked(r, s, v);
+        return userOp;
+    }
+
+    /// @dev A legitimate session op, with its gas fees rewritten to `feePerGas` on both halves of
+    ///      `gasFees` (so the packing order cannot affect the result) and re-signed.
+    function _inflatedGasOp(uint128 feePerGas) internal view returns (PackedUserOperation memory userOp) {
+        (userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(wallet),
+            config,
+            address(usdc),
+            0,
+            abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)),
+            sessionKey,
+            sessionKeyPk
+        );
+        userOp.gasFees = bytes32(uint256(feePerGas) << 128 | uint256(feePerGas));
+        return _resign(userOp, sessionKeyPk);
+    }
+
+    /// @dev The account-abstraction and OpenZeppelin PackedUserOperation structs are field-identical
+    ///      but distinct Solidity types; SessionHandler's validateUserOp takes OZ's.
+    function _toOz(PackedUserOperation memory op) internal pure returns (OZPackedUserOperation memory) {
+        return OZPackedUserOperation({
+            sender: op.sender,
+            nonce: op.nonce,
+            initCode: op.initCode,
+            callData: op.callData,
+            accountGasLimits: op.accountGasLimits,
+            preVerificationGas: op.preVerificationGas,
+            gasFees: op.gasFees,
+            paymasterAndData: op.paymasterAndData,
+            signature: op.signature
+        });
+    }
+
+    /// @dev The gas cost SessionHandler prices a UserOp at: (verification + call + preVerification)
+    ///      gas limits multiplied by maxFeePerGas.
+    function _expectedCost(PackedUserOperation memory userOp) internal pure returns (uint256) {
+        uint256 verificationGasLimit = uint256(userOp.accountGasLimits) >> 128;
+        uint256 callGasLimit = uint128(uint256(userOp.accountGasLimits));
+        uint256 maxFeePerGas = uint128(uint256(userOp.gasFees));
+        return (verificationGasLimit + callGasLimit + userOp.preVerificationGas) * maxFeePerGas;
+    }
+
+    /// @notice A UserOp whose own gas parameters price it above the ceiling fails validation, so a
+    ///         session key cannot have the account pay unbounded "gas" to a bundler it controls.
+    function test_validateUserOp_rejectsOpPricedAboveCeiling() public {
+        PackedUserOperation memory userOp = _inflatedGasOp(1e12); // 1000 gwei
+        uint256 cost = _expectedCost(userOp);
+        uint256 ceiling = wallet.maxOpGasCost(); // read BEFORE the prank, which only lasts one call
+        assertGt(cost, ceiling, "fixture should exceed the ceiling");
+
+        vm.prank(config.entryPoint);
+        vm.expectRevert(abi.encodeWithSelector(SessionHandler.SessionHandler_OpGasCostTooHigh.selector, cost, ceiling));
+        wallet.validateUserOp(_toOz(userOp), bytes32(0), 0);
+    }
+
+    /// @notice THE DEPOSIT BYPASS: bounding only the prefund top-up is not enough. The EntryPoint
+    ///         debits the FULL requiredPrefund from the account's deposit and asks for a top-up of
+    ///         `requiredPrefund - deposit`, so a wallet already carrying a deposit is billed with
+    ///         `missingAccountFunds == 0`. The ceiling must therefore price the op itself.
+    function test_validateUserOp_ceilingBindsEvenWhenDepositCoversTheOp() public {
+        // Wallet holds a deposit big enough that the EntryPoint would ask for no top-up at all.
+        IEntryPoint(config.entryPoint).depositTo{value: 60 ether}(address(wallet));
+        assertGt(IEntryPoint(config.entryPoint).balanceOf(address(wallet)), 0);
+
+        PackedUserOperation memory userOp = _inflatedGasOp(1e12);
+        uint256 cost = _expectedCost(userOp);
+        uint256 ceiling = wallet.maxOpGasCost();
+
+        // missingAccountFunds == 0 — the path a top-up-only bound would wave straight through.
+        vm.prank(config.entryPoint);
+        vm.expectRevert(abi.encodeWithSelector(SessionHandler.SessionHandler_OpGasCostTooHigh.selector, cost, ceiling));
+        wallet.validateUserOp(_toOz(userOp), bytes32(0), 0);
+    }
+
+    /// @notice `validateUserOp` is also reachable in the EXECUTION phase (the EntryPoint forwards a
+    ///         UserOp's callData to the account with msg.sender == EntryPoint), where BOTH the op
+    ///         struct and `missingAccountFunds` are caller-chosen. The prefund bound is what stops
+    ///         the account emptying its balance into its EntryPoint deposit. Note the signature is
+    ///         never even checked here: _validateUserOp RETURNS failure rather than reverting.
+    function test_payPrefund_rejectsOversizedPrefundRequest() public {
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(wallet),
+            config,
+            address(usdc),
+            0,
+            abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)),
+            sessionKey,
+            sessionKeyPk
+        );
+
+        uint256 balanceBefore = address(wallet).balance;
+        uint256 ceiling = wallet.maxOpGasCost();
+        vm.prank(config.entryPoint);
+        vm.expectRevert(abi.encodeWithSelector(SessionHandler.SessionHandler_PrefundTooHigh.selector, 5 ether, ceiling));
+        wallet.validateUserOp(_toOz(userOp), bytes32(0), 5 ether);
+        assertEq(address(wallet).balance, balanceBefore, "no ETH should have moved");
+    }
+
+    /// @notice A prefund within the ceiling is still paid, so ordinary bundling is unaffected.
+    function test_payPrefund_allowsPrefundWithinCeiling() public {
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(wallet),
+            config,
+            address(usdc),
+            0,
+            abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)),
+            sessionKey,
+            sessionKeyPk
+        );
+
+        uint256 balanceBefore = address(wallet).balance;
+        vm.prank(config.entryPoint);
+        wallet.validateUserOp(_toOz(userOp), bytes32(0), 0.01 ether);
+        assertEq(address(wallet).balance, balanceBefore - 0.01 ether, "prefund not paid");
+    }
+
+    /// @notice A paused wallet fails in VALIDATION, so it never reaches _payPrefund and pays nothing.
+    function test_validateUserOp_pausedWalletPaysNothing() public {
+        vm.prank(owner);
+        wallet.pause();
+
+        (PackedUserOperation memory userOp,,) = sendPackedUserOp.generateSignedUserOp(
+            address(wallet),
+            config,
+            address(usdc),
+            0,
+            abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)),
+            sessionKey,
+            sessionKeyPk
+        );
+
+        uint256 balanceBefore = address(wallet).balance;
+        vm.prank(config.entryPoint);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        wallet.validateUserOp(_toOz(userOp), bytes32(0), 0.01 ether);
+        assertEq(address(wallet).balance, balanceBefore, "paused wallet must not pay prefund");
+    }
+
+    function test_setMaxOpGasCost_ownerOnlyAndNonZero() public {
+        vm.prank(attacker);
+        vm.expectRevert();
+        wallet.setMaxOpGasCost(1 ether);
+
+        vm.prank(owner);
+        vm.expectRevert(SessionHandler.SessionHandler_InvalidMaxOpGasCost.selector);
+        wallet.setMaxOpGasCost(0);
+
+        vm.prank(owner);
+        wallet.setMaxOpGasCost(1 ether);
+        assertEq(wallet.maxOpGasCost(), 1 ether);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                  ENTRYPOINT AS A RESTRICTED TARGET
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice A session key cannot withdraw the account's EntryPoint deposit. That ETH would leave
+    ///         the EntryPoint for the attacker directly, so `account.balance` never changes and the
+    ///         spending-cap hook would meter a $0 spend.
+    function test_guard_revertsOnEntryPointTarget() public {
+        bytes memory executionCalldata = _encodeSingle(
+            config.entryPoint, 0, abi.encodeWithSignature("withdrawTo(address,uint256)", attacker, 1 ether)
+        );
+
+        vm.prank(config.entryPoint);
+        vm.expectRevert(
+            abi.encodeWithSelector(SessionHandler.SessionHandler_SessionRestrictedTarget.selector, config.entryPoint)
+        );
+        wallet.execute(bytes32(0), executionCalldata);
+    }
+
+    /// @notice The owner is NOT locked out: a direct owner call skips the guard entirely, so a
+    ///         deposit stranded by the restriction above is always recoverable.
+    function test_ownerCanStillWithdrawEntryPointDeposit() public {
+        IEntryPoint(config.entryPoint).depositTo{value: 1 ether}(address(wallet));
+        uint256 ownerBalanceBefore = owner.balance;
+
+        vm.prank(owner);
+        wallet.execute(
+            bytes32(0),
+            _encodeSingle(config.entryPoint, 0, abi.encodeWithSignature("withdrawTo(address,uint256)", owner, 1 ether))
+        );
+
+        assertEq(owner.balance, ownerBalanceBefore + 1 ether, "owner could not recover the deposit");
+        assertEq(IEntryPoint(config.entryPoint).balanceOf(address(wallet)), 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+             SESSION TARGET ALLOWLIST (THREAT_MODEL §3.13)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_allowlist_cannotEnableWhileEmpty() public {
+        vm.prank(owner);
+        vm.expectRevert(SessionHandler.SessionHandler_EmptyAllowlist.selector);
+        wallet.toggleAllowList(true);
+    }
+
+    function test_allowlist_offByDefault_allowsAnyExternalTarget() public {
+        assertFalse(wallet.sessionAllowlistEnabled());
+        _sendSessionOp(address(usdc), abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)));
+        assertEq(usdc.balanceOf(kani), 1e6);
+    }
+
+    function test_allowlist_confinesSessionKeyToAllowedTargets() public {
+        vm.startPrank(owner);
+        wallet.addAllowedTarget(address(usdc));
+        wallet.toggleAllowList(true);
+        vm.stopPrank();
+
+        // Allowed target still works end-to-end.
+        _sendSessionOp(address(usdc), abi.encodeCall(ERC20Mock.transfer, (kani, 1e6)));
+        assertEq(usdc.balanceOf(kani), 1e6, "allowed target should execute");
+
+        // A target that is not on the list is refused by the guard.
+        vm.prank(config.entryPoint);
+        vm.expectRevert(
+            abi.encodeWithSelector(SessionHandler.SessionHandler_SessionRestrictedTarget.selector, address(dai))
+        );
+        wallet.execute(bytes32(0), _encodeSingle(address(dai), 0, abi.encodeCall(ERC20Mock.transfer, (kani, 1e18))));
+    }
+
+    function test_allowlist_doesNotRestrictTheOwner() public {
+        vm.startPrank(owner);
+        wallet.addAllowedTarget(address(usdc));
+        wallet.toggleAllowList(true);
+        // dai is NOT allowlisted, but the owner's direct call skips the guard.
+        wallet.execute(bytes32(0), _encodeSingle(address(dai), 0, abi.encodeCall(ERC20Mock.transfer, (kani, 1e18))));
+        vm.stopPrank();
+
+        assertEq(dai.balanceOf(kani), 1e18);
+    }
+
+    function test_allowlist_batchAddAndRemoveTracksCount() public {
+        address[] memory targets = new address[](2);
+        targets[0] = address(usdc);
+        targets[1] = address(dai);
+
+        vm.startPrank(owner);
+        wallet.addAllowedTargets(targets);
+        assertEq(wallet.allowedTargetCount(), 2);
+        // Adding a duplicate must not double-count, or the emptiness guard could never be reached.
+        wallet.addAllowedTarget(address(usdc));
+        assertEq(wallet.allowedTargetCount(), 2);
+
+        wallet.removeAllowedTarget(address(usdc));
+        assertEq(wallet.allowedTargetCount(), 1);
+        assertFalse(wallet.sessionTargetAllowlist(address(usdc)));
+        // Removing something absent is a no-op, not an underflow.
+        wallet.removeAllowedTarget(address(usdc));
+        assertEq(wallet.allowedTargetCount(), 1);
+        vm.stopPrank();
+    }
+
+    /// @notice An allowlist emptied while enforced fails CLOSED — every session execution reverts —
+    ///         rather than silently reopening every target.
+    function test_allowlist_emptiedWhileEnabledFailsClosed() public {
+        vm.startPrank(owner);
+        wallet.addAllowedTarget(address(usdc));
+        wallet.toggleAllowList(true);
+        wallet.removeAllowedTarget(address(usdc));
+        vm.stopPrank();
+
+        assertTrue(wallet.sessionAllowlistEnabled());
+        vm.prank(config.entryPoint);
+        vm.expectRevert(
+            abi.encodeWithSelector(SessionHandler.SessionHandler_SessionRestrictedTarget.selector, address(usdc))
+        );
+        wallet.execute(bytes32(0), _encodeSingle(address(usdc), 0, abi.encodeCall(ERC20Mock.transfer, (kani, 1e6))));
+    }
+
+    function test_allowlist_rejectsZeroTarget() public {
+        vm.prank(owner);
+        vm.expectRevert(SessionHandler.SessionHandler_InvalidAllowedTarget.selector);
+        wallet.addAllowedTarget(address(0));
     }
 }

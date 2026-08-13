@@ -4,6 +4,7 @@ from web3 import Web3
 from web3.logs import DISCARD
 from constants import (
     get_native_wrapped_ticker,
+    get_router,
 )
 from network_config import load_network_config_by_name, load_network_config
 from db import (
@@ -291,6 +292,53 @@ def add_default_session(chat_id: int):
         print("Warning: SessionAdded event could not be decoded (stale ABI — run forge build)")
 
 
+def trust_router(chat_id: int):
+    """
+    Trusts the chain's canonical V2 router on the user's wallet, as the owner.
+
+    A wallet deploys with an EMPTY trusted-spender list. SpendingLimitModule refuses any
+    approval on a token the oracle cannot price unless its spender is trusted, so without
+    this the LP-token approval inside remove_liquidity would revert (LP tokens have no
+    Chainlink feed). Priced-token approvals never needed the exemption and are unaffected.
+
+    The router used to be protocol configuration (SHRegistry.router) and was auto-trusted
+    inside initialize(). It is now a wallet-level choice, granted here from the same
+    constants.ROUTER entry toolkits.py binds the Uniswap toolkit to, so the trusted router
+    and the router the bot builds calldata for cannot drift apart.
+
+    Trusting a spender is a real grant: it may pull an unpriced token within a single
+    transaction. The no-standing-approval rule still forces every such approval to exactly
+    zero before the transaction ends.
+
+    @param chat_id  The Telegram chat ID of the user.
+    """
+    w3, chain_id, chain_name = load_network_config(chat_id)
+    try:
+        router = get_router(chain_id)
+    except ValueError:
+        # Bare Anvil has no Uniswap deployment; nothing to trust and nothing to do.
+        print(f"No router configured for chain {chain_id}; skipping trust_router")
+        return
+
+    private_key_env = _private_key_env(chain_name)
+    owner = w3.eth.account.from_key(os.getenv(private_key_env))
+    session_handler = load_session_handler(chat_id=chat_id)
+
+    tx = session_handler.functions.addTrustedSpender(router).build_transaction(
+        {
+            "from": owner.address,
+            "nonce": w3.eth.get_transaction_count(owner.address),
+            "chainId": chain_id,
+        }
+    )
+    signed_tx = w3.eth.account.sign_transaction(tx, owner.key)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    if receipt["status"] != 1:
+        raise RuntimeError(f"addTrustedSpender reverted (tx: {tx_hash.hex()})")
+    print(f"Router trusted: {router} (tx: {tx_hash.hex()})")
+
+
 def deploy(chat_id: int, network: str):
     """
     Top-level deployment dispatcher. Deploys a SessionHandler wallet for chat_id via
@@ -323,3 +371,4 @@ if __name__ == "__main__":
     network = sys.argv[1] if len(sys.argv) > 1 else "anvil"
     deploy(chat_id=chat_id, network=network)
     add_default_session(chat_id=chat_id)
+    trust_router(chat_id=chat_id)

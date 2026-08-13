@@ -66,12 +66,9 @@ contract SHTreasury is Ownable, ReentrancyGuard {
      *                       [SHRegistry.MIN_PROTOCOL_FEE, SHRegistry.MAX_PROTOCOL_FEE].
      * @param priceOracle    Address of the deployed SHOracle. Must not be address(0).
      * @param initialAgentId Id of the SessionHandler ERC-4337 AI agent on the ERC-8004 Identity Registry.
-     * @param uniswapRouter  Uniswap V2 Router address. May be address(0) on chains without Uniswap V2.
      */
-    constructor(uint256 initialFee, address priceOracle, uint256 initialAgentId, address uniswapRouter)
-        Ownable(msg.sender)
-    {
-        SHRegistry registry = new SHRegistry(initialFee, address(this), priceOracle, initialAgentId, uniswapRouter);
+    constructor(uint256 initialFee, address priceOracle, uint256 initialAgentId) Ownable(msg.sender) {
+        SHRegistry registry = new SHRegistry(initialFee, address(this), priceOracle, initialAgentId);
         REGISTRY = address(registry);
     }
 
@@ -153,13 +150,5 @@ contract SHTreasury is Ownable, ReentrancyGuard {
      */
     function setAgentId(uint256 newId) external onlyOwner {
         SHRegistry(REGISTRY).setAgentId(newId);
-    }
-
-    /**
-     * @notice Updates the Uniswap V2 Router address in the registry. Only callable by the owner.
-     * @param newRouter The new Uniswap V2 Router address.
-     */
-    function setUniswapRouter(address newRouter) external onlyOwner {
-        SHRegistry(REGISTRY).setUniswapRouter(newRouter);
     }
 }

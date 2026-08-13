@@ -21,10 +21,20 @@ from live_network import (
 )
 
 from constants import ETH_SENTINEL, WEI_PER_ETH, get_native_wrapped_ticker, get_native_asset_ticker
+from langchain_erc20.amounts import to_base_units
 
 
-def _to_base_units(amount: float, decimals: int) -> int:
-    return int(Decimal(str(amount)) * Decimal(10) ** decimals)
+def _to_base_units(amount: float | str, decimals: int) -> int:
+    """Whole units -> base units, via langchain-erc20's converter.
+
+    Thin wrapper rather than a direct call: the package returns (base_units, truncated) and
+    this codebase only ever wants the integer. Worth delegating anyway — the package rejects
+    negative, non-finite and >uint256 amounts as ToolException instead of letting them reach
+    web3 as an unreadable encoding error, and truncates toward zero so an over-precise amount
+    can never round UP past a balance or an allowance.
+    """
+    base_units, _truncated = to_base_units(amount, decimals)
+    return base_units
 
 
 def send_user_op_as_session(chat_id, key_ciphertext, target, value, data):
@@ -126,6 +136,60 @@ def _resolve(chat_id: int, token: str) -> str:
     if token.lower() == "eth":
         token = get_native_wrapped_ticker(chain_id)
     return get_token_address(chain_id, token)
+
+
+def _resolve_contact(chat_id: int, name: str, role: str = "recipient", hint: str = "") -> str:
+    """Saved-contact name (or "me") -> address, failing usefully when it is neither.
+
+    Every tool that takes a person's name routes through here. Two reasons it is not just a
+    db lookup:
+
+      - db.get_contact returns None for an unknown name rather than raising. Passing that None
+        onward surfaces as an opaque "must be a string, got NoneType" from deep inside the
+        calldata builder, which tells the agent nothing it can act on.
+      - It is deliberately NOT address-accepting. The model may only name someone the user
+        already saved, so an address injected into the conversation cannot become a
+        destination for value (THREAT_MODEL 4.2). That makes save_contact the privileged step.
+
+    "me" names the wallet itself, matching transferFrom_erc20's documented convention.
+
+    @param role  What this name is being used as, for the error message ("sender", "spender", ...).
+    @param hint  Optional extra sentence appended to the error, e.g. how to skip the argument.
+    @raises ToolException If the name is not a saved contact.
+    """
+    if name.lower() == "me":
+        return load_session_handler(chat_id).address
+
+    address = _get_contact(chat_id, name)
+    if address is None:
+        raise ToolException(
+            f"'{name}' is not a saved contact, so they cannot be used as the {role}. "
+            f"Ask the user for their address and call save_contact first.{hint}"
+        )
+    return address
+
+
+def _resolve_recipient(chat_id: int, recipient: str | None) -> str | None:
+    """Resolve a swap's optional output recipient. None means "the wallet itself".
+
+    This is the one place a swap can send value somewhere other than the wallet, so the
+    contact-only rule in _resolve_contact is what bounds it.
+    """
+    if recipient is None:
+        return None
+    return _resolve_contact(
+        chat_id,
+        recipient,
+        role="swap output recipient",
+        hint=" Or omit recipient to receive the output in your own wallet.",
+    )
+
+
+def _destination_note(recipient: str | None) -> str:
+    """Result-string suffix naming where a swap's output went, when it wasn't the wallet."""
+    if recipient is None or recipient.lower() == "me":
+        return ""
+    return f", sent directly to: {recipient}"
 
 
 def _submit_plan(chat_id: int, key_ciphertext: str, plan: dict):
@@ -423,7 +487,7 @@ def send_eth(
         A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running send_eth")
-    recipient_addr = get_contact.func(chat_id, recipient)
+    recipient_addr = _resolve_contact(chat_id, recipient)
     value = _to_base_units(amount_eth, 18)
 
     tx_hash, receipt = send_user_op_as_session(
@@ -692,7 +756,7 @@ def get_contact_erc20_balance(chat_id: int, contact_name: str, token: str) -> fl
         The contact's token balance in whole units (e.g. 100.0 for 100 USDC).
     """
     print("Running get_contact_erc20_balance")
-    address = _get_contact(chat_id, contact_name)
+    address = _resolve_contact(chat_id, contact_name, role="account to check")
     return get_erc20_tools(chat_id)["get_balance"].invoke(
         {"token": token, "owner": address}
     )["amount"]
@@ -718,7 +782,7 @@ def get_erc20_allowance(chat_id: int, token: str, spender: str) -> float:
     """
     print("Running get_erc20_allowance")
     address = load_session_handler(chat_id).address
-    spender_addr = get_contact.func(chat_id, spender)
+    spender_addr = _resolve_contact(chat_id, spender, role="spender")
     return get_erc20_tools(chat_id)["get_allowance"].invoke(
         {"token": token, "owner": address, "spender": spender_addr}
     )["amount"]
@@ -784,7 +848,7 @@ def transfer_erc20(
     Returns: A string summarizing the transaction result, including the transaction hash and status.
     """
     print("Running transfer_erc20")
-    recipient_addr = get_contact.func(chat_id, recipient)
+    recipient_addr = _resolve_contact(chat_id, recipient)
     plan = get_erc20_tools(chat_id)["transfer"].invoke(
         {
             "token": token,
@@ -831,8 +895,10 @@ def transferFrom_erc20(
 
     print("Running transferFrom_erc20")
     wallet = load_session_handler(chat_id).address
-    sender_addr = get_contact.func(chat_id, sender)
-    recipient_addr = wallet if recipient.lower() == "me" else get_contact.func(chat_id, recipient)
+    sender_addr = _resolve_contact(chat_id, sender, role="sender")
+    # _resolve_contact maps "me" to the wallet, which is this tool's documented convention
+    # for the user naming themselves as the recipient.
+    recipient_addr = _resolve_contact(chat_id, recipient)
 
     plan = get_erc20_tools(chat_id)["transfer_from"].invoke(
         {
@@ -1210,6 +1276,7 @@ def swap_ETH_for_exact_tokens(
     token_out: str,
     amount_out: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    recipient: str | None = None,
 ):
     """
     Swaps the chain's native asset (ETH, BNB, etc.) for an exact amount of an ERC20 token via
@@ -1234,6 +1301,11 @@ def swap_ETH_for_exact_tokens(
                       upward buffer on the native-asset value sent so the swap succeeds even if the
                       price moves slightly. Defaults to 50 bps. Use a higher value for volatile
                       tokens or low-liquidity pools.
+        recipient: Optional. The name of a saved contact to receive token_out directly, when the
+                   user asks to swap and send in one go. This is delivered by the swap itself —
+                   do NOT follow up with transfer_erc20. Must be a saved contact; if they are not
+                   saved, call save_contact first. Pass "me" or omit it to keep the output in the
+                   wallet.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
              native asset spent, and amount of token_out received.
     """
@@ -1246,6 +1318,7 @@ def swap_ETH_for_exact_tokens(
             "token_out": _resolve(chat_id, token_out),
             "amount_out": amount_out,
             "from_address": load_session_handler(chat_id).address,
+            "recipient": _resolve_recipient(chat_id, recipient),
             "slippage_bps": slippage_bps,
         }
     )
@@ -1255,6 +1328,7 @@ def swap_ETH_for_exact_tokens(
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"Max {native_ticker} spent: {plan['summary']['amount_in_max']:.6f}, "
         f"{token_out.upper()} received: {amount_out}"
+        f"{_destination_note(recipient)}"
     )
 
 
@@ -1266,6 +1340,7 @@ def swap_exact_tokens_for_tokens(
     token_out: str,
     amount_in: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    recipient: str | None = None,
 ):
     """
     Swaps an exact amount of one ERC20 token (including WETH) for another using the Uniswap router.
@@ -1286,6 +1361,11 @@ def swap_exact_tokens_for_tokens(
                       queries getAmountsOut to find the expected output and sets amountOutMin
                       accordingly. Defaults to 50 bps. Use a higher value (e.g. 100–300) for
                       volatile tokens or low-liquidity pools.
+        recipient: Optional. The name of a saved contact to receive token_out directly, when the
+                   user asks to swap and send in one go (e.g. "swap 1 ETH for USDC and send it to
+                   Sandy"). This is delivered by the swap itself — do NOT follow up with
+                   transfer_erc20. Must be a saved contact; if they are not saved, call
+                   save_contact first. Pass "me" or omit it to keep the output in the wallet.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
              amount of token_in spent, and amount of token_out received.
     """
@@ -1296,6 +1376,7 @@ def swap_exact_tokens_for_tokens(
             "token_out": _resolve(chat_id, token_out),
             "amount_in": amount_in,
             "from_address": load_session_handler(chat_id).address,
+            "recipient": _resolve_recipient(chat_id, recipient),
             "slippage_bps": slippage_bps,
         }
     )
@@ -1305,6 +1386,7 @@ def swap_exact_tokens_for_tokens(
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token_in.upper()} spent: {amount_in}, "
         f"Min {token_out.upper()} received: {plan['summary']['amount_out_min']:.6f}"
+        f"{_destination_note(recipient)}"
     )
 
 
@@ -1316,6 +1398,7 @@ def swap_tokens_for_exact_tokens(
     token_out: str,
     amount_out: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    recipient: str | None = None,
 ):
     """
     Swaps an amount of one ERC20 token (including WETH) for an exact amount of another using the Uniswap router.
@@ -1336,6 +1419,11 @@ def swap_tokens_for_exact_tokens(
                       queries getAmountsIn to find the expected input cost and sets amountInMax
                       accordingly. Defaults to 50 bps. Use a higher value (e.g. 100–300) for
                       volatile tokens or low-liquidity pools.
+        recipient: Optional. The name of a saved contact to receive token_out directly, when the
+                   user asks to swap and send in one go. This is delivered by the swap itself —
+                   do NOT follow up with transfer_erc20. Must be a saved contact; if they are not
+                   saved, call save_contact first. Pass "me" or omit it to keep the output in the
+                   wallet.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
              amount of token_in spent, and amount of token_out received.
     """
@@ -1346,6 +1434,7 @@ def swap_tokens_for_exact_tokens(
             "token_out": _resolve(chat_id, token_out),
             "amount_out": amount_out,
             "from_address": load_session_handler(chat_id).address,
+            "recipient": _resolve_recipient(chat_id, recipient),
             "slippage_bps": slippage_bps,
         }
     )
@@ -1355,6 +1444,7 @@ def swap_tokens_for_exact_tokens(
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"Max {token_in.upper()} spent: {plan['summary']['amount_in_max']:.6f}, "
         f"{token_out.upper()} received: {amount_out}"
+        f"{_destination_note(recipient)}"
     )
 
 
@@ -1365,6 +1455,7 @@ def swap_exact_tokens_for_ETH(
     token_in: str,
     amount_in: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    recipient: str | None = None,
 ):
     """
     Swaps an exact amount of an ERC20 token for the chain's native asset (ETH, BNB, etc.) via
@@ -1389,6 +1480,11 @@ def swap_exact_tokens_for_ETH(
                       queries getAmountsOut to find the expected native-asset output and sets
                       amountOutMin accordingly. Defaults to 50 bps. Use a higher value for
                       volatile tokens or low-liquidity pools.
+        recipient: Optional. The name of a saved contact to receive the native asset directly,
+                   when the user asks to swap and send in one go. This is delivered by the swap
+                   itself — do NOT follow up with send_eth. Must be a saved contact; if they are
+                   not saved, call save_contact first. Pass "me" or omit it to keep the output in
+                   the wallet.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
              amount of token_in spent, and native asset received.
     """
@@ -1401,6 +1497,7 @@ def swap_exact_tokens_for_ETH(
             "token_in": _resolve(chat_id, token_in),
             "amount_in": amount_in,
             "from_address": load_session_handler(chat_id).address,
+            "recipient": _resolve_recipient(chat_id, recipient),
             "slippage_bps": slippage_bps,
         }
     )
@@ -1410,6 +1507,7 @@ def swap_exact_tokens_for_ETH(
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{token_in.upper()} spent: {amount_in}, "
         f"Min {native_ticker} received: {plan['summary']['amount_out_min']:.6f}"
+        f"{_destination_note(recipient)}"
     )
 
 
@@ -1420,6 +1518,7 @@ def swap_tokens_for_exact_ETH(
     token_in: str,
     amount_out_eth: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    recipient: str | None = None,
 ):
     """
     Swaps however much of an ERC20 token is needed to receive an exact amount of the chain's
@@ -1444,6 +1543,11 @@ def swap_tokens_for_exact_ETH(
                       upward buffer on amountInMax so the swap succeeds even if the price moves
                       slightly. Defaults to 50 bps. Use a higher value for volatile tokens or
                       low-liquidity pools.
+        recipient: Optional. The name of a saved contact to receive the native asset directly,
+                   when the user asks to swap and send in one go. This is delivered by the swap
+                   itself — do NOT follow up with send_eth. Must be a saved contact; if they are
+                   not saved, call save_contact first. Pass "me" or omit it to keep the output in
+                   the wallet.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
              amount of token_in spent, and native asset received.
     """
@@ -1456,6 +1560,7 @@ def swap_tokens_for_exact_ETH(
             "token_in": _resolve(chat_id, token_in),
             "amount_out": amount_out_eth,
             "from_address": load_session_handler(chat_id).address,
+            "recipient": _resolve_recipient(chat_id, recipient),
             "slippage_bps": slippage_bps,
         }
     )
@@ -1465,6 +1570,7 @@ def swap_tokens_for_exact_ETH(
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"Max {token_in.upper()} spent: {plan['summary']['amount_in_max']:.6f}, "
         f"{native_ticker} received: {amount_out_eth}"
+        f"{_destination_note(recipient)}"
     )
 
 
@@ -1475,6 +1581,7 @@ def swap_exact_ETH_for_tokens(
     token_out: str,
     eth_amount_in: float,
     slippage_bps: int = DEFAULT_SLIPPAGE_BPS,
+    recipient: str | None = None,
 ):
     """
     Swaps an exact amount of the chain's native asset (ETH, BNB, etc.) for an ERC20 token via
@@ -1499,6 +1606,11 @@ def swap_exact_ETH_for_tokens(
                       queries getAmountsOut to find the expected token output and sets amountOutMin
                       accordingly. Defaults to 50 bps. Use a higher value for volatile tokens
                       or low-liquidity pools.
+        recipient: Optional. The name of a saved contact to receive token_out directly, when the
+                   user asks to swap and send in one go (e.g. "swap 1 ETH for USDC and send it to
+                   Sandy"). This is delivered by the swap itself — do NOT follow up with
+                   transfer_erc20. Must be a saved contact; if they are not saved, call
+                   save_contact first. Pass "me" or omit it to keep the output in the wallet.
     Returns: A string summarizing the transaction result, including the transaction hash, status,
              native asset spent, and amount of token_out received.
     """
@@ -1511,6 +1623,7 @@ def swap_exact_ETH_for_tokens(
             "token_out": _resolve(chat_id, token_out),
             "amount_in": eth_amount_in,
             "from_address": load_session_handler(chat_id).address,
+            "recipient": _resolve_recipient(chat_id, recipient),
             "slippage_bps": slippage_bps,
         }
     )
@@ -1520,6 +1633,7 @@ def swap_exact_ETH_for_tokens(
         f"Tx hash: `{tx_hash.hex()}`, Status: {receipt['status']}, "
         f"{native_ticker} spent: {eth_amount_in}, "
         f"Min {token_out.upper()} received: {plan['summary']['amount_out_min']:.6f}"
+        f"{_destination_note(recipient)}"
     )
 
 

@@ -29,6 +29,12 @@ The surrounding layers form the test bench that produces those transactions: the
 
 ---
 
+## Demo
+
+[![AI agent powered smart wallet — demo video](https://img.youtube.com/vi/OIOLdvbGoNQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=OIOLdvbGoNQ)
+
+---
+
 ## Protocol Architecture
 
 ```

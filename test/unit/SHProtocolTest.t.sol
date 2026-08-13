@@ -320,9 +320,8 @@ contract SHProtocolTest is Test {
         }
         SHOracle bigOracle = new SHOracle(tokens, feeds, beats);
         // The module reads its oracle from a registry, so the fixture needs its own registry
-        // pointing at bigOracle (fee/agentId/router are irrelevant to the watched-list cap).
-        SHRegistry bigRegistry =
-            new SHRegistry(feeRegistry.MIN_PROTOCOL_FEE(), address(this), address(bigOracle), 1, address(0));
+        // pointing at bigOracle (fee/agentId are irrelevant to the watched-list cap).
+        SHRegistry bigRegistry = new SHRegistry(feeRegistry.MIN_PROTOCOL_FEE(), address(this), address(bigOracle), 1);
         SpendingLimitModule freshModule = new SpendingLimitModule(address(bigRegistry));
 
         address account = makeAddr("eoaAccount");
@@ -624,7 +623,7 @@ contract SHProtocolTest is Test {
 
     function test_addTrustedSpender_lifecycleAndEvents() public {
         address venue = makeAddr("venue");
-        // Anvil config has router == address(0), so nothing is auto-trusted; the list starts empty.
+        // Nothing is trusted at deploy, so the list starts empty.
         assertEq(wallet.getConfig().trustedSpenders.length, 0);
 
         vm.expectEmit(true, true, false, false, address(module));
@@ -868,7 +867,6 @@ contract SHProtocolTest is Test {
     }
 
     function test_registryViews() public view {
-        assertEq(wallet.getRouter(), feeRegistry.router());
         assertEq(wallet.getAgentId(), feeRegistry.agentId());
     }
 

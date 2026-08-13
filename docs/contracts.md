@@ -73,8 +73,9 @@ function setProtocolFee(uint256 newFee) external onlyOwner;
 function setTreasury(address newTreasury) external onlyOwner;
 function setPriceOracle(address newOracle) external onlyOwner;
 function setAgentId(uint256 newId) external onlyOwner;
-function setUniswapRouter(address newRouter) external onlyOwner;
 ```
+
+> `router` / `setUniswapRouter` were **removed**: which DEX a wallet trades on is a wallet-level choice, not protocol configuration. Wallets now start with an empty trusted-spender list and the owner grants a router explicitly via `addTrustedSpender`.
 
 > The former `callValueInterpreter` parameter and `SHValueInterpreter` contract were **removed**: the new module meters spending by diffing watched-token balances, so it needs no per-call calldata decoder.
 
@@ -102,7 +103,6 @@ function setProtocolFee(uint256 newFee) external onlyOwner;
 function setPriceOracle(address newOracle) external onlyOwner;
 function setTreasury(address newTreasury) external onlyOwner;
 function setAgentId(uint256 newId) external onlyOwner;
-function setUniswapRouter(address newRouter) external onlyOwner;
 
 address public immutable REGISTRY;
 uint256 public totalFeesCollected;
@@ -183,12 +183,12 @@ The `SessionHandler` is an **ERC-7579 smart account** (extends OpenZeppelin's `A
 
 Session-key management and cap configuration are plain `onlyOwner`. Note that the module also refuses `execute`-routed calls to its own setters for *every* caller, owner included — see `SpendingLimitModule` below.
 
-**Session keys are a bare allowlist.** `addSession(key)` / `removeSession(key)` — no per-key target/selector scope, no expiry. A session key can drive any external call, bounded by the spending cap and the guard. The registry router is auto-trusted as a spender in `initialize()` so `removeLiquidity`'s LP-token approval works out of the box.
+**Session keys are a bare allowlist.** `addSession(key)` / `removeSession(key)` — no per-key target/selector scope, no expiry. A session key can drive any external call, bounded by the spending cap, the guard, and the per-UserOp gas ceiling — optionally narrowed to a set of target addresses via `sessionTargetAllowlist` (off by default). Nothing is trusted at deploy: the owner grants a router with `addTrustedSpender` before `removeLiquidity`'s LP-token approval will pass.
 
 ```solidity
 /// Called once by SHFactory on each freshly cloned wallet (replaces the constructor).
 /// Installs the module as a HOOK with abi.encode(dailyLimitUsd, windowDuration, watchedTokens),
-/// then auto-trusts REGISTRY.router() (if nonzero) as a spender.
+/// The trusted-spender list starts EMPTY; the owner grants a router with addTrustedSpender.
 function initialize(
     address owner,
     address entryPointAddress,
@@ -236,10 +236,27 @@ function withdraw(address token, uint256 amount, address to) external onlyOwner;
 function getAgentId() public view returns (uint256);
 function getAgentIdentity() public view returns (bool registered, uint256 agentId, string memory agentUri);
 function getAgentReputation() public view returns (uint256 agentId, uint64 feedbackCount, int128 summaryValue, uint8 summaryValueDecimals);
-function getRouter() public view returns (address);
+
+// Per-UserOp gas ceiling (THREAT_MODEL 3.12) - the cap cannot see gas, these bound it
+uint256 public constant DEFAULT_MAX_OP_GAS_COST = 0.1 ether;
+uint256 public maxOpGasCost;
+function setMaxOpGasCost(uint256 newMax) external onlyOwner;
+
+// Optional session-key target allowlist (THREAT_MODEL 3.13), off by default
+mapping(address => bool) public sessionTargetAllowlist;
+bool public sessionAllowlistEnabled;
+uint256 public allowedTargetCount;
+function toggleAllowList(bool enabled) external onlyOwner;      // refuses to enable while empty
+function addAllowedTarget(address target) external onlyOwner;
+function addAllowedTargets(address[] calldata targets) external onlyOwner;
+function removeAllowedTarget(address target) external onlyOwner;
 
 event SessionAdded(address indexed sessionKey);
 event SessionRemoved(address indexed sessionKey);
+event MaxOpGasCostUpdated(uint256 oldMax, uint256 newMax);
+event SessionAllowlistToggled(bool enabled);
+event AllowedTargetAdded(address indexed target);
+event AllowedTargetRemoved(address indexed target);
 ```
 
 > The account currently has **no validator module**. Until a validator (an owner/ECDSA validator or Smart Sessions) is added, this self-validation path is what makes UserOps work — the bot's nonce-key scheme still validates fine because any extracted "validator" isn't installed and the account falls through to `_rawSignatureValidation`.
@@ -273,7 +290,7 @@ struct Config {
 
 Because spending *is* the drop in watched-portfolio USD, the module needs no per-venue swap decoder: a value-neutral swap nets ~0, and a bad-rate or sandwiched swap registers its lost value automatically. Both `execute` and `executeFromExecutor` calldata are decoded for approvals; delegatecalls are not decoded (no reliable selector), but the net-value cap still applies to them.
 
-**Trusted-spender exemption (unpriced approvals).** An `approve` on a token the oracle can't price normally reverts (`TokenNotPriced`) — *unless* the spender is on the account's `trustedSpenders` list. This is the escape hatch that lets a Uniswap V2 **LP token** (which has no Chainlink feed) be approved to the router for `removeLiquidity`. The no-standing-approval and no-unlimited-approval rules still apply in full to trusted spenders — the exemption only skips the price check. The account auto-trusts the registry router at deploy; owners can add/remove others.
+**Trusted-spender exemption (unpriced approvals).** An `approve` on a token the oracle can't price normally reverts (`TokenNotPriced`) — *unless* the spender is on the account's `trustedSpenders` list. This is the escape hatch that lets a Uniswap V2 **LP token** (which has no Chainlink feed) be approved to the router for `removeLiquidity`. The no-standing-approval and no-unlimited-approval rules still apply in full to trusted spenders — the exemption only skips the price check. The list starts empty — the owner trusts a router explicitly (the bot does this in `deploy_wallet.trust_router`).
 
 **Self-guard on the module's admin surface.** `preCheck` reverts `AdminExecution` if any sub-call of the execution targets the module itself with one of its own selectors (the six config setters, `onInstall`, `onUninstall`). It runs *first*, before approvals are collected, so a refused transaction pays almost nothing. It is defence-in-depth that holds even on a host account with no guard of its own — and it deliberately blocks the **owner's** `execute` path too, because by the time `preCheck` runs `msg.sender` is the account whether an owner or a session key drove it, leaving no way to tell them apart. Nothing legitimate is lost: the owner reaches the six setters through `SessionHandler`'s `onlyOwner` passthroughs (a direct call, so no hook runs), and `onInstall`/`onUninstall` through `installModule`/`uninstallModule`, whose outer calldata is not an `execute` selector and so never reaches the check.
 
@@ -417,7 +434,7 @@ Totals: **60** unit + **13** guard + **8** invariant (local), and **33** fork (1
 
 > **Gotcha:** the vendored account-abstraction is EntryPoint **v0.9**, whose `nonReentrant` requires `tx.origin == msg.sender` — tests must submit `handleOps` with a two-arg `vm.prank(bundler, bundler)` (EOA bundler) or it reverts `Reentrancy()`.
 
-**`test/fork/SHForkTestBase.sol` (10 tests, abstract)** + thin per-network instances **`SHUniswapV2Test`** (mainnet, WETH→DAI), **`SHSepoliaUniswapV2Test`** (Sepolia, WETH→USDC), and **`SHPancakeswapV2Test`** (BSC, USDT→WBNB→LINK multi-hop). Runs identically against the real router, live Chainlink feeds, and the canonical EntryPoint: wallet deploys with cap config, router auto-trusted; net-value metering at live prices; budget-exceeded reverts atomically; a real **session-key swap** metered by net portfolio change; standing/unlimited approvals rejected on a real DEX; a session op targeting the module reverts; a revoked key fails validation; and a full **`addLiquidity → removeLiquidity` round-trip** proving the unpriced LP-token approval flows through the auto-trusted router (BSC exercises the router's create-pair path). Metering assertions are computed from actual balance diffs priced through the deployed oracle, so they hold despite testnet pool-ratio divergence.
+**`test/fork/SHForkTestBase.sol` (10 tests, abstract)** + thin per-network instances **`SHUniswapV2Test`** (mainnet, WETH→DAI), **`SHSepoliaUniswapV2Test`** (Sepolia, WETH→USDC), and **`SHPancakeswapV2Test`** (BSC, USDT→WBNB→LINK multi-hop). Runs identically against the real router, live Chainlink feeds, and the canonical EntryPoint: wallet deploys with cap config and the owner trusts the chain's router (from Constants.s.sol); net-value metering at live prices; budget-exceeded reverts atomically; a real **session-key swap** metered by net portfolio change; standing/unlimited approvals rejected on a real DEX; a session op targeting the module reverts; a revoked key fails validation; and a full **`addLiquidity → removeLiquidity` round-trip** proving the unpriced LP-token approval flows through the trusted router (BSC exercises the router's create-pair path). Metering assertions are computed from actual balance diffs priced through the deployed oracle, so they hold despite testnet pool-ratio divergence.
 
 **`test/invariant/` (8 invariants)** — `SHHandler` fuzzes owner executes (transfers, mint+transfer batches), config changes, non-owner attacks, session-key management, and time warps, maintaining a **ghost model** that independently replicates the module's roll-then-accumulate net metering. `InvariantSH` asserts, among others: `invariant_meteringMatchesGhostModel` (module `spentInWindow` equals the ghost exactly), spend never negative, config only ever changed by the owner, the hook stays installed, the watched list stays bounded/consistent, remaining-budget consistency, and the session allowlist matches ghost bookkeeping.
 

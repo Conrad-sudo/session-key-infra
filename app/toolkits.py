@@ -24,8 +24,7 @@ from langchain_core.tools import BaseTool
 from langchain_erc20 import ERC20Toolkit
 from langchain_uniswap_v2 import UniswapV2Toolkit
 
-from constants import ETH_SENTINEL, get_native_wrapped_ticker
-from contracts import load_session_handler
+from constants import ETH_SENTINEL, get_native_wrapped_ticker, get_router
 from db import get_supported_tokens, get_token_address
 from network_config import load_network_config
 
@@ -88,10 +87,11 @@ def get_uniswap_tools(chat_id: int) -> dict[str, BaseTool]:
         tokens = _token_map(chat_id)
         toolkit = UniswapV2Toolkit(
             rpc_url=w3.provider.endpoint_uri,
-            # Read the router from the wallet, never from the package's chain registry:
-            # the registry has no Anvil entry and points BSC at PancakeSwap, and the wallet's
-            # router is the one SpendingLimitModule auto-trusted at deploy.
-            router_address=load_session_handler(chat_id).functions.getRouter().call(),
+            # Read the router from app constants, never from the package's chain registry
+            # (which has no Anvil entry and points BSC elsewhere). This is the same address
+            # deploy_wallet.py passes to addTrustedSpender, so the router the toolkit builds
+            # calldata for is always the one the wallet actually trusts.
+            router_address=get_router(chain_id),
             # Omitted on purpose -- the toolkit reads router.factory(), so the pair lookups
             # can never drift from the router the wallet actually uses, and Anvil works
             # without a hardcoded address.
