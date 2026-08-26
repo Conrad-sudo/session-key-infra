@@ -106,7 +106,8 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /// @notice Emitted when a session-key execution pays the protocol fee. Owner-initiated executions
     ///         pay no fee and emit nothing.
     /// @param treasury The registry-configured recipient at the time of payment.
-    /// @param fee      The amount paid in wei.
+    /// @param fee      The amount paid in wei. The fee is configured in USD, so this is the converted
+    ///        amount at the oracle price that applied to this execution, not the configured figure.
     event ProtocolFeePaid(address indexed treasury, uint256 fee);
 
     /*//////////////////////////////////////////////////////////////
@@ -117,7 +118,7 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     /// @dev Deliberately generous — it clears a ~600k-gas swap at 2x a spiking base fee, so a fee
     ///      spike never rejects a legitimate op. A bound on abuse, not a gas budget.
     uint256 public constant DEFAULT_MAX_OP_GAS_COST = 0.1 ether;
-     /// @notice Maximum total ETH (wei) one UserOp may cost this account, however it is paid.
+    /// @notice Maximum total ETH (wei) one UserOp may cost this account, however it is paid.
     /// @dev Owner-settable because gas prices differ per chain and over time; a compile-time constant
     ///      would be too tight somewhere (legitimate ops fail in a fee spike) and too loose elsewhere.
     ///      Enforced in both {_validateUserOp} and {_payPrefund} — see each for why one is not enough.
@@ -135,8 +136,6 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
     uint256 public WALLET_ID;
     /// @dev Installed as MODULE_TYPE_HOOK in initialize(); enforces the account's USD spending cap.
     SpendingLimitModule public SH_MODULE;
-
-   
 
     /// @notice Targets a session key may call, when {sessionAllowlistEnabled} is true. OFF by default.
     /// @dev Confines a key to a fixed set of venues — mainly to keep it away from protocols where the
@@ -399,7 +398,6 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         if (newMax == 0) revert SessionHandler_InvalidMaxOpGasCost();
         maxOpGasCost = newMax;
         emit MaxOpGasCostUpdated(maxOpGasCost, newMax);
-        
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -536,9 +534,25 @@ contract SessionHandler is AccountERC7579Hooked, OwnableUpgradeable, Pausable {
         }
     }
 
+    /**
+     * @dev Pays the protocol fee for one session-key execution. Both the recipient and the amount are
+     *      resolved from the registry per call, never stored here, so a fee or treasury change lands
+     *      on every deployed wallet at once.
+     * @dev The amount is USD-denominated on the registry and converted to native by
+     *      {SHRegistry-getFee} at the oracle's current price. Two consequences worth stating plainly:
+     *      the wei charged differs between two identical executions minutes apart, and a stale
+     *      ETH/USD feed reverts the execution outright — including one that moves only ERC-20s, which
+     *      would otherwise never touch the native feed. That trade is deliberate: charging a wrong
+     *      amount is worse than not charging, and the owner path never reaches here.
+     * @dev Called BEFORE {_execute}, so the transfer lands outside the hook's preCheck→postCheck
+     *      window and is NOT charged against the account's USD spending cap. That is intentional —
+     *      the cap meters what the user spends, and a protocol fee is not the user's spend. It does
+     *      mean the fee is native outflow the cap never sees, bounded by {SHRegistry-MAX_PROTOCOL_FEE}
+     *      per execution rather than by the cap.
+     */
     function _extractFee() internal {
         address treasury = REGISTRY.treasury();
-        uint256 fee = REGISTRY.protocolFee();
+        uint256 fee = REGISTRY.getFee();
         if (address(this).balance < fee) revert SessionHandler_NotEnoughBalance();
         (bool success,) = treasury.call{value: fee}("");
         if (!success) revert SessionHandler_TransferFailed();

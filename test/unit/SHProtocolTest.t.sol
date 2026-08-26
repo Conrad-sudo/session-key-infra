@@ -75,8 +75,8 @@ contract SHProtocolTest is Test {
     function setUp() public {
         DeploySHProtocol deployer = new DeploySHProtocol();
         (factory, treasury, config, oracle) = deployer.run();
-        feeRegistry = SHRegistry(treasury.REGISTRY());
-        module = SpendingLimitModule(factory.spendingLimitModule());
+        feeRegistry = treasury.REGISTRY();
+        module = SpendingLimitModule(feeRegistry.spendingLimitModule());
         owner = config.account;
 
         usdc = ERC20Mock(config.usdc);
@@ -140,12 +140,24 @@ contract SHProtocolTest is Test {
     }
 
     function test_deployWallet_revertsWhenModuleUnset() public {
-        vm.prank(owner);
-        factory.setSpendingLimitModule(address(0));
+        // The module lives on the registry now, and the registry refuses address(0) — so the only
+        // way to observe the factory's guard is the genuine pre-set state: a registry whose module
+        // has never been set (the window between deploying the registry and the module).
+        SHRegistry bareRegistry = new SHRegistry(
+            address(this),
+            feeRegistry.MIN_PROTOCOL_FEE(),
+            address(treasury),
+            address(oracle),
+            config.reputationRegistry,
+            config.identityRegistry,
+            config.entryPoint,
+            1
+        );
+        SHFactory bareFactory = new SHFactory(address(this), address(bareRegistry));
 
         address[] memory watched = new address[](0);
         vm.expectRevert(SHFactory.SHFactory_SpendingLimitModuleNotSet.selector);
-        factory.deployWallet(DAILY_LIMIT, WINDOW, watched);
+        bareFactory.deployWallet(DAILY_LIMIT, WINDOW, watched);
     }
 
     function test_deployWallet_revertsOnUnpricedWatchedToken() public {
@@ -307,21 +319,35 @@ contract SHProtocolTest is Test {
 
     function test_watchedTokenCap_enforcedAt32() public {
         // Self-contained fixture: 33 priced tokens against a dedicated oracle, with a plain EOA
-        // acting as the installing account (the module only cares about msg.sender).
+        // acting as the installing account (the module only cares about msg.sender). The oracle
+        // carries one extra entry for native, because SHRegistry's constructor refuses an oracle
+        // that cannot price address(0) — the fee path and the module both depend on that feed.
         uint256 n = 33;
-        address[] memory tokens = new address[](n);
-        address[] memory feeds = new address[](n);
-        uint256[] memory beats = new uint256[](n);
+        address[] memory tokens = new address[](n + 1);
+        address[] memory feeds = new address[](n + 1);
+        uint256[] memory beats = new uint256[](n + 1);
         MockV3Aggregator sharedFeed = new MockV3Aggregator(8, 1e8);
         for (uint256 i = 0; i < n; i++) {
             tokens[i] = address(new ERC20Mock("T", "T", 18));
             feeds[i] = address(sharedFeed);
             beats[i] = 1 days;
         }
-        SHOracle bigOracle = new SHOracle(tokens, feeds, beats);
+        tokens[n] = address(0);
+        feeds[n] = address(sharedFeed);
+        beats[n] = 1 days;
+        SHOracle bigOracle = new SHOracle(address(this), tokens, feeds, beats);
         // The module reads its oracle from a registry, so the fixture needs its own registry
-        // pointing at bigOracle (fee/agentId are irrelevant to the watched-list cap).
-        SHRegistry bigRegistry = new SHRegistry(feeRegistry.MIN_PROTOCOL_FEE(), address(this), address(bigOracle), 1);
+        // pointing at bigOracle (owner/fee/agentId are irrelevant to the watched-list cap).
+        SHRegistry bigRegistry = new SHRegistry(
+            address(this),
+            feeRegistry.MIN_PROTOCOL_FEE(),
+            address(this),
+            address(bigOracle),
+            config.reputationRegistry,
+            config.identityRegistry,
+            config.entryPoint,
+            1
+        );
         SpendingLimitModule freshModule = new SpendingLimitModule(address(bigRegistry));
 
         address account = makeAddr("eoaAccount");

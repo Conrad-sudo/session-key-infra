@@ -94,8 +94,8 @@ abstract contract SHForkTestBase is Test {
 
         DeploySHProtocol deployer = new DeploySHProtocol();
         (factory, treasury, config, oracle) = deployer.run();
-        feeRegistry = SHRegistry(treasury.REGISTRY());
-        module = SpendingLimitModule(factory.spendingLimitModule());
+        feeRegistry = treasury.REGISTRY();
+        module = SpendingLimitModule(feeRegistry.spendingLimitModule());
         owner = config.account;
         router = IUniswapV2Router01(_routerForChain());
 

@@ -89,8 +89,13 @@ A negative test suite (`SessionGuardTest`) locks all three in: session-key unins
 
 ### 3.7 Price Oracle — Staleness
 **Threat:** A stale Chainlink feed could mis-price a token's USD value.
-**Mitigation in place:** `SHOracle` reverts with `PriceOracle_StalePrice` if `block.timestamp - updatedAt > heartbeat` for that specific feed (each feed has its own heartbeat), and with `PriceOracle_InvalidPrice` on a non-positive answer. Crucially, the module prices **only tokens that actually moved** in a transaction, so a stale feed on an untouched watched token can never block an unrelated transaction — staleness only reverts a transaction that actually moves the stale-fed token.
-**Residual risk:** Low under normal operation. A genuinely stale feed blocks any transaction moving that token (a hard revert, not silent overspending) until it updates.
+**Mitigation in place:** `SHOracle` reverts with `PriceOracle_StalePrice` if `block.timestamp - updatedAt > heartbeat` for that specific feed (each feed has its own heartbeat), and with `PriceOracle_InvalidPrice` on a non-positive answer. For **token** feeds the blast radius stays narrow: the module prices only tokens that actually moved in a transaction, so a stale feed on an untouched watched token can never block an unrelated transaction.
+
+**The ETH/USD feed is the exception, and its blast radius widened when the protocol fee became USD-denominated.** ⚠️ `SessionHandler._extractFee` calls `SHRegistry.getFee()` on **every** session-key execution, which prices native through this one feed. A stale ETH/USD feed therefore reverts *all* session-key execution protocol-wide — including transactions that move only ERC-20s, which under the previous flat-wei fee never touched the native feed at all. The feed was already a dependency for any native-moving transaction (the module meters the native delta); the fee change extended that to every transaction.
+
+Failing closed is the intended behaviour — charging a fee struck at a stale price is worse than not charging — and two things bound the impact. Owner-initiated `execute` **pays no fee**, so a wallet owner keeps full access to their funds throughout an outage; only the agent's session-key path stops. And `SessionHandler.pause()` remains available to owners regardless.
+
+**Residual risk:** Low under normal operation — ETH/USD is among the most reliable and shortest-heartbeat (1h) Chainlink feeds on every supported chain. But a stale ETH/USD feed is now a **protocol-wide halt of agent activity**, not a per-token revert, and the operator's only remedy is `setFeed` to repoint the aggregator (immediate, not timelocked — see §3.8). No fallback oracle and no stale-price grace path exist; neither is implemented.
 
 ---
 
@@ -99,9 +104,13 @@ A negative test suite (`SessionGuardTest`) locks all three in: session-key unins
 
 **Why it is built this way:** the indirection is what makes an oracle bug fixable. With the oracle fixed at construction, a bad feed registration or a mis-priced token could only be corrected by deploying a new module and migrating every wallet onto it — wallets whose hook is `onlyOwner`-uninstallable, i.e. a migration the protocol cannot perform on a user's behalf. Reach over already-deployed wallets is the entire point, and the trust assumption is inseparable from it.
 
-**Mitigation in place:** `SHRegistry.setPriceOracle` is `onlyOwner` and rejects `address(0)`; all registry admin flows through `SHTreasury`'s pass-through setters, so the operator key is the single point of control. `PriceOracleUpdated(oldOracle, newOracle)` is emitted on every change, making a swap publicly observable on-chain. `SpendingLimitModule`'s constructor reverts (`OracleNotSet`) if the registry it is given reports no oracle, which also catches the deploy-time mistake of passing the `SHOracle` address in place of the registry.
+**Mitigation in place:** repointing the oracle is **two-phase and timelocked**. `SHRegistry.proposePriceOracle` records a candidate and starts `ORACLE_TIMELOCK` (2 days); `commitPriceOracle` applies it only once that ETA passes; `cancelPriceOracle` withdraws it. `PriceOracleProposed(newOracle, eta)` is emitted at proposal time, so a swap is publicly observable **two days before it binds** rather than only after the fact, and wallet owners can `pause()` in the interval. Both phases are `onlyOwner` and flow through `SHTreasury`'s pass-through setters, so the operator key remains the single point of control.
 
-**Residual risk:** No timelock, no multi-sig, and no per-wallet opt-out. An operator-key compromise is protocol-wide and takes effect on the next transaction of every wallet, with the only warning being the emitted event. A timelock on `setPriceOracle` is the obvious hardening step and is **not** implemented. Wallet owners cannot pin an oracle version.
+`proposePriceOracle` also rejects `address(0)` and any oracle that **cannot price native (`address(0)`)** — the module meters the native balance delta on every metered transaction, so committing such an oracle would revert every native-moving execution on every deployed wallet. That same check rejects any address with no `isPriced()` to call, catching a wrong-network or mistyped oracle. `SpendingLimitModule`'s constructor reverts (`OracleNotSet`) if the registry it is given reports no oracle, which also catches the deploy-time mistake of passing the `SHOracle` address in place of the registry.
+
+`SHOracle` is itself `Ownable` (owned by `SHTreasury`) with `setFeed`/`removeFeed`, so a wrong heartbeat or a deprecated aggregator can be corrected in place without redeploying the oracle. `removeFeed` refuses to deregister the native feed, for the same reason the propose-time check exists. Feed edits are **not** timelocked — the delay governs *which* oracle wallets read, not what any oracle contains.
+
+**Residual risk:** No multi-sig and no per-wallet opt-out; wallet owners still cannot pin an oracle version. The timelock bounds *surprise*, not authority — a compromised operator key can still repoint the oracle protocol-wide, it just has to wait 2 days in public first, and nothing forces anyone to be watching. **Feed-level edits (`setFeed`) bypass the delay entirely**: an operator who can register a feed on the *live* oracle can mis-price a token immediately, so the timelock is not a complete bound on oracle-integrity abuse. The delay also cuts the other way — a genuinely broken live oracle (deprecated feed, garbage prices) cannot be replaced for 2 days, during which wallet owners' only recourse is `SessionHandler.pause()`. Multi-sig ownership of `SHTreasury` is the remaining hardening step and is **not** implemented.
 
 ---
 
@@ -138,6 +147,8 @@ A negative test suite (`SessionGuardTest`) locks all three in: session-key unins
 - `validateUserOp` is `whenNotPaused`: a paused wallet fails in validation and pays nothing, rather than paying a full prefund and then reverting in `execute`.
 
 **Residual risk:** A compromised key can still burn up to `maxOpGasCost` per UserOp, each op costing it real gas and being individually visible on-chain — bounded and slow, not zero. The ceiling is a blunt instrument: too low and legitimate ops fail during a fee spike (`AA23 reverted`, an opaque bundler error), too high and the bound is weak. It is one value for all chains until an owner tunes it, and the default is sized for the worst case the bot builds (~600k gas at 2× a spiking base fee), which is deliberately generous on cheap chains. Gas is still not charged against the USD cap at all.
+
+**The protocol fee is a second, smaller category of the same thing — and it is deliberate.** `_extractFee` runs *before* `_execute`, and the hook's `preCheck`→`postCheck` window opens inside `_execute`, so the fee transfer never appears in the metered native delta. This is by design: the cap meters what the *user* spends, and a protocol fee is not the user's spend. The exposure it leaves is bounded differently from gas, though — a session key spamming executions burns `SHRegistry.getFee()` wei per op with none of it charged to the cap, capped at `MAX_PROTOCOL_FEE` ($0.15) per execution by registry bounds rather than by the wallet's own limit. Each such op still costs the attacker real gas and is individually visible on-chain, and the ceiling is the operator's to raise — which is the same operator-trust assumption as §3.8, not a new one.
 
 ---
 
@@ -206,16 +217,48 @@ On-chain this is metered correctly and needs no new check: routing output away m
 
 ### 4.6 Calldata-Construction Dependencies ⚠️
 
-**Threat:** Every ERC20 transfer, swap and liquidity operation has its `(to, value, data)` built by two external PyPI packages, `langchain-erc20` and `langchain-uniswap-v2`. A malicious release — or a compromised PyPI account — could return a plan whose recipient, amount or approval spender differs from what the agent asked for, and the app would sign and submit it. This is a **higher-value target than a typical dependency**: it sits directly on the path between user intent and signed calldata.
+**Threat:** Every ERC20 transfer, swap, liquidity operation and ERC-8004 registry write has its `(to, value, data)` built by three external PyPI packages, `langchain-erc20`, `langchain-uniswap-v2` and `langchain-erc8004`. A malicious release — or a compromised PyPI account — could return a plan whose recipient, amount or approval spender differs from what the agent asked for, and the app would sign and submit it. This is a **higher-value target than a typical dependency**: it sits directly on the path between user intent and signed calldata.
 
 **Mitigations in place:**
-- Both are pinned to exact versions in `requirements.txt`, so an upgrade is a deliberate, reviewable change.
+- All three are pinned to exact versions in `requirements.txt`, so an upgrade is a deliberate, reviewable change.
 - `SpendingLimitModule` is an independent on-chain check on the result: a plan that overspends the USD cap, leaves a standing approval, requests an unlimited approval, or targets the admin surface reverts regardless of what built it. A malicious plan cannot exceed the cap, only misdirect value up to it.
 - Trusted-spender and watched-token lists are on-chain state the packages cannot alter.
 
 **Residual risk:** Within one window's remaining budget, a malicious plan could still send value to an attacker-controlled address — the module meters *how much* leaves, not *where it goes*. Both packages are also pre-1.0 with an explicitly unstable API, so upgrades need re-testing, not just a version bump.
 
 **Not yet done:** hash-pinning (`--require-hashes`) and a pinned lockfile. Recommended before production.
+
+Note the ERC-8004 surface is *narrower* than the other two: registry writes move no ERC20 or native value, so the cap has nothing to meter and a malicious plan there cannot drain the wallet — the worst it achieves is writing a permanent attributed statement from the wallet's address. The one class of registry write that *could* destroy something the cap never sees (`transfer_agent`, giving away an agent NFT — §3.13, non-priced assets) is not exposed to the agent at all; see §4.8.
+
+---
+
+### 4.7 ERC-8004 Registries — Upgradeable Proxies and Attacker-Written Content ⚠️
+
+Two distinct risks arrive with the ERC-8004 tools.
+
+**a) The registries are UUPS proxies.** Both `IdentityRegistry` and `ReputationRegistry` sit behind an owner-controlled implementation that can be swapped without notice — the same class of trust assumption as the mutable oracle in §3.8, but held by a third party rather than by this project's operator. A malicious upgrade could change what `getSummary` returns, what `giveFeedback` records, or make a read revert.
+**Mitigation in place:** `langchain-erc8004` reads `getVersion()` on both registries at toolkit construction and surfaces a major-version drift as a warning through `get_registry_info`, so an ABI change becomes a startup warning rather than a `MismatchedABI` twenty tool calls later. The addresses the toolkit binds to are read off `SessionHandler` itself, not from a package table, so the app and the wallet cannot disagree about which contracts are in play.
+**Residual risk:** A drift *warning* is not a *block*. Nothing stops the tools running against an upgraded registry, and the reputation reads are advisory data rather than a spend authorisation, so the blast radius is a wrong answer, not a wrong transfer.
+
+**b) Registration files and agent metadata are attacker-controlled input.** `agentURI` points at a document written by the agent being inspected; metadata values and feedback tags are likewise chosen by whoever wrote them. Resolving one means the bot makes an **outbound HTTP request to a host the subject chose**, and hands the response to an LLM — a prompt-injection channel that does not require the user to say anything (§4.2).
+**Mitigations in place:** The package enforces SSRF rules on every hop — no `http://`, no private/loopback/link-local hosts, a redirect cap re-checked per hop, a 1 MB size ceiling enforced during the stream and again after decompression, a per-resolution wall-clock budget, and a failure cache so a dead gateway is not re-dialled. The toolkit is constructed with those defaults (`allow_http=False`, `allow_private_hosts=False`). Every resolved document comes back tagged `untrusted_content`, carries `registration_verified` / `verification_reason` for the on-chain join, and `SYSTEM_PROMPT` instructs the agent to treat the contents as data and to state when verification failed.
+**Residual risk:** As with §4.2, the "treat this as data" rule is enforced by the LLM, not by code. The on-chain constraints remain the real bound — a registration file cannot itself move value, so an injection there has to talk the agent into a *separate* spending action that the cap, the contact-only destinations and the confirmation step all still apply to.
+
+---
+
+### 4.8 The Protocol's Agent Identity Is Not a User Asset
+
+**Threat:** `DeploySHProtocol.s.sol` registers **one** ERC-8004 agent per deployment and stores its id in `SHRegistry.agentId`. That identity is shared by every wallet on the chain and its ERC-721 token is held by the protocol operator's key. The ERC-8004 identity writes (`set_agent_uri`, `set_agent_metadata`, `transfer_agent`, `set_agent_wallet`, `unset_agent_wallet`) would let a *user's* session key attempt to repoint, rewrite, rebind or give away that identity. Repointing `agentURI` is the sharpest edge: the registration file is what every other reader resolves to decide whether the protocol's agent is who it claims to be, so a single successful write would let an attacker redirect the whole deployment's published identity — and it costs no value the spending cap could meter.
+
+**Mitigations in place:**
+- **The tools are not exposed.** All eight identity/agent-wallet wrappers are defined in `app/tools.py` but deliberately left out of `get_tools()`, so no prompt can reach them. Only reads and the four *reputation* writes are on the agent's surface.
+- **`tools._reject_protocol_agent_write`** refuses any identity write resolving to `SHRegistry.agentId` before calldata is built, so re-enabling the tools in another deployment still cannot touch the protocol's agent.
+- **On-chain, the wallet is neither owner nor approved operator**, so the registry rejects it independently of anything the app does — verified on a Sepolia fork: `isAuthorizedOrOwner(userWallet, agentId)` is `false`.
+- A user's SessionHandler also cannot acquire an agent of its own: with no ERC-7579 fallback handler for `onERC721Received`, any mint or `safeTransferFrom` to the account reverts.
+
+**Residual risk:** If an operator ever grants a user's wallet `setApprovalForAll` on the identity registry, the on-chain layer stops refusing and only the two app-side guards remain. Don't. Changing the protocol's agent belongs to the operator's own key, off this path entirely.
+
+Note the reputation writes are deliberately *not* restricted this way: a user's wallet rating the protocol's agent is a legitimate attributed review (the self-feedback guard does not fire, since the wallet is not the owner), and it is the main thing users do with these tools.
 
 ---
 

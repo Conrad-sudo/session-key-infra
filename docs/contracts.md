@@ -9,8 +9,8 @@ The account (`SessionHandler`) validates its own UserOperations and manages a se
 ```
 src/
 ├── SHFactory.sol              ← User-facing factory — deploys one SessionHandler per user, assigns sequential walletIds
-├── SHTreasury.sol             ← Protocol operator — owns and administers SHRegistry (fee plumbing present but not charged)
-├── SHRegistry.sol             ← Central config store (treasury, oracle, agentId, router, protocol fee)
+├── SHTreasury.sol             ← Protocol admin root — owns SHRegistry, SHOracle, and SHFactory; fee sink
+├── SHRegistry.sol             ← Central config store — every address a wallet needs (EntryPoint, both ERC-8004 registries, module, oracle, treasury, fee, agentId)
 ├── SHOracle.sol               ← Chainlink-based USD value converter
 ├── SessionHandler.sol         ← ERC-7579 smart account — self-validation, session-key allowlist, cap config, admin guard
 ├── SpendingLimitModule.sol   ← ERC-7579 Hook (type 4 only) — global USD spending cap (net-value metering)
@@ -28,7 +28,7 @@ src/
     └── MockWeth.sol               ← WETH mock with deposit/withdraw for Anvil
 
 script/
-├── DeploySHProtocol.s.sol     ← Deployment entry point (SHOracle → agent registration → SHTreasury → SpendingLimitModule → SHFactory)
+├── DeploySHProtocol.s.sol     ← Deployment entry point (SHTreasury → SHOracle → agent → SHRegistry → setRegistry → module → setSpendingLimitModule → SHFactory → setFactory)
 ├── Constants.s.sol            ← Chain IDs, canonical addresses, per-network token/Chainlink-feed addresses, Anvil mock prices
 ├── HelperConfig.s.sol         ← Chain-specific configuration resolver (Mainnet, Sepolia, BSC, Anvil)
 └── SendPackedUserOp.s.sol     ← ERC-7579 UserOp construction and signing helper (single + batch)
@@ -54,26 +54,67 @@ test/
 
 ## `SHRegistry.sol`
 
-The `SHRegistry` is the central configuration store. Deployed `SessionHandler` wallets read runtime parameters — treasury address, price oracle, agent identity, and Uniswap/PancakeSwap router — from this single contract, so any parameter can be updated by the operator without redeploying user wallets. It is owned by `SHTreasury`, and all admin flows through `SHTreasury`'s pass-through setters.
+The `SHRegistry` is the central configuration store. Deployed `SessionHandler` wallets read runtime parameters — protocol fee, treasury address, price oracle, and agent identity — from this single contract, so any parameter can be updated by the operator without redeploying user wallets. It is owned by `SHTreasury`, and all admin flows through `SHTreasury`'s pass-through setters. The `owner` is supplied to the constructor rather than taken from `msg.sender`, so the registry is deployed already owned by the treasury with no follow-up `transferOwnership`.
 
 **Stored parameters:**
 
 | Parameter | Type | Purpose |
 |---|---|---|
-| `protocolFee` | `uint256` | Flat ETH fee config (capped at `MAX_PROTOCOL_FEE = 0.001 ether`). **Retained but no longer charged** — `SessionHandler.execute` does not collect a per-execution fee in the current design. |
-| `treasury` | `address` | `SHTreasury` — fee sink and registry owner |
+| `protocolFee` | `uint256` | **USD-denominated** fee (18 decimals) charged on every session-key execution, bounded to `[MIN_PROTOCOL_FEE, MAX_PROTOCOL_FEE]` = **$0.015–$0.15**. Converted to native per execution by `getFee()`. See [Protocol fee](#protocol-fee) below. |
+| `treasury` | `address` | `SHTreasury` — fee sink and admin root (owns this registry, the oracle, and the factory) |
 | `priceOracle` | `address` | Canonical `SHOracle` address for USD accounting. **Also governs spending-cap enforcement** — `SpendingLimitModule` resolves it from here on every valuation, so changing it changes how every deployed wallet meters spending. See [THREAT_MODEL.md](../THREAT_MODEL.md) §3.8. |
-| `agentId` | `uint256` | ERC-8004 token ID of the registered protocol agent |
-| `router` | `address` | Uniswap V2-compatible router (Uniswap on mainnet/Sepolia, PancakeSwap on BSC); `address(0)` on chains without one. Auto-trusted as a spender on each wallet at deploy. |
+| `agentId` | `uint256` | ERC-8004 token ID of the registered protocol agent. **`0` is a valid id** — ERC-8004 registries mint from 0, so no zero-check exists or should. |
+| `spendingLimitModule` | `address` | Hook installed on wallets deployed from here on. Owner-settable; **not** a constructor arg — see below. Changing it never touches existing wallets. |
+| `ENTRY_POINT` | `address` (immutable) | Canonical ERC-4337 EntryPoint baked into every wallet |
+| `REPUTATION_REGISTRY` | `address` (immutable) | Reputation Registry baked into every wallet |
+| `IDENTITY_REGISTRY` | `address` (immutable) | ERC-8004 Identity Registry baked into every wallet |
+| `factory` | `address` | The SHFactory deploying against this registry. Off-chain discoverability only — no contract reads it. |
 
 ```solidity
-uint256 public constant MAX_PROTOCOL_FEE = 0.001 ether;
+uint256 public constant MAX_PROTOCOL_FEE = 15e16;   // $0.15, USD @ 18 decimals
+uint256 public constant MIN_PROTOCOL_FEE = 15e15;   // $0.015, USD @ 18 decimals
 
+uint256 public constant ORACLE_TIMELOCK = 2 days;
+
+function getFee() external view returns (uint256);   // protocolFee priced into wei, live
 function setProtocolFee(uint256 newFee) external onlyOwner;
 function setTreasury(address newTreasury) external onlyOwner;
-function setPriceOracle(address newOracle) external onlyOwner;
 function setAgentId(uint256 newId) external onlyOwner;
+function setSpendingLimitModule(address newModule) external onlyOwner;
+function setFactory(address newFactory) external onlyOwner;
+
+// Oracle changes are two-phase and delayed (see below)
+function proposePriceOracle(address newOracle) external onlyOwner;
+function commitPriceOracle() external onlyOwner;
+function cancelPriceOracle() external onlyOwner;
+address public pendingPriceOracle;
+uint256 public pendingPriceOracleEta;
 ```
+
+> **`setPriceOracle` was replaced by a two-phase timelock.** The oracle governs every wallet's spending cap, so repointing it is the single highest-impact action the operator key can take. `proposePriceOracle` records the candidate and starts a 2-day delay; `commitPriceOracle` applies it once the ETA passes; `cancelPriceOracle` withdraws it. `proposePriceOracle` also **rejects an oracle that cannot price native (`address(0)`)**, and **the constructor makes the same check on the initial oracle**. Two paths depend on that feed: the module meters the native balance delta on every metered transaction, and `getFee` prices the protocol fee on every session-key execution — so an oracle without it would leave deployed wallets unable to execute at all. The check also catches a mistyped or wrong-network address, which has no `isPriced()` to call. See [THREAT_MODEL.md](../THREAT_MODEL.md) §3.8.
+
+> **Why `spendingLimitModule` is not a constructor argument.** `SpendingLimitModule`'s own constructor reads `priceOracle()` off the registry — that check is what catches a mis-wired deployment (passing the oracle address where the registry belongs). So the registry must exist before the module can be deployed. Taking the module as a registry constructor argument would make the two mutually undeployable. The deploy script constructs the module against the live registry and then calls `setSpendingLimitModule`; `SHFactory.deployWallet` reverts with `SHFactory_SpendingLimitModuleNotSet` in the window between.
+
+### Protocol fee
+
+The fee is **stored in USD and charged in native**. `SHRegistry` holds `protocolFee` as an 18-decimal dollar figure; `SessionHandler` converts it at execution time:
+
+```
+SessionHandler._extractFee()
+  └─ SHRegistry.getFee()
+       └─ SHOracle.getNativeFee(protocolFee)
+            └─ (protocolFee × 1e18) / getPrice(address(0), 1e18)
+```
+
+At $0.015 with ETH at $2500 that is `0.015e18 × 1e18 / 2500e18` = `6e12` wei. The dollar cost per execution stays fixed as ETH moves, where a stored wei amount would silently re-price itself. `setProtocolFee` therefore sets what users pay in dollars, and needs no revisiting on price moves.
+
+Three properties worth knowing:
+
+- **Only session-key executions pay.** `execute` charges the fee when `msg.sender != owner()`; owner-initiated calls pay nothing. `executeFromExecutor` always charges.
+- **The fee is outside the spending cap.** `_extractFee` runs *before* `_execute`, and the hook's `preCheck`→`postCheck` window opens inside `_execute` — so the fee never counts against the account's USD cap. This is deliberate: the cap meters what the *user* spends, and a protocol fee is not the user's spend. It does mean the fee is native outflow the cap cannot see, bounded per execution by `MAX_PROTOCOL_FEE` rather than by the cap.
+- **The ETH/USD feed is now a liveness dependency for all session execution.** Every fee charge prices native, so a stale ETH/USD feed reverts *any* session-key execution — including one that only moves ERC-20s, which under the old flat-wei fee never touched the native feed. See [THREAT_MODEL.md](../THREAT_MODEL.md) §3.7.
+
+`totalFeesCollected` on `SHTreasury` sums **wei**, struck at whatever price applied to each execution. It is not a dollar total and cannot be converted into one with a spot price after the fact.
 
 > `router` / `setUniswapRouter` were **removed**: which DEX a wallet trades on is a wallet-level choice, not protocol configuration. Wallets now start with an empty trusted-spender list and the owner grants a router explicitly via `addTrustedSpender`.
 
@@ -83,28 +124,53 @@ function setAgentId(uint256 newId) external onlyOwner;
 
 ## `SHTreasury.sol`
 
-`SHTreasury` is the protocol operator and fee-sink contract. It deploys its own `SHRegistry` in its constructor — establishing `address(this)` as the canonical registry owner and fee destination atomically — and holds exclusive write access to it. It can still receive ETH and hold accumulated balance, though the account no longer pushes a fee on each execution.
+`SHTreasury` is the protocol's **single admin root** and fee sink. It owns the `SHRegistry`, the `SHOracle`, and the `SHFactory`, and is the only address that can drive their owner-only functions — the operator EOA owns the treasury and reaches everything else through its pass-through setters.
+
+```
+operator EOA → SHTreasury → { SHRegistry, SHOracle, SHFactory }
+```
+
+It is deployed **first**, with no constructor dependencies, so its address is available as the `owner` argument to all three. The one back-reference it needs — the registry it administers — is wired in afterwards by `setRegistry`, which is **write-once**: a second call reverts, so `REGISTRY` carries the same guarantee an `immutable` would.
+
+The oracle and factory pass-throughs take their target's address as an argument rather than reading a stored one. For the oracle that is what lets a **replacement oracle be seeded with feeds while it sits pending in the timelock**, before it becomes live; for the factory it means the protocol can run more than one factory without redeploying the treasury.
 
 ```solidity
-constructor(
-    uint256 initialFee,      // starting protocol fee config in wei
-    address priceOracle,     // SHOracle address
-    uint256 initialAgentId,  // ERC-8004 agent token ID
-    address uniswapRouter    // address(0) on chains without a Uniswap V2-compatible router
-);
+constructor();  // no dependencies: deployed first, owns everything deployed after it
+
+// One-time wiring, called by the deploy script right after SHRegistry is constructed
+function setRegistry(address registry) external onlyOwner;   // reverts if already set
 
 // Balance management
 receive() external payable;                                                   // totalFeesCollected += msg.value
 function withdraw(address recipient, uint256 amount) external onlyOwner nonReentrant;
 function withdrawAll(address recipient) external onlyOwner nonReentrant;
 
-// Registry pass-through admin
+// Registry pass-through admin (all `registrySet`-guarded)
 function setProtocolFee(uint256 newFee) external onlyOwner;
-function setPriceOracle(address newOracle) external onlyOwner;
 function setTreasury(address newTreasury) external onlyOwner;
 function setAgentId(uint256 newId) external onlyOwner;
+function proposePriceOracle(address newOracle) external onlyOwner;
+function commitPriceOracle() external onlyOwner;
+function cancelPriceOracle() external onlyOwner;
 
-address public immutable REGISTRY;
+// Oracle pass-through admin (target passed in, so a pending oracle can be seeded)
+function setFeed(address oracle, address token, address priceFeed, uint256 heartbeat) external onlyOwner;
+function removeOracleFeed(address oracle, address token) external onlyOwner;
+
+// Factory pass-through admin (target passed in, so multiple factories are supported)
+function pauseFactory(address factory) external onlyOwner;
+function unpauseFactory(address factory) external onlyOwner;
+
+// Registry-held wallet config (the module lives on the registry, so one call covers every factory)
+function setSpendingLimitModule(address newModule) external onlyOwner;
+function setFactory(address newFactory) external onlyOwner;
+
+// One-way migration: hands registry + oracle + factory to a successor owner or multi-sig.
+// Does NOT move this contract's own ownership, nor redirect the fee stream — call setTreasury
+// first if that is the intent, since afterwards this contract can no longer reach the registry.
+function transferProtocol(address newOwner) external onlyOwner;
+
+address public REGISTRY;          // write-once via setRegistry
 uint256 public totalFeesCollected;
 ```
 
@@ -116,33 +182,33 @@ uint256 public totalFeesCollected;
 
 `deployWallet` takes the per-wallet spending-cap config so each wallet is born with a cap, a window, and its watched-token set:
 
+The factory stores **no** protocol addresses of its own. EntryPoint, both ERC-8004 registries, and the `SpendingLimitModule` are read off the registry at `deployWallet` time, so correcting any of them is a single registry call rather than a factory redeploy. `SHFactory` itself owns only the clone implementation and the wallet index.
+
 ```solidity
 constructor(
-    address _entryPoint,
-    address _feeRegistry,        // SHRegistry address
-    address _reputationRegistry, // ERC-8004 ReputationRegistry
-    address _identityRegistry,   // ERC-8004 IdentityRegistry
-    address _module              // SpendingLimitModule installed on every clone
+    address owner,      // SHTreasury — the admin root
+    address _registry   // SHRegistry; every other address is read from it at deploy-wallet time
 );
 
 /// Deploys a new SessionHandler owned by msg.sender; forwards msg.value as ETH prefund.
 /// dailyLimitUsd (18 decimals, >= 0), windowDuration (seconds, > 0), and watchedTokens (each
 /// must already be priced by the oracle) seed the hook's onInstall config.
-/// Reverts with SHFactory_SpendingLimitModuleNotSet if the module hasn't been configured.
+/// Reverts with SHFactory_SpendingLimitModuleNotSet if the registry has no module set yet.
 function deployWallet(int256 dailyLimitUsd, uint256 windowDuration, address[] calldata watchedTokens)
     external payable whenNotPaused returns (address);
 
-function setSpendingLimitModule(address newModule) external onlyOwner;
-function pause() external onlyOwner;
-function unpause() external onlyOwner;
+function pause() external onlyOwner;      // via SHTreasury.pauseFactory
+function unpause() external onlyOwner;    // via SHTreasury.unpauseFactory
 
-address public spendingLimitModule;
-uint256 public totalWallets = 1;           // next walletId to assign (wallet IDs start at 1)
+SHRegistry public immutable REGISTRY;
+address public immutable IMPLEMENTATION;
+uint256 public totalWallets;               // next walletId to assign (wallet IDs start at 0)
 mapping(uint256 => address) public wallets;
 
 event WalletDeployed(address indexed walletAddress, address indexed owner, uint256 indexed walletId);
-event SpendingLimitModuleUpdated(address indexed oldModule, address indexed newModule);
 ```
+
+> `setSpendingLimitModule` moved to `SHRegistry` — every factory reads the module from there, so one call now covers them all. Note also that `totalWallets` starts at **0**, so the first wallet has id `0`; `wallets[0]` is a real wallet, not an "unset" sentinel.
 
 ---
 
@@ -383,11 +449,17 @@ Orchestrates deployment of all shared infrastructure. Individual `SessionHandler
 **Deployment sequence:**
 
 1. Instantiate `HelperConfig`; build parallel `(tokens, priceFeeds, heartbeats)` arrays.
-2. Deploy `SHOracle(tokens, priceFeeds, heartbeats)`.
-3. Call `IIdentityRegistry.register(AGENT_URI)` to mint the agent NFT and obtain `agentId`.
-4. Deploy `SHTreasury(initialFee, address(oracle), agentId, router)` — its constructor deploys `SHRegistry`.
-5. Deploy `SpendingLimitModule(treasury.REGISTRY())` — wired to the **registry**, from which it resolves the current oracle on every valuation (no interpreter).
-6. Deploy `SHFactory(entryPoint, treasury.REGISTRY(), reputationRegistry, identityRegistry, address(module))` — the factory deploys the `SessionHandler` implementation it clones from internally.
+2. Deploy `SHTreasury()` — the admin root, deployed **first** so its address can own everything below.
+3. Deploy `SHOracle(address(treasury), tokens, priceFeeds, heartbeats)` — born owned by the treasury.
+4. Call `IIdentityRegistry.register(AGENT_URI)` to mint the agent NFT and obtain `agentId`.
+5. Deploy `SHRegistry(address(treasury), initialFee, address(treasury), address(oracle), agentId)` — owned by the treasury and paying fees to it.
+6. Call `treasury.setRegistry(address(registry))` — write-once, fixing the pairing.
+6b. Deploy `SpendingLimitModule(address(registry))` — wired to the **registry**, from which it resolves the current oracle on every valuation (no interpreter). Must come after the registry: its constructor reads `priceOracle()` off it.
+7. Call `treasury.setSpendingLimitModule(address(module))` — the module could not be a registry constructor argument (see the registry section), so it is registered here.
+8. Deploy `SHFactory(address(treasury), address(registry))` — just owner and registry. Every other address a wallet needs is read off the registry at `deployWallet` time, so the factory stores none of them. It deploys the `SessionHandler` implementation it clones from internally.
+9. Call `treasury.setFactory(address(factory))` — records the factory on the registry for off-chain discoverability.
+
+No `transferOwnership` step is needed anywhere, and at no point does the deployer EOA own a live contract other than the treasury.
 
 ```solidity
 function run() external returns (SHFactory factory, SHTreasury treasury, HelperConfig.NetworkConfig memory config, SHOracle oracle);

@@ -4,20 +4,39 @@ pragma solidity ^0.8.24;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {SHRegistry} from "./SHRegistry.sol";
+import {SHOracle} from "./SHOracle.sol";
+import {SHFactory} from "./SHFactory.sol";
 
 /**
  * @title SHTreasury
  * @author Conrad Japhet
- * @notice Receives protocol fees from SessionHandler wallets and administers the SHRegistry.
- * @dev Deploys its own SHRegistry in the constructor, so `address(this)` is the canonical
- *      treasury address from day one — no post-deployment ownership transfers required.
+ * @notice Receives protocol fees from SessionHandler wallets and is the protocol's single admin
+ *         root: it owns the SHRegistry, the SHOracle, and the SHFactory, and is the only address
+ *         that can drive their owner-only functions.
+ * @dev The registry is deployed separately and wired in once via {setRegistry}, rather than being
+ *      constructed here. That ordering is what lets every other contract be deployed already owned
+ *      by this treasury instead of needing a follow-up transferOwnership: this contract is deployed
+ *      FIRST, so its address is available as the `owner` argument to all of them.
+ *
+ *      Ownership graph:
+ *        operator EOA → SHTreasury → { SHRegistry, SHOracle, SHFactory }
  *
  *      Fee flow:
- *        SessionHandler.execute() → payable(FEE_REGISTRY.treasury()).call{value: fee}()
+ *        SessionHandler.execute() → payable(REGISTRY.treasury()).call{value: fee}()
  *                                 → SHTreasury.receive()
  *
+ *      The fee is configured in USD on the registry and converted to native per execution by
+ *      {SHRegistry-getFee}, so what arrives here is a wei amount that varies with the ETH price
+ *      while the dollar value each user paid stays fixed.
+ *
  *      Admin flow:
- *        Protocol operator → SHTreasury.set*() → SHRegistry.set*()
+ *        Protocol operator → SHTreasury.<passthrough>() → SHRegistry / SHOracle / SHFactory
+ *
+ *      The oracle and factory passthroughs take their target's address as an argument rather than
+ *      reading a stored one. For the oracle that is what allows a REPLACEMENT oracle to be seeded
+ *      with feeds while it sits pending in {SHRegistry-proposePriceOracle}'s timelock, before it
+ *      becomes the live one; for the factory it means the protocol can run more than one factory
+ *      without this contract needing to be redeployed to learn about each.
  */
 contract SHTreasury is Ownable, ReentrancyGuard {
     /*//////////////////////////////////////////////////////////////
@@ -32,15 +51,36 @@ contract SHTreasury is Ownable, ReentrancyGuard {
     error SHTreasury_InvalidAmount();
     /// @dev Thrown when address(0) is passed as the withdrawal recipient.
     error SHTreasury_InvalidRecipient();
+    /// @dev Thrown when address(0) is passed to {setRegistry}.
+    error SHTreasury_InvalidRegistry();
+    /// @dev Thrown when {setRegistry} is called after the registry has already been wired in. The
+    ///      registry is set exactly once, at deployment, so it is effectively immutable afterwards.
+    error SHTreasury_RegistryAlreadySet();
+    /// @dev Thrown when a passthrough is called before {setRegistry} has wired in the registry.
+    error SHTreasury_RegistryNotSet();
+    /// @dev Thrown when address(0) is passed as the new owner to {transferProtocol}, which would
+    ///      renounce protocol admin outright rather than migrate it.
+    error SHTreasury_InvalidNewOwner();
+    /// @dev Thrown by {transferProtocol} when the registry has no factory recorded yet.
+    error SHTreasury_InvalidFactory();
 
     /*//////////////////////////////////////////////////////////////
                              STATE VARIABLES
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice The SHRegistry deployed and owned by this treasury.
-    address public immutable REGISTRY;
+    /// @notice The SHRegistry owned by this treasury.
+    /// @dev Typed rather than a bare address so every passthrough below reads as a plain call.
+    ///      Not `immutable`, and NOT a constructor argument, only because this contract must be
+    ///      deployed BEFORE the registry — the registry takes this address as both its owner and its
+    ///      fee recipient, so it cannot exist first. {setRegistry} writes this exactly once and it
+    ///      can never change afterwards, so it carries the same guarantee an immutable would.
+    SHRegistry public REGISTRY;
 
     /// @notice Cumulative ETH received as protocol fees since deployment.
+    /// @dev Wei, not USD. Fees are set in USD but arrive converted, so this sums amounts struck at
+    ///      different ETH prices and multiplying it by a spot price does not give dollar revenue.
+    ///      Deriving that needs each execution's price, which is off-chain work: ProtocolFeePaid
+    ///      carries the wei charged, not the rate it was charged at.
     uint256 public totalFeesCollected;
 
     /*//////////////////////////////////////////////////////////////
@@ -52,24 +92,41 @@ contract SHTreasury is Ownable, ReentrancyGuard {
     /// @param amount    The amount withdrawn in wei.
     event FeesWithdrawn(address indexed recipient, uint256 amount);
 
+    /// @notice Emitted once, at deployment, when the registry is wired in.
+    /// @param registry The SHRegistry this treasury administers.
+    event RegistrySet(address indexed registry);
+
     /*//////////////////////////////////////////////////////////////
                                CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Deploys the treasury and its SHRegistry in one transaction.
-     * @dev The SHRegistry is deployed with `address(this)` as the treasury, so fees
-     *      flow here from the moment the first SessionHandler goes live. The SHRegistry's
-     *      Ownable owner is also set to `address(this)`, so all registry admin passes
-     *      through this contract.
-     * @param initialFee     Starting protocol fee in wei. Must be within
-     *                       [SHRegistry.MIN_PROTOCOL_FEE, SHRegistry.MAX_PROTOCOL_FEE].
-     * @param priceOracle    Address of the deployed SHOracle. Must not be address(0).
-     * @param initialAgentId Id of the SessionHandler ERC-4337 AI agent on the ERC-8004 Identity Registry.
+     * @notice Deploys the treasury, owned by the protocol operator.
+     * @dev Deliberately takes no dependencies: this contract is deployed FIRST so that its address
+     *      can be passed as the `owner` argument to the SHOracle, SHRegistry, and SHFactory
+     *      constructors. The registry is wired back in afterwards with {setRegistry}.
      */
-    constructor(uint256 initialFee, address priceOracle, uint256 initialAgentId) Ownable(msg.sender) {
-        SHRegistry registry = new SHRegistry(initialFee, address(this), priceOracle, initialAgentId);
-        REGISTRY = address(registry);
+    constructor() Ownable(msg.sender) {}
+
+    /// @dev Reverts if the registry has not been wired in yet. Guards every passthrough, so an
+    ///      admin call made before {setRegistry} fails loudly instead of calling into address(0).
+    modifier registrySet() {
+        if (address(REGISTRY) == address(0)) revert SHTreasury_RegistryNotSet();
+        _;
+    }
+
+    /**
+     * @notice Wires in the SHRegistry this treasury administers. Callable once, by the owner.
+     * @dev Called by the deploy script immediately after the registry is constructed. Permanent:
+     *      a second call reverts, so the registry cannot be swapped out from under the wallets
+     *      that read it.
+     * @param registry The deployed SHRegistry, which must already have this contract as its owner.
+     */
+    function setRegistry(address registry) external onlyOwner {
+        if (registry == address(0)) revert SHTreasury_InvalidRegistry();
+        if (address(REGISTRY) != address(0)) revert SHTreasury_RegistryAlreadySet();
+        REGISTRY = SHRegistry(registry);
+        emit RegistrySet(registry);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -117,20 +174,71 @@ contract SHTreasury is Ownable, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Updates the protocol fee charged on every session-key execution. Only callable by the owner.
-     * @param newFee The new fee in wei. Must be within
-     *               [SHRegistry.MIN_PROTOCOL_FEE, SHRegistry.MAX_PROTOCOL_FEE].
+     * @notice Hands ownership of the registry, the live oracle, and the recorded factory to
+     *         `newOwner` in one transaction. Only callable by the owner.
+     * @dev The migration path to a successor treasury or a multi-sig. ONE-WAY: this contract loses
+     *      the ability to drive any of the three the moment it returns, so every passthrough below
+     *      starts reverting and only `newOwner` can undo it. Pass an address you control and have
+     *      tested — a wrong one strands protocol admin permanently.
+     * @dev Deliberately does NOT move this contract's own ownership, nor redirect the fee stream:
+     *      the registry's `treasury` still points here, so fees keep arriving and {withdraw} keeps
+     *      working for the current owner. Call {setTreasury} FIRST if the intent is to move the fee
+     *      stream too — afterwards this contract can no longer reach it.
+     * @dev Reverts if the registry has no factory recorded, since {SHRegistry-setFactory} is a
+     *      post-deployment step and calling into address(0) would revert unhelpfully.
+     * @param newOwner The address to receive ownership of all three. Must not be address(0).
      */
-    function setProtocolFee(uint256 newFee) external onlyOwner {
-        SHRegistry(REGISTRY).setProtocolFee(newFee);
+    function transferProtocol(address newOwner) external onlyOwner registrySet {
+        if (newOwner == address(0)) revert SHTreasury_InvalidNewOwner();
+        address factory = REGISTRY.factory();
+        if (factory == address(0)) revert SHTreasury_InvalidFactory();
+
+        SHOracle(REGISTRY.priceOracle()).transferOwnership(newOwner);
+        SHFactory(factory).transferOwnership(newOwner);
+        // Last: once the registry moves, priceOracle()/factory() are still readable but this
+        // contract can no longer administer anything, so nothing above could be retried.
+        REGISTRY.transferOwnership(newOwner);
     }
 
     /**
-     * @notice Updates the canonical SHOracle used by all SessionHandler wallets. Only callable by the owner.
-     * @param newOracle The new SHOracle address. Must not be address(0).
+     * @notice Updates the protocol fee charged on every session-key execution. Only callable by the owner.
+     * @dev The fee is USD-denominated; each SessionHandler converts it to native at execution time
+     *      through {SHRegistry-getFee}. So this sets what a user pays in dollars, and the wei amount
+     *      follows the ETH price on its own.
+     * @param newFee The new fee, in USD with 18 decimals. Must be within
+     *               [SHRegistry.MIN_PROTOCOL_FEE, SHRegistry.MAX_PROTOCOL_FEE].
      */
-    function setPriceOracle(address newOracle) external onlyOwner {
-        SHRegistry(REGISTRY).setPriceOracle(newOracle);
+    function setProtocolFee(uint256 newFee) external onlyOwner registrySet {
+        REGISTRY.setProtocolFee(newFee);
+    }
+
+    /**
+     * @notice Proposes a new canonical SHOracle for all SessionHandler wallets, starting the
+     *         registry's {SHRegistry-ORACLE_TIMELOCK} delay. Only callable by the owner.
+     * @dev Changing the oracle is a two-step, delayed operation: propose here, then
+     *      {commitPriceOracle} once the delay elapses, or {cancelPriceOracle} to withdraw. The
+     *      oracle governs every wallet's spending cap, so the delay makes the change publicly
+     *      observable before it binds (THREAT_MODEL §3.8).
+     * @param newOracle The new SHOracle address. Must not be address(0) and must price native.
+     */
+    function proposePriceOracle(address newOracle) external onlyOwner registrySet {
+        REGISTRY.proposePriceOracle(newOracle);
+    }
+
+    /**
+     * @notice Commits the pending oracle proposal once its delay has elapsed. Only callable by the owner.
+     * @dev Reverts if no proposal is outstanding or the ETA has not passed. Takes effect on every
+     *      deployed wallet's next valuation.
+     */
+    function commitPriceOracle() external onlyOwner registrySet {
+        REGISTRY.commitPriceOracle();
+    }
+
+    /**
+     * @notice Withdraws the pending oracle proposal before it is committed. Only callable by the owner.
+     */
+    function cancelPriceOracle() external onlyOwner registrySet {
+        REGISTRY.cancelPriceOracle();
     }
 
     /**
@@ -139,8 +247,8 @@ contract SHTreasury is Ownable, ReentrancyGuard {
      *      longer flow to this contract — ensure the new treasury is ready before calling.
      * @param newTreasury The new treasury address. Must not be address(0).
      */
-    function setTreasury(address newTreasury) external onlyOwner {
-        SHRegistry(REGISTRY).setTreasury(newTreasury);
+    function setTreasury(address newTreasury) external onlyOwner registrySet {
+        REGISTRY.setTreasury(newTreasury);
     }
 
     /**
@@ -148,7 +256,82 @@ contract SHTreasury is Ownable, ReentrancyGuard {
      * @dev Reverts if newId is 0 or equal to the current agentId.
      * @param newId The new agentId. Must not be 0 and must differ from the current agentId.
      */
-    function setAgentId(uint256 newId) external onlyOwner {
-        SHRegistry(REGISTRY).setAgentId(newId);
+    function setAgentId(uint256 newId) external onlyOwner registrySet {
+        REGISTRY.setAgentId(newId);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              ORACLE ADMIN
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Registers or repoints a price feed on an SHOracle this treasury owns. Only callable
+     *         by the owner.
+     * @dev `oracle` is an argument rather than the registry's current oracle so that a REPLACEMENT
+     *      oracle can be given its full feed set while it is still pending in the
+     *      {SHRegistry-ORACLE_TIMELOCK}, and so a feed can be corrected on the live oracle either
+     *      way. Feeds take effect on the live oracle immediately, with no delay — the timelock
+     *      governs WHICH oracle wallets read, not what any oracle contains (THREAT_MODEL §3.8).
+     * @param oracle    The SHOracle to write to. Must be owned by this treasury.
+     * @param token     Token to price. Use address(0) for native.
+     * @param priceFeed Chainlink USD aggregator for it. Must not be address(0).
+     * @param heartbeat That feed's Chainlink-published heartbeat, in seconds. Must be > 0.
+     */
+    function setFeed(address oracle, address token, address priceFeed, uint256 heartbeat) external onlyOwner {
+        SHOracle(oracle).setFeed(token, priceFeed, heartbeat);
+    }
+
+    /**
+     * @notice Deregisters a token from an SHOracle this treasury owns. Only callable by the owner.
+     * @dev The oracle refuses to remove the native feed. Accounts watching `token` will revert on
+     *      their next transaction that moves it — have them unwatch it first.
+     * @param oracle The SHOracle to write to. Must be owned by this treasury.
+     * @param token  The token to stop pricing. Must not be address(0).
+     */
+    function removeOracleFeed(address oracle, address token) external onlyOwner {
+        SHOracle(oracle).removeFeed(token);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             FACTORY ADMIN
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Halts new wallet deployments on a factory this treasury owns. Only callable by the owner.
+     * @dev `factory` is an argument so the protocol can run more than one factory (e.g. alongside a
+     *      successor) without redeploying this contract to learn about each.
+     * @param factory The SHFactory to pause. Must be owned by this treasury.
+     */
+    function pauseFactory(address factory) external onlyOwner {
+        SHFactory(factory).pause();
+    }
+
+    /**
+     * @notice Resumes wallet deployments on a factory this treasury owns. Only callable by the owner.
+     * @param factory The SHFactory to unpause. Must be owned by this treasury.
+     */
+    function unpauseFactory(address factory) external onlyOwner {
+        SHFactory(factory).unpause();
+    }
+
+    /**
+     * @notice Sets the SpendingLimitModule installed on wallets deployed from this point on. Only
+     *         callable by the owner.
+     * @dev Lives on the REGISTRY, not the factory: every factory reads the module from the registry,
+     *      so one call covers them all. Does not touch wallets already deployed — they keep the
+     *      module they were initialized with.
+     * @param newModule The deployed SpendingLimitModule address. Must not be address(0).
+     */
+    function setSpendingLimitModule(address newModule) external onlyOwner registrySet {
+        REGISTRY.setSpendingLimitModule(newModule);
+    }
+
+    /**
+     * @notice Records the SHFactory deploying wallets against the registry. Only callable by the owner.
+     * @dev Called by the deploy script once the factory exists. Off-chain discoverability only.
+     * @param newFactory The SHFactory address. Must not be address(0).
+     */
+    function setFactory(address newFactory) external onlyOwner registrySet {
+        REGISTRY.setFactory(newFactory);
     }
 }

@@ -123,7 +123,9 @@ rule requires, on every flow, without any project-side patching.
   `check_spending_within_budget`, `get_session_keys`, `get_all_sessions` — session-key and
   USD-cap logic.
 - contacts / `get_supported_tokens` / `get_native_asset` — DB layer.
-- ERC-8004 tools.
+- `get_agent_id` — reads `SHRegistry.agentId()`, project-specific. (The ERC-8004 *tools* have
+  since moved to `langchain-erc8004` on the same pattern — see the ERC-8004 section of
+  `docs/app.md`.)
 
 ### Must **not** be exposed to the agent
 

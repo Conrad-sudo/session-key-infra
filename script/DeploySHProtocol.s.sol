@@ -4,6 +4,7 @@ import {Script} from "forge-std/Script.sol";
 import {HelperConfig} from "./HelperConfig.s.sol";
 import {SHOracle} from "../src/SHOracle.sol";
 import {SHTreasury} from "../src/SHTreasury.sol";
+import {SHRegistry} from "../src/SHRegistry.sol";
 import {SHFactory} from "../src/SHFactory.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
 import {SpendingLimitModule} from "../src/SpendingLimitModule.sol";
@@ -12,19 +13,29 @@ import "./Constants.s.sol";
 /**
  * @title DeploySHProtocol
  * @notice Deployment script for the SessionHandler protocol's shared infrastructure
- * @dev Retrieves network configuration from HelperConfig and deploys the SHOracle,
- *      SHTreasury (which deploys its own SHRegistry), SpendingLimitModule, and SHFactory.
- *      Individual SessionHandler wallets are deployed later via SHFactory.deployWallet().
+ * @dev Retrieves network configuration from HelperConfig and deploys the SHTreasury, SHOracle,
+ *      SHRegistry, SpendingLimitModule, and SHFactory. Individual SessionHandler wallets are
+ *      deployed later via SHFactory.deployWallet().
  *
- *      Deployment is broadcast as config.account so that account becomes the
- *      Ownable owner of SHTreasury and SHFactory.
+ *      SHTreasury is the protocol's single admin root and is therefore deployed FIRST, so its
+ *      address can be passed as the `owner` argument to the oracle, registry, and factory. Every
+ *      one of them is born already owned by the treasury — no transferOwnership step, and no
+ *      window in which the deployer EOA owns a live contract. The one back-reference the treasury
+ *      needs (the registry it administers) is wired in afterwards with setRegistry, which is
+ *      write-once.
+ *
+ *      Ownership graph after this script:
+ *        config.account → SHTreasury → { SHRegistry, SHOracle, SHFactory }
+ *
+ *      Deployment is broadcast as config.account so that account becomes the Ownable owner of
+ *      SHTreasury, and thereby the root of everything below it.
  *
  *      Supported networks are determined by HelperConfig:
  *      - Anvil (chainid 31337): deploys a local EntryPoint and uses the default anvil account
  *      - Live networks: uses the canonical ERC-4337 EntryPoint and the configured account
  */
 contract DeploySHProtocol is Script {
-    uint256 public constant INITIAL_PROTOCOL_FEE = 0.0002 ether;
+    uint256 public constant INITIAL_PROTOCOL_FEE = 0.02e18;
     string public constant AGENT_URI = "ipfs://QmZyYpLh7qjH1n9Zt2Xqj8Vh5v6s9z5X7w8y9z0a1b2c3/metadata.json";
 
     /**
@@ -34,11 +45,12 @@ contract DeploySHProtocol is Script {
      *
      *      Deployment steps:
      *      1. Instantiate HelperConfig to resolve chain-specific configuration
-     *      2. Broadcast as config.account to set it as the Ownable owner
-     *      3. Deploy SHOracle, then SHTreasury (which deploys its own SHRegistry), then SHFactory
+     *      2. Broadcast as config.account to set it as the Ownable owner of the treasury
+     *      3. Deploy SHTreasury first, then SHOracle and SHRegistry owned by it, wire the registry
+     *         back into the treasury, then the SpendingLimitModule and SHFactory
      *
      * @return factory  The newly deployed SHFactory used to deploy individual SessionHandler wallets
-     * @return treasury The newly deployed SHTreasury that owns the SHRegistry
+     * @return treasury The newly deployed SHTreasury that owns the registry, oracle, and factory
      * @return config   The resolved NetworkConfig containing the entryPoint address and deployer account
      * @return oracle   The newly deployed SHOracle
      */
@@ -127,24 +139,49 @@ contract DeploySHProtocol is Script {
 
         vm.deal(config.account, 100 ether); // Fund the deployer account with 10 ETH for deployment costs
 
-        // Broadcast as config.account so it becomes the Ownable owner of SHTreasury and SHFactory
+        // Broadcast as config.account so it becomes the Ownable owner of SHTreasury — and, through
+        // it, the root of the registry, oracle, and factory deployed below.
         vm.startBroadcast(config.account);
 
-        //deploy price oracle
-        oracle = new SHOracle(tokens, priceFeeds, heartbeats);
-        //register the agent
+        // 1. The admin root, deployed first so its address can own everything that follows.
+        treasury = new SHTreasury();
+
+        // 2. Price oracle, born owned by the treasury (feed admin runs through its passthroughs).
+        oracle = new SHOracle(address(treasury), tokens, priceFeeds, heartbeats);
+
+        // 3. Register the protocol's agent, whose id the registry records.
         uint256 agentId = IIdentityRegistry(config.identityRegistry).register(AGENT_URI);
 
-        // SHTreasury deploys the SHRegistry in its constructor.
-        treasury = new SHTreasury(INITIAL_PROTOCOL_FEE, address(oracle), agentId);
-
-        // deploy the ERC-7579 spending-limit module, wired to the price oracle it values tokens with
-        SpendingLimitModule module = new SpendingLimitModule(treasury.REGISTRY());
-
-        //deploy factory (module set via constructor; deploys the SessionHandler implementation internally)
-        factory = new SHFactory(
-            config.entryPoint, treasury.REGISTRY(), config.reputationRegistry, config.identityRegistry, address(module)
+        // 4. Config registry, owned by the treasury and paying fees to it. It carries every address
+        //    a deployed wallet needs, so the factory below stores none of them itself.
+        SHRegistry registry = new SHRegistry(
+            address(treasury),
+            INITIAL_PROTOCOL_FEE,
+            address(treasury),
+            address(oracle),
+            config.reputationRegistry,
+            config.identityRegistry,
+            config.entryPoint,
+            agentId
         );
+
+        // 5. Wire the registry back into the treasury. Write-once, so this fixes the pairing.
+        treasury.setRegistry(address(registry));
+
+        // 6. The ERC-7579 spending-limit hook. It must come AFTER the registry: its constructor reads
+        //    priceOracle() off the registry to fail loudly on a mis-wired deployment. That is exactly
+        //    why the module is not a registry constructor argument — the two would be mutually
+        //    undeployable. It is registered in the step below instead.
+        SpendingLimitModule module = new SpendingLimitModule(address(registry));
+        treasury.setSpendingLimitModule(address(module));
+
+        // 7. Factory, owned by the treasury. It reads EntryPoint, both ERC-8004 registries, and the
+        //    module from the registry at deploy-wallet time, so it takes only owner + registry.
+        factory = new SHFactory(address(treasury), address(registry));
+
+        // 8. Record the factory on the registry for off-chain discoverability.
+        treasury.setFactory(address(factory));
+
         vm.stopBroadcast();
     }
 }

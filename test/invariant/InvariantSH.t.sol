@@ -42,7 +42,7 @@ contract InvariantSH is StdInvariant, Test {
         SHFactory factory;
         SHTreasury treasury;
         (factory, treasury, config, oracle) = deployer.run();
-        module = SpendingLimitModule(factory.spendingLimitModule());
+        module = SpendingLimitModule(factory.REGISTRY().spendingLimitModule());
         usdc = ERC20Mock(config.usdc);
         dai = ERC20Mock(config.dai);
 

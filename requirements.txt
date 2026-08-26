@@ -2,13 +2,16 @@
 web3==7.14.1
 eth-account==0.13.7
 
-# ERC20 + Uniswap V2 calldata construction. Both return account-agnostic execution
-# plans (lists of (to, value, data) calls) that app/tools.py submits as ERC-7579
-# UserOps -- they never sign or broadcast. Pinned exactly: both are pre-1.0 with an
-# explicitly unstable public API, and langchain-uniswap-v2 already changed its write
-# return shape between 0.2.0 and 0.3.0.
+# ERC20, Uniswap V2 and ERC-8004 registry calldata construction. All three return
+# account-agnostic execution plans (lists of (to, value, data) calls) that app/tools.py
+# submits as ERC-7579 UserOps -- they never sign or broadcast. Pinned exactly: all are
+# pre-1.0 with an explicitly unstable public API, and langchain-uniswap-v2 already changed
+# its write return shape between 0.2.0 and 0.3.0. langchain-erc8004 also reads
+# registration files over the network, so an upgrade changes an outbound-request surface
+# as well as a calldata one (THREAT_MODEL 4.6, 4.7).
 langchain-erc20==0.1.0
 langchain-uniswap-v2==0.4.0
+langchain-erc8004==0.1.1
 
 # LangChain agent stack
 langchain==1.2.10

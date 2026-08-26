@@ -6,10 +6,7 @@ from db import (
     get_token_address,
     get_factory_address,
 )
-from abi import (
-    ientry_point,
-    ireputation_registry,
-)
+from abi import ientry_point
 # The ERC-20 ABI comes from langchain-erc20 rather than a local copy: the package already
 # exports the exact same nine-function ABI it builds all its own calldata against, so a local
 # duplicate could only ever drift away from what the toolkits actually encode.
@@ -19,7 +16,6 @@ _session_handler_cache: dict[int, Contract] = {}
 _entry_point_cache: dict[int, Contract] = {}
 _erc20_cache: dict[tuple[int, str], Contract] = {}
 _sh_factory_cache: dict[int, Contract] = {}
-_reputation_registry_cache: dict[int, Contract] = {}
 _spending_limit_module_cache: dict[int, Contract] = {}
 
 # ERC-7579 single-call, default-execution-type mode (CALLTYPE_SINGLE = 0x00 in the top byte).
@@ -41,7 +37,6 @@ def invalidate_cache(chat_id: int) -> None:
     _session_handler_cache.pop(chat_id, None)
     _entry_point_cache.pop(chat_id, None)
     _sh_factory_cache.pop(chat_id, None)
-    _reputation_registry_cache.pop(chat_id, None)
     _spending_limit_module_cache.pop(chat_id, None)
     for key in [k for k in _erc20_cache if k[0] == chat_id]:
         del _erc20_cache[key]
@@ -199,15 +194,8 @@ def load_calldata(instance: Contract, fn_name: str, args: list) -> bytes:
     )
 
 
-def load_reputation_registry(chat_id: int) -> Contract:
-    """Loads the ERC-8004 Reputation Registry bound to the correct address for this chain.
-    Anvil uses the locally compiled ABI; Sepolia/Mainnet use the canonical artifact."""
-    if chat_id not in _reputation_registry_cache:
-        w3, _, _ = load_network_config(chat_id)
-       
-        abi = ireputation_registry
-        address = load_session_handler(chat_id).functions.REPUTATION_REGISTRY().call()
-        _reputation_registry_cache[chat_id] = w3.eth.contract(address=address, abi=abi)
-    return _reputation_registry_cache[chat_id]
-
+# load_reputation_registry lived here until langchain-erc8004 took over the ERC-8004 registries.
+# The package owns both the ABIs and the address resolution now; app/toolkits.py builds the
+# toolkit from the addresses the WALLET reports, so there is nothing left for a local Contract
+# instance to do.
 

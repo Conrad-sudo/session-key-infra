@@ -157,4 +157,5 @@ agent:
 # re-run every time. Pass the same ARGS you'd give `deploy`/`deploy-wallet` individually,
 # e.g. `make setup ARGS="sepolia-fork"` — both steps read the same $(ARGS).
 setup: deploy fund db deploy-wallet agent
+setup-test: deploy fund db deploy-wallet 
 

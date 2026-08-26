@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
  * @title SHOracle
@@ -24,7 +25,7 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
  *      oracle like Pyth, where "how recent" is genuinely caller-choosable since anyone can pay
  *      to submit a fresh update at any time.
  */
-contract SHOracle {
+contract SHOracle is Ownable {
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -41,6 +42,21 @@ contract SHOracle {
 
     /// @dev Reverts when the tokens and priceFeeds constructor arrays have different lengths
     error PriceOracle_ArrayLengthMismatch();
+
+    /// @dev Reverts when address(0) is supplied as a feed address to {setFeed}. Registering a zero
+    ///      feed would leave the token reading as unpriced while looking registered; use
+    ///      {removeFeed} to deregister instead.
+    error PriceOracle_InvalidFeed();
+
+    /// @dev Reverts when a heartbeat is 0 (every feed would read as stale) or exceeds the uint48
+    ///      storage ceiling, where the cast would silently truncate into a much tighter ceiling.
+    error PriceOracle_InvalidHeartbeat();
+
+    /// @dev Reverts on any attempt to deregister the native (address(0)) feed. SpendingLimitModule
+    ///      prices the account's native balance delta on EVERY metered transaction, so removing this
+    ///      feed would revert every native-moving execution on every wallet installed against this
+    ///      oracle. Repoint it with {setFeed} instead, which overwrites in place.
+    error PriceOracle_CannotRemoveNativeFeed();
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -71,6 +87,31 @@ contract SHOracle {
     /// @dev Chainlink returns prices with 8 decimals. Multiply by 1e10 to get 18 decimals.
     int256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
 
+    /// @notice The 18-decimal fixed-point scale every USD figure in this protocol is expressed in.
+    uint256 private constant PRECISION = 1e18;
+
+    /// @notice One whole native token, in wei — the amount {getNativeFee} prices to learn the current
+    ///         USD-per-ETH rate.
+    /// @dev Numerically equal to {PRECISION}, kept separate because the two mean different things:
+    ///      one is a fixed-point scale, the other is a token quantity. Collapsing them would make
+    ///      {getNativeFee}'s formula read as a coincidence rather than a conversion.
+    uint256 private constant ONE_NATIVE = 1 ether;
+
+    /*//////////////////////////////////////////////////////////////
+                                  EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when a feed is registered or repointed by the owner. One event covers both:
+    ///         {setFeed} overwrites in place, so there is no separate "added" vs "updated" case.
+    /// @param token     The token the feed prices (address(0) for native).
+    /// @param feed      The Chainlink aggregator now registered for it.
+    /// @param heartbeat That feed's staleness ceiling in seconds.
+    event FeedSet(address indexed token, address indexed feed, uint256 heartbeat);
+
+    /// @notice Emitted when a feed is deregistered by the owner.
+    /// @param token The token that is no longer priced.
+    event FeedRemoved(address indexed token);
+
     /*//////////////////////////////////////////////////////////////
                              CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -89,17 +130,15 @@ contract SHOracle {
      *                    Matches the Chainlink-published heartbeat for each feed (e.g. 3600 for ETH/USD, 82800 for USDC/USD).
      *                    The value at index i is ignored when priceFeeds[i] is address(0).
      */
-    constructor(address[] memory tokens, address[] memory priceFeeds, uint256[] memory heartbeats) {
+    constructor(address owner, address[] memory tokens, address[] memory priceFeeds, uint256[] memory heartbeats)
+        Ownable(owner)
+    {
         if (tokens.length != priceFeeds.length || priceFeeds.length != heartbeats.length) {
             revert PriceOracle_ArrayLengthMismatch();
         }
         for (uint256 i = 0; i < tokens.length; i++) {
             if (priceFeeds[i] != address(0)) {
-                // Native ETH has no contract to query; every other token exposes its own decimals.
-                uint8 tokenDecimals = tokens[i] == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(tokens[i]).decimals();
-                // Heartbeats are small (hours-to-days in seconds); this cast can never truncate a real feed config.
-                sFeeds[tokens[i]] =
-                    Feed({feed: priceFeeds[i], decimals: tokenDecimals, heartbeat: uint48(heartbeats[i])});
+                _setFeed(tokens[i], priceFeeds[i], heartbeats[i]);
             }
         }
     }
@@ -128,7 +167,7 @@ contract SHOracle {
      * @param amount Amount of the token in its native base units.
      * @return       USD value with 18 decimals of precision.
      */
-    function getPrice(address token, uint256 amount) external view returns (int256) {
+    function getPrice(address token, uint256 amount) public view returns (int256) {
         Feed memory f = sFeeds[token]; // single SLOAD: feed + decimals + heartbeat all in one slot
         if (f.feed == address(0)) revert PriceOracle_UnsupportedToken();
 
@@ -137,6 +176,37 @@ contract SHOracle {
         // amount is a token balance/allowance that cannot approach 2**255, so the cast never truncates.
         // forge-lint: disable-next-line(unsafe-typecast)
         return (int256(amount) * price * ADDITIONAL_FEED_PRECISION) / int256(10 ** f.decimals);
+    }
+
+    /**
+     * @notice Converts a USD amount into the equivalent amount of native token, in wei, at the
+     *         native feed's current price.
+     * @dev This is what keeps the protocol fee stable in USD terms. {SHRegistry} stores the fee as a
+     *      USD figure and every SessionHandler converts it here at execution time, so the wei charged
+     *      tracks the ETH price instead of drifting against it as a hardcoded wei amount would.
+     *
+     *      Formula: (usdAmount × 1e18) / usdPerNative
+     *      Example — $0.015 at ETH = $2500:
+     *        usdPerNative = getPrice(address(0), 1e18) = 2500e18
+     *        (0.015e18 × 1e18) / 2500e18 = 6e12 wei = 0.000006 ETH
+     *
+     *      Reverts through {getPrice} if the native feed is stale or unregistered, so a broken
+     *      ETH/USD feed blocks fee collection rather than charging a wrong amount. Callers should
+     *      know that makes every fee-charging execution depend on this one feed's freshness.
+     *
+     *      The division truncates in the payer's favour. Reaching zero would take an ETH price
+     *      around 1e16 USD, so within {SHRegistry}'s fee bounds the result is always non-zero.
+     *
+     * @param usdAmount USD amount with 18 decimals.
+     * @return          The equivalent native amount in wei.
+     */
+    function getNativeFee(uint256 usdAmount) external view returns (uint256) {
+        // Positive by construction — _stalePriceCheck rejects any non-positive answer — so the cast
+        // cannot wrap and the division below can never be by zero.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 usdPerNative = uint256(getPrice(ETH_TOKEN_ADDRESS, ONE_NATIVE));
+
+        return (usdAmount * PRECISION) / usdPerNative;
     }
 
     /**
@@ -164,5 +234,56 @@ contract SHOracle {
 
         // forge-lint: disable-next-line(unsafe-typecast)
         return price;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            FEED ADMIN (owner-only)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Registers a price feed for `token`, or repoints an existing one in place.
+     * @dev Overwriting is deliberate and is the supported way to correct a wrong heartbeat or
+     *      migrate to a replacement aggregator without deregistering the token first — a
+     *      remove-then-add would leave every wallet unable to price that token in between.
+     *      Feeds registered here take effect on the next valuation, protocol-wide, with no delay;
+     *      the timelock protecting wallets from a bad oracle lives on
+     *      {SHRegistry-proposePriceOracle}, which governs WHICH oracle they read, not its contents.
+     *      The owner is therefore trusted for cap integrity either way (THREAT_MODEL §3.8).
+     * @dev The token's decimals are read on-chain rather than supplied by the caller: a wrong
+     *      decimals value would silently mis-price every valuation of that token by a power of ten,
+     *      with nothing on-chain to catch it.
+     * @param token     Token to price. Use address(0) for native.
+     * @param priceFeed Chainlink USD aggregator for it. Must not be address(0).
+     * @param heartbeat That feed's Chainlink-published heartbeat, in seconds. Must be > 0.
+     */
+    function setFeed(address token, address priceFeed, uint256 heartbeat) external onlyOwner {
+        _setFeed(token, priceFeed, heartbeat);
+    }
+
+    /**
+     * @notice Deregisters `token`, after which {isPriced} reports false and {getPrice} reverts.
+     * @dev Refuses to remove the native (address(0)) feed — see {PriceOracle_CannotRemoveNativeFeed}.
+     *      Removing a token that accounts currently watch does NOT unwatch it: their next metered
+     *      transaction that moves it will revert in the hook's postCheck. Have accounts drop it from
+     *      their watched list first.
+     * @param token The token to stop pricing. Must not be address(0).
+     */
+    function removeFeed(address token) external onlyOwner {
+        if (token == ETH_TOKEN_ADDRESS) revert PriceOracle_CannotRemoveNativeFeed();
+        delete sFeeds[token];
+        emit FeedRemoved(token);
+    }
+
+    /// @dev Shared write path for the constructor and {setFeed}, so both validate identically and
+    ///      both cache the token's own decimals rather than trusting a supplied value.
+    function _setFeed(address token, address priceFeed, uint256 heartbeat) internal {
+        if (priceFeed == address(0)) revert PriceOracle_InvalidFeed();
+        // A zero heartbeat reads as permanently stale; anything past uint48 would truncate on the
+        // cast below into a far tighter ceiling than intended. Real feeds are hours-to-days.
+        if (heartbeat == 0 || heartbeat > type(uint48).max) revert PriceOracle_InvalidHeartbeat();
+        // Native ETH has no contract to query; every other token exposes its own decimals.
+        uint8 tokenDecimals = token == ETH_TOKEN_ADDRESS ? 18 : IERC20Metadata(token).decimals();
+        sFeeds[token] = Feed({feed: priceFeed, decimals: tokenDecimals, heartbeat: uint48(heartbeat)});
+        emit FeedSet(token, priceFeed, heartbeat);
     }
 }

@@ -338,4 +338,15 @@ def _submit_user_op(
         )
 
     op_hash_bytes = bytes.fromhex(user_op_hash[2:])
-    return op_hash_bytes, {"status": 1}
+    # `logs` and `transactionHash` are carried through from the bundler receipt so a caller
+    # that needs an on-chain OUTPUT can read it: ERC-8004's register() returns the new agentId
+    # only in a Registered event, so tools.register_agent has nothing else to parse. Both are
+    # in the JSON form (hex strings), which is what the packages' receipt parsers expect.
+    # Additive — `status` keeps the shape every other tool checks, and a bundler that omits
+    # either field leaves an empty list rather than raising.
+    inner_receipt = bundler_receipt.get("receipt") or {}
+    return op_hash_bytes, {
+        "status": 1,
+        "logs": bundler_receipt.get("logs") or inner_receipt.get("logs") or [],
+        "transactionHash": inner_receipt.get("transactionHash"),
+    }

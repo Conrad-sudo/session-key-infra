@@ -143,7 +143,6 @@ def load_spending_limit_module(chat_id) -> Contract   # the spending-cap HOOK, r
 def load_entry_point(chat_id) -> Contract
 def load_ierc20(chat_id, token) -> Contract      # ticker -> address + decimals, for the oracle-pricing tools
 def load_factory(chat_id) -> Contract
-def load_reputation_registry(chat_id) -> Contract
 def load_calldata(instance, fn_name, args) -> bytes
 def invalidate_cache(chat_id) -> None
 
@@ -315,7 +314,25 @@ The wrappers exist — rather than exposing the package tools directly — becau
 
 ### ERC-8004 tools
 
-`get_agent_identity`, `get_agent_reputation`, `post_reputation_feedback` (`giveFeedback` via the session key). All write tools accept `session_key_ciphertext` — the opaque Vault ciphertext; never decrypted or logged at the tool layer.
+All 29 tools of [`langchain-erc8004`](https://pypi.org/project/langchain-erc8004/) are wrapped — the package owns the registry ABIs, address resolution, registration-file resolution, the sybil-aware read shapes and all calldata construction. `toolkits.get_erc8004_tools(chat_id)` builds the toolkit per user, reading **both registry addresses off the wallet** (`SessionHandler.IDENTITY_REGISTRY()` / `.REPUTATION_REGISTRY()`) rather than from the package's chain table: that is the canonical `0x8004…` pair on Sepolia/BSC but the local mocks on Anvil, and chain 31337 is not in the package's `KNOWN_NETWORKS` at all.
+
+**Who the agent is.** `DeploySHProtocol.s.sol` registers exactly **one** agent per deployment, stores its id in `SHRegistry.agentId`, and leaves the ERC-721 with the deploying operator's key. That agent is the *protocol's* on-chain identity, shared by every wallet on the chain — a user's SessionHandler is a smart account, not an agent, and has no registry entry of its own. This shapes the whole surface: `"protocol"` is the default for every `agent` argument (resolved by `_resolve_agent` via `get_agent_id`, which stays project-side), the user's wallet is always the *reviewer* rather than the subject, and the identity writes are withheld.
+
+| Group | Tools | Exposed to the agent? |
+|---|---|---|
+| identity reads | `get_registry_info`, `get_agent_identity`, `agent_exists`, `get_agent_owner`, `get_agent_uri`, `get_agent_wallet`, `get_agent_metadata`, `resolve_registration_file`, `verify_agent_endpoint` | yes |
+| reputation reads | `get_feedback_clients`, `get_agent_feedback`, `list_all_feedback`, `get_feedback_summary`, `read_feedback`, `get_last_feedback_index`, `get_response_count`, `get_agent_reputation` | yes |
+| reputation writes | `post_reputation_feedback`, `give_feedback`, `revoke_feedback`, `append_response` | yes |
+| identity writes | `register_agent`, `parse_registration_receipt`, `set_agent_uri`, `set_agent_metadata`, `transfer_agent` | **no** |
+| agent wallet | `build_agent_wallet_typed_data`, `set_agent_wallet`, `unset_agent_wallet` | **no** |
+
+21 registered, 62 agent tools in total. Every write returns a plan and goes out through the same `_submit_plan` as the ERC20/Uniswap tools; all write tools accept `session_key_ciphertext` — the opaque Vault ciphertext; never decrypted or logged at the tool layer. Every `agent` argument also accepts a bare id or a fully-qualified `eip155:chain:registry:id` reference, so third-party agents can be read and rated.
+
+> **The eight identity writes are defined but withheld from `get_tools()`**, on the same principle as `toolkits._BLOCKED_TOOLS`: a tool that cannot succeed is worse than no tool. Changing the protocol agent is governance done with the operator's key, and a user's wallet cannot own an agent of its own either — `register_agent` mints the ERC-721 to the wallet, and `SessionHandler` installs no ERC-7579 fallback handler for `onERC721Received`, so any mint or `safeTransferFrom` to the account reverts with `ERC7579MissingFallbackHandler(0x150b7a02)`. Each wrapper additionally calls `_reject_protocol_agent_write`, which refuses the protocol's own agent before any calldata is built — so a deployment whose wallet *does* own an agent (or has been granted `setApprovalForAll`) can re-enable them by adding them back to the list, without exposing the protocol identity.
+
+> **The Validation Registry's seven tools are absent too.** ERC-8004's validation registry has no canonical deployment on any chain and this protocol deploys none, so `get_erc8004_tools` passes `validation_registry=None` and the toolkit withholds them.
+
+> **What the port fixed.** `get_agent_reputation` used to call `SessionHandler.getAgentReputation()`, which hardcodes `clients[0] = address(this)` and therefore only ever read back feedback *the wallet itself had given* — a real bug for "how is this service rated". It now aggregates over named reviewers, or over every discovered reviewer flagged as unfiltered. `post_reputation_feedback` passed the user's free-text label into **tag1**, the slot that names the *scale*, leaving every rating invisible to a reader filtering on `"starred"`; it now writes `tag1="starred"` with the label in `tag2`, and takes an optional `agent` so other agents can be rated. Note the `langchain-erc8004.md` spec's claim that the old tool was self-feedback does **not** apply here: `isAuthorizedOrOwner(userWallet, agentId)` is false, so a user rating the protocol's agent is a genuine attributed review, and that stayed the default.
 
 ---
 
